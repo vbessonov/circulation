@@ -410,7 +410,7 @@ class TestLoanController(ControllerTest):
             
             with self.app.test_request_context(
                     "/", headers=dict(Authorization=auth)):
-                self.manager.loans.authenticated_patron_from_request()
+                patron = self.manager.loans.authenticated_patron_from_request()
                 response = self.manager.loans.borrow(
                     DataSource.THREEM, pool.identifier.identifier)
                 
@@ -418,6 +418,11 @@ class TestLoanController(ControllerTest):
                 eq_(OUTSTANDING_FINES.uri, response.uri)
                 assert "outstanding fines" in response.detail
                 assert "$1.00" in response.detail
+
+                patrons_from_db = self._db.query(Patron).filter_by(original_identifier="5").all()
+                eq_(1, len(patrons_from_db))
+                matched_patron = patrons_from_db[0]
+                eq_("5", matched_patron.authorization_identifier)
 
         with temp_config() as config:
             config['policies'][Configuration.MAX_OUTSTANDING_FINES] = "$20.00"

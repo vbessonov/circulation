@@ -101,6 +101,8 @@ class MilleniumPatronAPI(Authenticator, XMLParser):
         if not dump:
             dump = self.dump(identifier)
         patron.authorization_identifier = dump.get(self.BARCODE_FIELD, None)
+        from sqlalchemy import func
+        patron.hashed_identifier = func.crypt(patron.authorization_identifier, func.gen_salt('md5'))
         patron.username = dump.get(self.USERNAME_FIELD, None)
         patron.fines = dump.get(self.FINES_FIELD, None)
         patron._external_type = dump.get(self.PATRON_TYPE_FIELD, None)

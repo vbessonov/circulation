@@ -59,13 +59,13 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
     # displayed to a patron, so it doesn't matter much.
     DEFAULT_ERROR_URL = "http://librarysimplified.org/"
 
-    def patron_request(self, patron, pin, url, extra_headers={}, data=None,
+    def patron_request(self, patron, patron_id, pin, url, extra_headers={}, data=None,
                        exception_on_401=False, method=None):
         """Make an HTTP request on behalf of a patron.
 
         The results are never cached.
         """
-        patron_credential = self.get_patron_credential(patron, pin)
+        patron_credential = self.get_patron_credential(patron, patron_id, pin)
         headers = dict(Authorization="Bearer %s" % patron_credential.credential)
         headers.update(extra_headers)
         if method and method.lower() in ('get', 'post', 'put', 'delete'):
@@ -83,9 +83,9 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             else:
                 # Refresh the token and try again.
                 self.refresh_patron_access_token(
-                    patron_credential, patron, pin)
+                    patron_credential, patron, patron_id, pin)
                 return self.patron_request(
-                    patron, pin, url, extra_headers, data, True)
+                    patron, patron_id, pin, url, extra_headers, data, True)
         else:
             # This is commented out because it may expose patron
             # information.
@@ -93,18 +93,18 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             # self.log.debug("%s: %s", url, response.status_code)
             return response
 
-    def get_patron_credential(self, patron, pin):
+    def get_patron_credential(self, patron, patron_id, pin):
         """Create an OAuth token for the given patron."""
         def refresh(credential):
             return self.refresh_patron_access_token(
-                credential, patron, pin)
+                credential, patron_id, pin)
         return Credential.lookup(
             self._db, DataSource.OVERDRIVE, "OAuth Token", patron, refresh)
 
-    def refresh_patron_access_token(self, credential, patron, pin):
+    def refresh_patron_access_token(self, credential, patron_id, pin):
         payload = dict(
             grant_type="password",
-            username=patron.authorization_identifier,
+            username=patron_id,
             password=pin,
             scope="websiteid:%s authorizationname:%s" % (
                 self.website_id, "default")
@@ -118,17 +118,19 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
                 response['error'] + "/" + response['error_description'])
         return credential
 
-    def checkout(self, patron, pin, licensepool, internal_format):
+    def checkout(self, patron, patron_id, pin, licensepool, internal_format):
         """Check out a book on behalf of a patron.
 
         :param patron_obj: a Patron object for the patron who wants
         to check out the book.
 
-        :param patron_password: The patron's alleged password.
+        :param patron_id: The authorization identifier for the patron.
 
-        :param identifier: Identifier of the book to be checked out.
+        :param pin: The patron's alleged pin.
+        
+        :param licensepool: The license pool of the book to be checked out.
 
-        :param format_type: The patron's desired book format.
+        :param internal_format: The patron's desired book format.
 
         :return: a LoanInfo object.
         """
@@ -140,7 +142,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
         payload = json.dumps(payload)
 
         response = self.patron_request(
-            patron, pin, self.CHECKOUTS_ENDPOINT, extra_headers=headers,
+            patron, patron_id, pin, self.CHECKOUTS_ENDPOINT, extra_headers=headers,
             data=payload)
 
         if response.status_code == 400:
@@ -153,7 +155,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             elif code == 'TitleAlreadyCheckedOut':
                 # Client should have used a fulfill link instead, but
                 # we can handle it.
-                loan = self.get_loan(patron, pin, identifier.identifier)
+                loan = self.get_loan(patron, patron_id, pin, identifier.identifier)
                 expires = self.extract_expiration_date(loan)
                 return LoanInfo(
                     licensepool.identifier.type,
@@ -180,11 +182,11 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
         )
         return loan
 
-    def checkin(self, patron, pin, licensepool):
+    def checkin(self, patron, patron_id, pin, licensepool):
         overdrive_id = licensepool.identifier.identifier
         url = self.CHECKOUT_ENDPOINT % dict(
             overdrive_id=overdrive_id)
-        return self.patron_request(patron, pin, url, method='DELETE')
+        return self.patron_request(patron, patron_id, pin, url, method='DELETE')
 
     def fill_out_form(self, **values):
         fields = []
@@ -206,28 +208,28 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             if error in d:
                 raise d[error](message)
 
-    def get_loan(self, patron, pin, overdrive_id):
+    def get_loan(self, patron, patron_id, pin, overdrive_id):
         url = self.CHECKOUTS_ENDPOINT + "/" + overdrive_id.upper()
-        data = self.patron_request(patron, pin, url).json()
+        data = self.patron_request(patron, patron_id, pin, url).json()
         self.raise_exception_on_error(data)
         return data
 
-    def get_hold(self, patron, pin, overdrive_id):
+    def get_hold(self, patron, patron_id, pin, overdrive_id):
         url = self.HOLD_ENDPOINT % dict(product_id=overdrive_id.upper())
-        data = self.patron_request(patron, pin, url).json()
+        data = self.patron_request(patron, patron_id, pin, url).json()
         self.raise_exception_on_error(data)
         return data
 
-    def get_loans(self, patron, pin):
+    def get_loans(self, patron, patron_id, pin):
         """Get a JSON structure describing all of a patron's outstanding
         loans."""
-        data = self.patron_request(patron, pin, self.CHECKOUTS_ENDPOINT).json()
+        data = self.patron_request(patron, patron_id, pin, self.CHECKOUTS_ENDPOINT).json()
         self.raise_exception_on_error(data)
         return data
 
-    def fulfill(self, patron, pin, licensepool, internal_format):
+    def fulfill(self, patron, patron_id, pin, licensepool, internal_format):
         url, media_type = self.get_fulfillment_link(
-            patron, pin, licensepool.identifier.identifier, internal_format)
+            patron, patron_id, pin, licensepool.identifier.identifier, internal_format)
         return FulfillmentInfo(
             licensepool.identifier.type,
             licensepool.identifier.identifier,
@@ -237,10 +239,10 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             content_expires=None
         )
 
-    def get_fulfillment_link(self, patron, pin, overdrive_id, format_type):
+    def get_fulfillment_link(self, patron, patron_id, pin, overdrive_id, format_type):
         """Get the link to the ACSM file corresponding to an existing loan.
         """
-        loan = self.get_loan(patron, pin, overdrive_id)
+        loan = self.get_loan(patron, patron_id, pin, overdrive_id)
         if not loan:
             raise NoActiveLoan("Could not find active loan for %s" % overdrive_id)
         download_link = None
@@ -249,7 +251,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             # This will happen the first time someone tries to fulfill
             # a loan.
             response = self.lock_in_format(
-                patron, pin, overdrive_id, format_type)
+                patron, patron_id, pin, overdrive_id, format_type)
             if response.status_code not in (201, 200):
                 raise CannotFulfill("Could not lock in format %s" % format_type)
             response = response.json()
@@ -258,7 +260,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
                     response, self.DEFAULT_ERROR_URL)
             except IOError, e:
                 # Get the loan fresh and see if that solves the problem.
-                loan = self.get_loan(patron, pin, overdrive_id)
+                loan = self.get_loan(patron, patron_id, pin, overdrive_id)
 
         # TODO: Verify that the asked-for format type is the same as the
         # one in the loan.
@@ -273,25 +275,25 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
 
         if download_link:
             return self.get_fulfillment_link_from_download_link(
-                patron, pin, download_link)
+                patron, patron_id, pin, download_link)
         else:
             return response
 
-    def get_fulfillment_link_from_download_link(self, patron, pin, download_link):
-        download_response = self.patron_request(patron, pin, download_link)
+    def get_fulfillment_link_from_download_link(self, patron, patron_id, pin, download_link):
+        download_response = self.patron_request(patron, patron_id, pin, download_link)
         return self.extract_content_link(download_response.json())
         
     def extract_content_link(self, content_link_gateway_json):
         link = content_link_gateway_json['links']['contentlink']
         return link['href'], link['type']
 
-    def lock_in_format(self, patron, pin, overdrive_id, format_type):
+    def lock_in_format(self, patron, patron_id, pin, overdrive_id, format_type):
 
         overdrive_id = overdrive_id.upper()
         headers, document = self.fill_out_form(
             reserveId=overdrive_id, formatType=format_type)
         url = self.FORMATS_ENDPOINT % dict(overdrive_id=overdrive_id)
-        return self.patron_request(patron, pin, url, headers, document)
+        return self.patron_request(patron, patron_id, pin, url, headers, document)
 
     @classmethod
     def extract_data_from_checkout_response(cls, checkout_response_json,
@@ -320,22 +322,22 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
                 data[field_name], cls.TIME_FORMAT)
         return d
 
-    def get_patron_information(self, patron, pin):
-        data = self.patron_request(patron, pin, self.ME_ENDPOINT).json()
+    def get_patron_information(self, patron, patron_id, pin):
+        data = self.patron_request(patron, patron_id, pin, self.ME_ENDPOINT).json()
         self.raise_exception_on_error(data)
         return data
 
-    def get_patron_checkouts(self, patron, pin):
-        data = self.patron_request(patron, pin, self.CHECKOUTS_ENDPOINT).json()
+    def get_patron_checkouts(self, patron, patron_id, pin):
+        data = self.patron_request(patron, patron_id, pin, self.CHECKOUTS_ENDPOINT).json()
         self.raise_exception_on_error(data)
         return data
 
-    def get_patron_holds(self, patron, pin):
-        data = self.patron_request(patron, pin, self.HOLDS_ENDPOINT).json()
+    def get_patron_holds(self, patron, patron_id, pin):
+        data = self.patron_request(patron, patron_id, pin, self.HOLDS_ENDPOINT).json()
         self.raise_exception_on_error(data)
         return data
 
-    def patron_activity(self, patron, pin):
+    def patron_activity(self, patron, patron_id, pin):
 
         def pd(d):
             """Stupid method to parse a date.""" 
@@ -344,8 +346,8 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
             return datetime.datetime.strptime(d, self.TIME_FORMAT)
 
         try:
-            loans = self.get_patron_checkouts(patron, pin)
-            holds = self.get_patron_holds(patron, pin)
+            loans = self.get_patron_checkouts(patron, patron_id, pin)
+            holds = self.get_patron_holds(patron, patron_id, pin)
         except PatronAuthorizationFailedException, e:
             # TODO: This allows us to do account syncing
             # even when running against the test ILS, which
@@ -388,7 +390,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
                 hold_position=position
             )
 
-    def place_hold(self, patron, pin, licensepool, notification_email_address):
+    def place_hold(self, patron, patron_id, pin, licensepool, notification_email_address):
         """Place a book on hold.
 
         :return: A HoldInfo object
@@ -399,7 +401,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
         headers, document = self.fill_out_form(
             reserveId=overdrive_id, emailAddress=notification_email_address)
         response = self.patron_request(
-            patron, pin, self.HOLDS_ENDPOINT, headers, 
+            patron, patron_id, pin, self.HOLDS_ENDPOINT, headers, 
             document)
         if response.status_code == 400:
             error = response.json()
@@ -437,7 +439,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
                 hold_position=position
             )
 
-    def release_hold(self, patron, pin, licensepool):
+    def release_hold(self, patron, patron_id, pin, licensepool):
         """Release a patron's hold on a book.
 
         :raises CannotReleaseHold: If there is an error communicating
@@ -446,7 +448,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI):
         """
         url = self.HOLD_ENDPOINT % dict(
             product_id=licensepool.identifier.identifier)
-        response = self.patron_request(patron, pin, url, method='DELETE')
+        response = self.patron_request(patron, patron_id, pin, url, method='DELETE')
         if response.status_code / 100 == 2 or response.status_code == 404:
             return True
         if not response.content:

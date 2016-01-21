@@ -68,7 +68,7 @@ class TestVendorIDModel(DatabaseTest):
         bob_uuid = Credential.lookup(
             self._db, self.data_source, self.model.VENDOR_ID_UUID_TOKEN_TYPE,
             self.bob_patron, None)
-        eq_("Card number 5", label)
+        eq_("Library ID 200200200", label)
         eq_(urn, bob_uuid.credential)
         assert urn.startswith("urn:uuid:0")
         assert urn.endswith('685b35c00f05')
@@ -88,7 +88,7 @@ class TestVendorIDModel(DatabaseTest):
             self._db, self.data_source, self.model.VENDOR_ID_UUID_TOKEN_TYPE,
             self.bob_patron, None)
         eq_(urn, bob_uuid.credential)
-        eq_("Card number 5", label)
+        eq_("Library ID 200200200", label)
 
         # Having been used once, the temporary token has been expired.
         assert temp_token.expires < now
@@ -110,7 +110,7 @@ class TestVendorIDModel(DatabaseTest):
         urn, label = self.model.standard_lookup("5", "5555")
         label2 = self.model.urn_to_label(urn)
         eq_(label, label2)
-        eq_("Card number 5", label)
+        eq_("Library ID 200200200", label)
 
     def test_urn_to_label_failure_no_active_credential(self):
         label = self.model.urn_to_label("bad urn")

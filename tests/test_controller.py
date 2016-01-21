@@ -199,10 +199,10 @@ class TestBaseController(ControllerTest):
             }
         )
 
-        patron._external_type = '10'
+        patron.external_type = '10'
         eq_(None, self.controller.apply_borrowing_policy(patron, pool))
 
-        patron._external_type = '152'
+        patron.external_type = '152'
         problem = self.controller.apply_borrowing_policy(patron, pool)
         eq_(FORBIDDEN_BY_POLICY.uri, problem.uri)
 
@@ -225,6 +225,7 @@ class TestIndexController(ControllerTest):
                 Configuration.ROOT_LANE_POLICY : { "2": ["eng", "Adult Fiction"]},
                 Configuration.EXTERNAL_TYPE_REGULAR_EXPRESSION : "^(.)",
             }
+            
             with self.app.test_request_context(
                 "/", headers=dict(Authorization=self.invalid_auth)):
                 response = self.manager.index_controller()
@@ -232,6 +233,12 @@ class TestIndexController(ControllerTest):
 
             with self.app.test_request_context(
                 "/", headers=dict(Authorization=self.valid_auth)):
+
+                # This is necessary to update the patron's external type
+                # since the config has changed.
+                patron = self.manager.index_controller.authenticated_patron_from_request()
+                patron.authorization_identifier = "2"
+
                 response = self.manager.index_controller()
                 eq_(302, response.status_code)
                 eq_("http://cdn/groups/eng/Adult%20Fiction", response.headers['location'])

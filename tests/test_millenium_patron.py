@@ -6,6 +6,7 @@ from nose.tools import (
     set_trace,
 )
 
+from ..core.model import Patron
 from ..millenium_patron import MilleniumPatronAPI
 from . import DatabaseTest
 
@@ -73,8 +74,10 @@ class TestMilleniumPatronAPI(DatabaseTest):
         p = self._patron()
         self.api.update_patron(p, "12345678901234")
         eq_("10", p.external_type)
-        eq_("44444444444447", p.authorization_identifier)
-        eq_("alice", p.username)
+        db_patrons = self._db.query(Patron).filter_by(authorization_identifier="44444444444447").all()
+        eq_(1, len(db_patrons))
+        db_patrons = self._db.query(Patron).filter_by(username="alice").all()
+        eq_(1, len(db_patrons))
         expiration = date(1999, 4, 1)
         eq_(expiration, p.authorization_expires)
 
@@ -83,8 +86,8 @@ class TestMilleniumPatronAPI(DatabaseTest):
         p = self._patron()
         self.api.update_patron(p, "12345678901234")
         eq_("10", p.external_type)
-        eq_("44444444444448", p.authorization_identifier)
-        eq_(None, p.username)
+        db_patrons = self._db.query(Patron).filter_by(authorization_identifier="44444444444448").all()
+        eq_(1, len(db_patrons))
         expiration = date(1999, 4, 1)
         eq_(expiration, p.authorization_expires)
 
@@ -94,20 +97,21 @@ class TestMilleniumPatronAPI(DatabaseTest):
         self.api.enqueue("dump.success.html")
         self.api.enqueue("pintest.good.html")
         alice = self.api.authenticated_patron(self._db, "alice", "4444")
-        eq_("44444444444447", alice.authorization_identifier)
-        eq_("alice", alice.username)
+        assert isinstance(alice, Patron)
+        db_patrons = self._db.query(Patron).filter_by(authorization_identifier="44444444444447").all()
+        eq_(1, len(db_patrons))
+        db_patrons = self._db.query(Patron).filter_by(username="alice").all()
+        eq_(1, len(db_patrons))
 
         # Patron is in the db, now authenticate with barcode
         self.api.enqueue("pintest.good.html")
         alice = self.api.authenticated_patron(self._db, "44444444444447", "4444")
-        eq_("44444444444447", alice.authorization_identifier)
-        eq_("alice", alice.username)
+        assert isinstance(alice, Patron)
 
         # Authenticate with username again
         self.api.enqueue("pintest.good.html")
         alice = self.api.authenticated_patron(self._db, "alice", "4444")
-        eq_("44444444444447", alice.authorization_identifier)
-        eq_("alice", alice.username)
+        assert isinstance(alice, Patron)
 
     def test_patron_info(self):
         self.api.enqueue("dump.success.html")

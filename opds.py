@@ -218,9 +218,6 @@ class CirculationManagerAnnotator(Annotator):
             entry.append(tag)
 
     def annotate_feed(self, feed, lane):
-        if self.patron:
-            self.add_patron(feed)
-
         # Add an account info link
         account_url = self.url_for('account', _external=True)
         account_link = dict(
@@ -484,16 +481,6 @@ class CirculationManagerAnnotator(Annotator):
         )
         link_tag.append(always_available)
         return link_tag
-
-    def add_patron(self, feed_obj):
-        patron_details = {}
-        if self.patron.username:
-            patron_details["{%s}username" % simplified_ns] = self.patron.username
-        if self.patron.authorization_identifier:
-            patron_details["{%s}authorizationIdentifier" % simplified_ns] = self.patron.authorization_identifier
-
-        patron_tag = E._makeelement("{%s}patron" % simplified_ns, patron_details)
-        feed_obj.feed.append(patron_tag)
 
 
 class CirculationManagerLoanAndHoldAnnotator(CirculationManagerAnnotator):

@@ -91,7 +91,7 @@ class TestSyncBookshelf(TestThreeMAPI):
         api = DummyThreeMAPI(self._db)
         api.queue_response(content=self.sample_data("checkouts.xml"))
         circulation = CirculationAPI(self._db, threem=api)
-        circulation.sync_bookshelf(patron, "dummy pin")
+        circulation.sync_bookshelf(patron, "dummy barcode", "dummy pin")
 
         # The patron should have two loans and two holds.
         l1, l2 = patron.loans

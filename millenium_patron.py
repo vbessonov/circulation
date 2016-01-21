@@ -103,7 +103,7 @@ class MilleniumPatronAPI(Authenticator, XMLParser):
         patron.authorization_identifier = dump.get(self.BARCODE_FIELD, None)
         patron.username = dump.get(self.USERNAME_FIELD, None)
         patron.fines = dump.get(self.FINES_FIELD, None)
-        patron._external_type = dump.get(self.PATRON_TYPE_FIELD, None)
+        patron.external_type = dump.get(self.PATRON_TYPE_FIELD, None)
         expires = dump.get(self.EXPIRATION_FIELD, None)
         expires = datetime.datetime.strptime(
             expires, self.EXPIRATION_DATE_FORMAT).date()
@@ -136,12 +136,12 @@ class MilleniumPatronAPI(Authenticator, XMLParser):
         # identifier passed in to this method.
 
         # Let's start with a simple lookup based on identifier.
-        kwargs = {Patron.authorization_identifier.name: identifier}
+        kwargs = {"authorization_identifier": identifier}
         patron = get_one(db, Patron, **kwargs)
 
         if not patron:
             # The patron might have used a username instead of a barcode.
-            kwargs = {Patron.username.name: identifier}
+            kwargs = {"username": identifier}
             patron = get_one(db, Patron, *kwargs)
 
         __transaction = db.begin_nested()

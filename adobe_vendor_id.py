@@ -228,14 +228,10 @@ class AdobeVendorIDModel(object):
             self._db, self.data_source, self.VENDOR_ID_UUID_TOKEN_TYPE,
             patron, generate_uuid, True)
 
-        identifier = patron.authorization_identifier          
+        identifier = patron.external_identifier
         if not identifier:
-            # Maybe this should be an error, but even though the lack
-            # of an authorization identifier is a problem, the problem
-            # should manifest when the patron tries to actually use
-            # their credential.
-            return "Unknown card number.", "Unknown card number"
-        return credential.credential, "Card number " + identifier
+            identifier = credential.credential
+        return credential.credential, "Library ID " + identifier
 
     def create_authdata(self, patron):
         credential, is_new = Credential.temporary_token_create(

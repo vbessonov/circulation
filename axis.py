@@ -64,11 +64,10 @@ class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
         (pdf, adobe_drm): 'PDF',
     }
 
-    def checkout(self, patron, pin, licensepool, internal_format):
+    def checkout(self, patron, patron_id, pin, licensepool, internal_format):
 
         url = self.base_url + "checkout/v2" 
         title_id = licensepool.identifier.identifier
-        patron_id = patron.authorization_identifier
         args = dict(titleId=title_id, patronId=patron_id, 
                     format=internal_format)
         response = self.request(url, data=args, method="POST")
@@ -77,12 +76,12 @@ class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
         except etree.XMLSyntaxError, e:
             raise InternalServerError(response.content)
 
-    def fulfill(self, patron, pin, licensepool, format_type):
+    def fulfill(self, patron, patron_id, pin, licensepool, format_type):
         """Fulfill a patron's request for a specific book.
         """
         identifier = licensepool.identifier
         # This should include only one 'activity'.
-        activities = self.patron_activity(patron, pin, licensepool.identifier)
+        activities = self.patron_activity(patron, patron_id, pin, licensepool.identifier)
         
         for loan in activities:
             if not isinstance(loan, LoanInfo):
@@ -100,26 +99,24 @@ class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
         # book checked out.
         raise NoActiveLoan()
 
-    def checkin(self, patron, pin, licensepool):
+    def checkin(self, patron, patron_id, pin, licensepool):
         pass
 
-    def place_hold(self, patron, pin, licensepool, format_type,
+    def place_hold(self, patron, patron_id, pin, licensepool, format_type,
                    hold_notification_email):
         url = self.base_url + "addtoHold/v2" 
         identifier = licensepool.identifier
         title_id = identifier.identifier
-        patron_id = patron.authorization_identifier
         params = dict(titleId=title_id, patronId=patron_id, format=format_type,
                       email=hold_notification_email)
         response = self.request(url, params=params)
         return HoldResponseParser().process_all(
                 response.content)
 
-    def release_hold(self, patron, pin, licensepool):
+    def release_hold(self, patron, patron_id, pin, licensepool):
         url = self.base_url + "removeHold/v2"
         identifier = licensepool.identifier
         title_id = identifier.identifier
-        patron_id = patron.authorization_identifier
         params = dict(titleId=title_id, patronId=patron_id)
         response = self.request(url, params=params)
         try:
@@ -131,13 +128,13 @@ class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
         # If we didn't raise an exception, we're fine.
         return True
 
-    def patron_activity(self, patron, pin, identifier=None):
+    def patron_activity(self, patron, patron_id, pin, identifier=None):
         if identifier:
             title_ids = [identifier.identifier]
         else:
             title_ids = None
         availability = self.availability(
-            patron_id=patron.authorization_identifier, 
+            patron_id=patron_id, 
             title_ids=title_ids)
         return list(AvailabilityResponseParser().process_all(
             availability.content))

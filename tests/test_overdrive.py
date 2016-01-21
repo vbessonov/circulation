@@ -153,7 +153,7 @@ class TestOverdriveAPI(DatabaseTest):
 
         patron = self.default_patron
         circulation = CirculationAPI(self._db, overdrive=overdrive)
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
 
         # All four loans in the sample data were created.
         eq_(4, len(loans))
@@ -164,7 +164,7 @@ class TestOverdriveAPI(DatabaseTest):
         # Running the sync again leaves all four loans in place.
         overdrive.queue_response(content=holds_data)
         overdrive.queue_response(content=loans_data)
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
         eq_(4, len(loans))
         eq_(loans, patron.loans)        
 
@@ -187,7 +187,7 @@ class TestOverdriveAPI(DatabaseTest):
         # Sync with Overdrive, and the loan not present in the sample
         # data is removed.
         circulation = CirculationAPI(self._db, overdrive=overdrive)
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
 
         eq_(4, len(loans))
         eq_(loans, patron.loans)
@@ -209,7 +209,7 @@ class TestOverdriveAPI(DatabaseTest):
         circulation = CirculationAPI(self._db, overdrive=overdrive)
         patron = self.default_patron
         
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
         eq_(5, len(patron.loans))
         assert gutenberg_loan in patron.loans
 
@@ -224,7 +224,7 @@ class TestOverdriveAPI(DatabaseTest):
         circulation = CirculationAPI(self._db, overdrive=overdrive)
         patron = self.default_patron
 
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
         # All four loans in the sample data were created.
         eq_(4, len(holds))
         eq_(holds, patron.holds)
@@ -233,7 +233,7 @@ class TestOverdriveAPI(DatabaseTest):
         overdrive.queue_response(content=holds_data)
         overdrive.queue_response(content=loans_data)
         circulation = CirculationAPI(self._db, overdrive=overdrive)
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
         eq_(4, len(holds))
         eq_(holds, patron.holds)        
 
@@ -253,7 +253,7 @@ class TestOverdriveAPI(DatabaseTest):
 
         # The hold not present in the sample data has been removed
         circulation = CirculationAPI(self._db, overdrive=overdrive)
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
         eq_(4, len(holds))
         eq_(holds, patron.holds)
         assert overdrive_hold not in patron.loans
@@ -274,6 +274,6 @@ class TestOverdriveAPI(DatabaseTest):
         # Overdrive doesn't know about the 3M hold, but it was
         # not destroyed, because it came from another source.
         circulation = CirculationAPI(self._db, overdrive=overdrive)
-        loans, holds = circulation.sync_bookshelf(patron, "dummy pin")
+        loans, holds = circulation.sync_bookshelf(patron, "200", "dummy pin")
         eq_(5, len(patron.holds))
         assert threem_hold in patron.holds

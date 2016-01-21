@@ -151,7 +151,7 @@ class CirculationAPI(object):
             return True
         return False
 
-    def borrow(self, patron, pin, licensepool, delivery_mechanism,
+    def borrow(self, patron, patron_id, pin, licensepool, delivery_mechanism,
                hold_notification_email):
         """Either borrow a book or put it on hold. Don't worry about fulfilling
         the loan yet.
@@ -200,7 +200,7 @@ class CirculationAPI(object):
         loan_info = None
         try:
             loan_info = api.checkout(
-                patron, pin, licensepool, internal_format
+                patron, patron_id, pin, licensepool, internal_format
             )
         except AlreadyCheckedOut:
             # This is good, but we didn't get the real loan info.
@@ -241,7 +241,7 @@ class CirculationAPI(object):
         # the book on hold.
         try:
             hold_info = api.place_hold(
-                patron, pin, licensepool,
+                patron, patron_id, pin, licensepool,
                 hold_notification_email
             )
         except AlreadyOnHold, e:
@@ -269,7 +269,7 @@ class CirculationAPI(object):
         __transaction.commit()
         return None, hold, is_new
 
-    def fulfill(self, patron, pin, licensepool, delivery_mechanism):
+    def fulfill(self, patron, patron_id, pin, licensepool, delivery_mechanism):
         """Fulfil a book that a patron has previously checked out.
 
         :param delivery_mechanism: An explanation of how the patron
@@ -301,7 +301,7 @@ class CirculationAPI(object):
             api = self.api_for_license_pool(licensepool)
             internal_format = api.internal_format(delivery_mechanism)
             fulfillment = api.fulfill(
-                patron, pin, licensepool, internal_format
+                patron, patron_id, pin, licensepool, internal_format
             )
             if not fulfillment or not (
                     fulfillment.content_link or fulfillment.content
@@ -348,7 +348,7 @@ class CirculationAPI(object):
             content_expires=None
         )
 
-    def revoke_loan(self, patron, pin, licensepool):
+    def revoke_loan(self, patron, patron_id, pin, licensepool):
         """Revoke a patron's loan for a book."""
         loan = get_one(
             self._db, Loan, patron=patron, license_pool=licensepool,
@@ -361,7 +361,7 @@ class CirculationAPI(object):
         if not licensepool.open_access:
             api = self.api_for_license_pool(licensepool)
             try:
-                api.checkin(patron, pin, licensepool)
+                api.checkin(patron, patron_id, pin, licensepool)
             except NotCheckedOut, e:
                 # The book wasn't checked out in the first
                 # place. Everything's fine.
@@ -370,7 +370,7 @@ class CirculationAPI(object):
         # at this point.
         return True
 
-    def release_hold(self, patron, pin, licensepool):
+    def release_hold(self, patron, patron_id, pin, licensepool):
         """Remove a patron's hold on a book."""
         hold = get_one(
             self._db, Hold, patron=patron, license_pool=licensepool,
@@ -379,7 +379,7 @@ class CirculationAPI(object):
         if not licensepool.open_access:
             api = self.api_for_license_pool(licensepool)
             try:
-                api.release_hold(patron, pin, licensepool)
+                api.release_hold(patron, patron_id, pin, licensepool)
             except NotOnHold, e:
                 # The book wasn't on hold in the first place. Everything's
                 # fine.
@@ -392,7 +392,7 @@ class CirculationAPI(object):
             __transaction.commit()
         return True
 
-    def patron_activity(self, patron, pin):
+    def patron_activity(self, patron, patron_id, pin):
         """Return a record of the patron's current activity
         vis-a-vis all data sources.
 
@@ -402,21 +402,22 @@ class CirculationAPI(object):
         `LoanInfo` objects.
         """
         class PatronActivityThread(Thread):
-            def __init__(self, api, patron, pin):
+            def __init__(self, api, patron, patron_id, pin):
                 self.api = api
                 self.patron = patron
+                self.patron_id = patron_id
                 self.pin = pin
                 self.activity = None
                 super(PatronActivityThread, self).__init__()
 
             def run(self):
                 self.activity = self.api.patron_activity(
-                    self.patron, self.pin)
+                    self.patron, self.patron_id, self.pin)
 
         threads = []
         import time
         for api in self.apis:
-            thread = PatronActivityThread(api, patron, pin)
+            thread = PatronActivityThread(api, patron, patron_id, pin)
             threads.append(thread)
         for thread in threads:
             thread.start()
@@ -437,10 +438,10 @@ class CirculationAPI(object):
                         l.append(i)
         return loans, holds
 
-    def sync_bookshelf(self, patron, pin):
+    def sync_bookshelf(self, patron, patron_id, pin):
 
         # Get the external view of the patron's current state.
-        remote_loans, remote_holds = self.patron_activity(patron, pin)
+        remote_loans, remote_holds = self.patron_activity(patron, patron_id, pin)
         
         # Get our internal view of the patron's current state.
         __transaction = self._db.begin_nested()
@@ -553,7 +554,7 @@ class DummyCirculationAPI(CirculationAPI):
         self.active_loans = loans
         self.active_holds = holds
 
-    def patron_activity(self, patron, pin):
+    def patron_activity(self, patron, patron_id, pin):
         # Should be a 2-tuple containing a list of LoanInfo and a
         # list of HoldInfo.
         return self.active_loans, self.active_holds
@@ -573,26 +574,26 @@ class DummyCirculationAPI(CirculationAPI):
             self.dummy = dummy
 
         def checkout(
-                self, patron_obj, patron_password, licensepool, 
+                self, patron_obj, patron_id, pin, licensepool, 
                 delivery_mechanism
         ):
             # Should be a LoanInfo.
             return self.dummy._return_or_raise('checkout')
                 
-        def place_hold(self, patron, pin, licensepool, 
+        def place_hold(self, patron, patron_id, pin, licensepool, 
                        hold_notification_email=None):
             # Should be a HoldInfo.
             return self.dummy._return_or_raise('hold')
 
-        def fulfill(self, patron, password, pool, delivery_mechanism):
+        def fulfill(self, patron, patron_id, pin, pool, delivery_mechanism):
             # Should be a FulfillmentInfo.
             return self.dummy._return_or_raise('fulfill')
 
-        def checkin(self, patron, pin, licensepool):
+        def checkin(self, patron, patron_id, pin, licensepool):
             # Return value is not checked.
             return self.dummy._return_or_raise('checkin')
 
-        def release_hold(self, patron, pin, licensepool):
+        def release_hold(self, patron, patron_id, pin, licensepool):
             # Return value is not checked.
             return self.dummy._return_or_raise('release_hold')
 

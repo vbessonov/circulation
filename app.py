@@ -108,6 +108,7 @@ def lane_search(languages, lane_name):
 @requires_auth
 @returns_problem_detail
 def account():
+    set_trace()
     return app.manager.accounts.account()
 
 @app.route('/loans/', methods=['GET', 'HEAD'])

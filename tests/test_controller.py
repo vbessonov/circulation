@@ -700,6 +700,12 @@ class TestWorkController(CirculationControllerTest):
         self.datasource = self.lp.data_source.name
         self.identifier = self.lp.identifier
 
+    def test_all(self):
+        with self.app.test_request_context("/"):
+            response = self.manager.work_controller.all()
+
+        eq_(200, response.status_code)
+
     def test_permalink(self):
         with self.app.test_request_context("/"):
             response = self.manager.work_controller.permalink(self.datasource, self.identifier.type, self.identifier.identifier)

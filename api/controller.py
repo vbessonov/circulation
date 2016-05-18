@@ -44,9 +44,11 @@ from core.model import (
     Admin,
     Complaint,
     DataSource,
+    Equivalency,
     Hold,
     Identifier,
     Loan,
+    LicensePool,
     LicensePoolDeliveryMechanism,
     production_session,
 )
@@ -783,6 +785,12 @@ class LoanController(CirculationManagerController):
 
 
 class WorkController(CirculationManagerController):
+
+    def all(self):
+        results = []
+
+        qu = self._db.query(LicensePool).join(LicensePool.identifier).\
+            join(Identifier.equivalencies).join(LicensePool.presentation_edition)
 
     def permalink(self, data_source, identifier_type, identifier):
         """Serve an entry for a single book.

@@ -793,22 +793,19 @@ class WorkController(CirculationManagerController):
         data = dict(works=[])
         pagination = load_pagination_from_request()
 
+        # Grab licensed and owned works with ISBNs.
         equivalent_identifier = aliased(Identifier)
-        works_qu = self._db.query(Work).\
-            join(Work.license_pools).join(LicensePool.identifier).\
-            join(Identifier.equivalencies).\
+        works_qu = self._db.query(Work).join(Work.license_pools).\
+            join(LicensePool.identifier).join(Identifier.equivalencies).\
             join(equivalent_identifier, Equivalency.output).\
             filter(
                 or_(LicensePool.licenses_owned > 0, LicensePool.open_access),
                 equivalent_identifier.type=='ISBN'
             )
-        # works_qu = self._db.query(Work).\
-        #     join(Work.license_pools).filter(
-        #         or_(LicensePool.licenses_owned > 0, LicensePool.open_access)
-        #     )
         works_qu = works_qu.order_by(Work.id.desc())
         works_qu = pagination.apply(works_qu)
         works_qu = works_qu.options(joinedload(Work.presentation_edition))
+
         for work in works_qu.all():
             edition = work.presentation_edition
             if edition:

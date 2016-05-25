@@ -7,6 +7,8 @@ import urlparse
 import uuid
 
 from lxml import etree
+from sqlalchemy import or_
+from sqlalchemy.orm import joinedload, aliased
 
 from functools import wraps
 import flask
@@ -51,6 +53,7 @@ from core.model import (
     LicensePool,
     LicensePoolDeliveryMechanism,
     production_session,
+    Work,
 )
 from core.opds import (
     E,
@@ -786,11 +789,53 @@ class LoanController(CirculationManagerController):
 
 class WorkController(CirculationManagerController):
 
-    def all(self):
-        results = []
+    def isbns(self):
+        data = dict(works=[])
+        pagination = load_pagination_from_request()
 
-        qu = self._db.query(LicensePool).join(LicensePool.identifier).\
-            join(Identifier.equivalencies).join(LicensePool.presentation_edition)
+        equivalent_identifier = aliased(Identifier)
+        works_qu = self._db.query(Work).\
+            join(Work.license_pools).join(LicensePool.identifier).\
+            join(Identifier.equivalencies).\
+            join(equivalent_identifier, Equivalency.output).\
+            filter(
+                or_(LicensePool.licenses_owned > 0, LicensePool.open_access),
+                equivalent_identifier.type=='ISBN'
+            )
+        # works_qu = self._db.query(Work).\
+        #     join(Work.license_pools).filter(
+        #         or_(LicensePool.licenses_owned > 0, LicensePool.open_access)
+        #     )
+        works_qu = works_qu.order_by(Work.id.desc())
+        works_qu = pagination.apply(works_qu)
+        works_qu = works_qu.options(joinedload(Work.presentation_edition))
+        for work in works_qu.all():
+            edition = work.presentation_edition
+            if edition:
+                isbns = edition.equivalent_identifiers(type=Identifier.ISBN).all()
+            if isbns:
+                isbns = [identifier.identifier for identifier in isbns]
+                work_data = dict(
+                    title=work.title, author=work.author,
+                    ISBNs=isbns
+                )
+                data['works'].append(work_data)
+
+        # Add pagination links
+        def paginated_isbns_url(pagination):
+            kwargs = dict(pagination.items())
+            return self.cdn_url_for('isbns', _external=True, **kwargs)
+
+        if not pagination.done:
+            data['next'] = paginated_isbns_url(pagination.next_page)
+        if pagination.offset > 0:
+            data['first'] = paginated_isbns_url(pagination.first_page)
+        previous_page = pagination.previous_page
+        if previous_page:
+            data['previous'] = paginated_isbns_url(previous_page)
+
+        data = json.dumps(data)
+        return Response(data, 200, {"Content-Type" : "application/json"})
 
     def permalink(self, data_source, identifier_type, identifier):
         """Serve an entry for a single book.

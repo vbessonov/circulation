@@ -6,7 +6,7 @@ from nose.tools import (
 from contextlib import contextmanager
 import os
 import datetime
-
+import json
 import flask
 from flask import url_for
 from flask_sqlalchemy_session import current_session
@@ -700,11 +700,68 @@ class TestWorkController(CirculationControllerTest):
         self.datasource = self.lp.data_source.name
         self.identifier = self.lp.identifier
 
-    def test_all(self):
+    def test_isbns(self):
+        # Without any ISBN equivalencies, an empty response is returned.
         with self.app.test_request_context("/"):
-            response = self.manager.work_controller.all()
-
+            response = self.manager.work_controller.isbns()
         eq_(200, response.status_code)
+        works = json.loads(response.data)["works"]
+        eq_([], works)
+
+        # With ISBN equivalencies, all of the works are returned.
+        for work in [self.english_1, self.english_2, self.french_1]:
+            identifier = work.license_pools[0].identifier
+            isbn = self._identifier(identifier_type=Identifier.ISBN)
+            identifier.equivalent_to(self.lp.data_source, isbn, 1)
+        with self.app.test_request_context("/"):
+            response = self.manager.work_controller.isbns()
+        eq_(200, response.status_code)
+        works = json.loads(response.data)["works"]
+        eq_(3, len(works))
+        titles = [work["title"] for work in works]
+        assert self.english_1.title in titles
+        assert self.english_2.title in titles
+        assert self.french_1.title in titles
+
+        # Licensed works are returned, but if a work isn't owned, it isn't.
+        self.english_1.license_pools[0].licenses_owned = 1
+        self.english_1.license_pools[0].open_access = False
+        self.english_2.license_pools[0].open_access = False
+        with self.app.test_request_context("/"):
+            response = self.manager.work_controller.isbns()
+        works = json.loads(response.data)["works"]
+        eq_(2, len(works))
+        assert self.english_2.title not in response.data
+
+        # Requests can be paginated.
+        existing_works = [self.english_1, self.french_1]
+        with self.app.test_request_context("/?after=0&size=1"):
+            response = self.manager.work_controller.isbns()
+        response = json.loads(response.data)
+        works = response["works"]
+        eq_(1, len(works))
+        eq_(True, response["next"].endswith("?after=1&size=1"))
+        eq_(None, response.get("first"))
+        # And they include the proper ISBN string.
+        [work] = filter(lambda w: w.title==works[0]["title"], existing_works)
+        isbn = work.presentation_edition.equivalent_identifiers(type=Identifier.ISBN).one()
+        eq_([isbn.identifier], works[0]["ISBNs"])
+
+        # The next page turns up the remaining work that we expect.
+        existing_works.remove(work)
+        with self.app.test_request_context("/?after=1&size=1"):
+            response = self.manager.work_controller.isbns()
+        response = json.loads(response.data)
+        works = response["works"]
+        eq_(1, len(works))
+        eq_(existing_works[0].title, works[0]["title"])
+        [work] = filter(lambda w: w.title==works[0]["title"], existing_works)
+        isbn = work.presentation_edition.equivalent_identifiers(type=Identifier.ISBN).one()
+        eq_([isbn.identifier], works[0]["ISBNs"])
+        # And the proper pagination.
+        eq_(True, response["first"].endswith("?after=0&size=1"))
+        eq_(True, response["previous"].endswith("?after=0&size=1"))
+        eq_(None, response.get("next"))
 
     def test_permalink(self):
         with self.app.test_request_context("/"):

@@ -171,10 +171,10 @@ def work():
     annotator = CirculationManagerAnnotator(app.manager.circulation, None)
     return app.manager.urn_lookup.work_lookup(annotator, 'work')
 
-@app.route('/works/all')
+@app.route('/works/isbns')
 @returns_problem_detail
-def all():
-    return app.manager.work_controller.all()
+def isbns():
+    return app.manager.work_controller.isbns()
 
 @app.route('/works/<data_source>/<identifier_type>/<path:identifier>')
 @returns_problem_detail

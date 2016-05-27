@@ -813,7 +813,7 @@ class WorkController(CirculationManagerController):
             if isbns:
                 isbns = [identifier.identifier for identifier in isbns]
                 work_data = dict(
-                    title=work.title, author=work.author,
+                    title=work.title, author=work.sort_author,
                     ISBNs=isbns
                 )
                 data['works'].append(work_data)
@@ -823,7 +823,7 @@ class WorkController(CirculationManagerController):
             kwargs = dict(pagination.items())
             return self.cdn_url_for('isbns', _external=True, **kwargs)
 
-        if not pagination.done:
+        if pagination.has_next_page:
             data['next'] = paginated_isbns_url(pagination.next_page)
         if pagination.offset > 0:
             data['first'] = paginated_isbns_url(pagination.first_page)

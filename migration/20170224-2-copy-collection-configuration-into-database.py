@@ -14,8 +14,9 @@ from api.config import Configuration
 from core.model import (
     get_one_or_create,
     production_session,
-    Library,
     Collection,
+    ExternalIntegration,
+    Library,
 )
 
 # We're going directly against the configuration object, rather than
@@ -38,22 +39,23 @@ def convert_overdrive(_db, library):
     config = Configuration.integration('Overdrive')
     if not config:
         print u"No Overdrive configuration, not creating a Collection for it."
+        return
     print u"Creating Collection object for Overdrive collection."
     username = config.get('client_key')
     password = config.get('client_secret')
     library_id = config.get('library_id')
     website_id = config.get('website_id')
 
-    collection, ignore = get_one_or_create(
-        _db, Collection,
-        protocol=Collection.OVERDRIVE,
-        name="Overdrive"
-    )
-    library.collections.append(collection)
-    collection.external_integration.username = username
-    collection.external_integration.password = password
+    collection, ignore = get_one_or_create(_db, Collection, name=u"Overdrive")
     collection.external_account_id = library_id
-    collection.external_integration.set_setting("website_id", website_id)
+    library.collections.append(collection)
+
+    integration = collection.create_external_integration(
+        ExternalIntegration.OVERDRIVE
+    )
+    integration.username = username
+    integration.password = password
+    integration.set_setting(u"website_id", website_id)
 
 def convert_bibliotheca(_db, library):
     config = Configuration.integration('3M')
@@ -64,15 +66,15 @@ def convert_bibliotheca(_db, library):
     username = config.get('account_id')
     password = config.get('account_key')
     library_id = config.get('library_id')
-    collection, ignore = get_one_or_create(
-        _db, Collection,
-        protocol=Collection.BIBLIOTHECA,
-        name="Bibliotheca"
-    )
-    library.collections.append(collection)
-    collection.external_integration.username = username
-    collection.external_integration.password = password
+    collection, ignore = get_one_or_create(_db, Collection, name=u"Bibliotheca")
     collection.external_account_id = library_id
+    library.collections.append(collection)
+
+    integration = collection.create_external_integration(
+        ExternalIntegration.BIBLIOTHECA
+    )
+    integration.username = username
+    integration.password = password
 
 def convert_axis(_db, library):
     config = Configuration.integration('Axis 360')
@@ -86,21 +88,22 @@ def convert_axis(_db, library):
     # This is not technically a URL, it's u"production" or u"staging",
     # but it's converted into a URL internally.
     url = config.get('server')
-    collection, ignore = get_one_or_create(
-        _db, Collection,
-        protocol=Collection.AXIS_360,
-        name="Axis 360"
-    )
-    library.collections.append(collection)
-    collection.external_integration.username = username
-    collection.external_integration.password = password
+    collection, ignore = get_one_or_create(_db, Collection, name=u"Axis 360")
     collection.external_account_id = library_id
-    collection.external_integration.url = url
+    library.collections.append(collection)
+
+    integration = collection.create_external_integration(
+        ExternalIntegration.AXIS_360
+    )
+    integration.username = username
+    integration.password = password
+    integration.url = url
 
 def convert_one_click(_db, library):
     config = Configuration.integration('OneClick')
     if not config:
         print u"No OneClick configuration, not creating a Collection for it."
+        return
     print u"Creating Collection object for OneClick collection."
     basic_token = config.get('basic_token')
     library_id = config.get('library_id')
@@ -108,17 +111,15 @@ def convert_one_click(_db, library):
     ebook_loan_length = config.get('ebook_loan_length')
     eaudio_loan_length = config.get('eaudio_loan_length')
     
-    collection, ignore = get_one_or_create(
-        _db, Collection,
-        protocol=Collection.ONE_CLICK,
-        name="OneClick"
-    )
-    library.collections.append(collection)
-    collection.external_integration.password = basic_token
+    collection, ignore = get_one_or_create(_db, Collection, name=u"OneClick")
     collection.external_account_id = library_id
-    collection.external_integration.url = url
-    collection.external_integration.set_setting("ebook_loan_length", ebook_loan_length)
-    collection.external_integration.set_setting("eaudio_loan_length", eaudio_loan_length)
+    library.collections.append(collection)
+
+    integration = collection.create_external_integration(
+        ExternalIntegration.ONE_CLICK
+    )
+    integration.password = basic_token
+    integration.url = url
     
 def convert_content_server(_db, library):
     config = Configuration.integration("Content Server")
@@ -127,15 +128,17 @@ def convert_content_server(_db, library):
         return
     url = config.get('url')
     collection, ignore = get_one_or_create(
-        _db, Collection,
-        protocol=Collection.OPDS_IMPORT,
-        name="Open Access Content Server"
+        _db, Collection, name=u"Open Access Content Server"
     )
+    collection.external_account_id = url
     library.collections.append(collection)
+    integration = collection.create_external_integration(
+        ExternalIntegration.OPDS_IMPORT
+    )
 
 # This is the point in the migration where we first create a Library
 # for this system.
-library = get_one_or_create(
+library, ignore = get_one_or_create(
     _db, Library,
     create_method_kwargs=dict(
         name="Default Library",

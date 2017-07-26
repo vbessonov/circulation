@@ -78,6 +78,9 @@ class EnkiAPI(object):
     item_endpoint = "ItemAPI"
     lib = 1
 
+    ENKI_DATASOURCE = u"Enki"
+    ENKI_EXTERNAL = ENKI_DATASOURCE
+
     SET_DELIVERY_MECHANISM_AT = BaseCirculationAPI.BORROW_STEP
     SERVICE_NAME = "Enki"
     log = logging.getLogger("Enki API")

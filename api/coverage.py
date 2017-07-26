@@ -147,6 +147,7 @@ class MetadataWranglerCoverageProvider(OPDSImportCoverageProvider):
         Identifier.THREEM_ID,
         Identifier.AXIS_360_ID,
         Identifier.ONECLICK_ID,
+        Identifier.ENKI_ID,
     ]
     
     def __init__(self, collection, lookup_client=None, **kwargs):
@@ -174,7 +175,7 @@ class MetadataWranglerCoverageProvider(OPDSImportCoverageProvider):
         for identifier in batch:
             if identifier.type in [
                     Identifier.AXIS_360_ID, Identifier.THREEM_ID,
-                    Identifier.ONECLICK_ID
+                    Identifier.ONECLICK_ID, Identifier.ENKI_ID,
             ]:
                 for e in identifier.equivalencies:
                     if e.output.type == Identifier.ISBN:

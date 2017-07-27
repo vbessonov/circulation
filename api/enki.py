@@ -1,5 +1,4 @@
-
-m nose.tools import set_trace
+from nose.tools import set_trace
 from collections import defaultdict
 import datetime
 import base64
@@ -72,7 +71,17 @@ from core.opds_import import SimplifiedOPDSLookup
 
 #TODO: Remove unnecessary imports (once the classes are more or less complete)
 
-class EnkiAPI(object):
+class EnkiAPI(BaseCirculationAPI):
+
+    NAME = ExternalIntegration.Enki
+    DESCRIPTION = _("Integrate an Enki collection.")
+    SETTINGS = [
+        { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID") },
+        { "key": ExternalIntegration.USERNAME, "label": _("Username") },
+        { "key": ExternalIntegration.PASSWORD, "label": _("Password") },
+        { "key": BaseEnkiAPI.URL, "label": _("URL") },
+    ] + BaseCirculationAPI.SETTINGS
+
     PRODUCTION_BASE_URL = "http://enkilibrary.org/API/"
     availability_endpoint = "ListAPI"
     item_endpoint = "ItemAPI"
@@ -86,46 +95,29 @@ class EnkiAPI(object):
     log = logging.getLogger("Enki API")
     log.setLevel(logging.DEBUG)
 
-    def __init__(self, _db, username=None, library_id=None, password=None,
-                 base_url=None):
+    def __init__(self, _db, collection):
         self._db = _db
-        (env_library_id, env_username,
-         env_password, env_base_url) = self.environment_values()
-        self.library_id = library_id or env_library_id
-        self.username = username or env_username
-        self.password = password or env_password
-        self.base_url = base_url or env_base_url
-        if self.base_url == 'production':
-            self.base_url = self.PRODUCTION_BASE_URL
+
+        if collection.protocol != collection.ENKI:
+            raise ValueError(
+                "Collection protocol is %s, but passed into EnkiAPI!" %
+                collection.protocol
+            )
+        self.username = collection.external_integration.username.encode("utf8")
+        self.password = collection.external_integration.password.encode("utf8")
+        self.library_id = collection.external_account_id.encode("utf8")
+        self.base_url = collection.external_integration.url or self.PRODUCTION_BASE_URL
+
+        if not self.account_id or not self.account_key or not self.library_id:
+            raise CannotLoadConfiguration(
+                "Bibliotheca configuration is incomplete."
+            )
+        self.enki_bibliographic_coverage_provider = (
+            EnkiBibliographicCoverageProvider(
+                collection, api_class=self
+            )
+        )
         self.token = "mock_token"
-
-    @classmethod
-    def environment_values(cls):
-        config = Configuration.integration('Enki')
-        values = []
-        for name in [
-                'library_id',
-		'username',
-		'password',
-		'url'
-        ]:
-            value = config.get(name)
-            if value:
-                value = value.encode("utf8")
-            values.append(value)
-        return values
-
-    @classmethod
-    def from_environment(cls, _db):
-	values = cls.environment_values()
-	if len([x for x in values if not x]):
-	    cls.log.info( "No Enki client configured" )
-	    return None
-        return cls(_db)
-
-    @property
-    def source(self):
-        return DataSource.lookup(self._db, DataSource.ENKI)
 
     @property
     def authorization_headers(self):

@@ -296,6 +296,7 @@ class EnkiBibliographicCoverageProvider(BibliographicCoverageProvider):
         :param input_identifier_types: Passed in by RunCoverageProviderScript, data sources to get coverage for.
         :param input_identifiers: Passed in by RunCoverageProviderScript, specific identifiers to get coverage for.
         """
+        enki_api = enki_api or EnkiAPI(_db)
         self.parser = BibliographicParser()
         super(EnkiBibliographicCoverageProvider, self).__init__(
             _db, enki_api, DataSource.ENKI,
@@ -334,9 +335,6 @@ class EnkiBibliographicCoverageProvider(BibliographicCoverageProvider):
                 )
                 batch_results.append(result)
         return batch_results
-
-    def handle_success(self, identifier):
-        return self.set_presentation_ready(identifier)
 
     def process_item(self, identifier):
         results = self.process_batch([identifier])

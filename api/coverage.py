@@ -35,6 +35,7 @@ from core.util.http import (
     RemoteIntegrationException,
 )
 
+from enki import EnkiAPI
 
 class OPDSImportCoverageProvider(CollectionCoverageProvider):
     """Provide coverage for identifiers by looking them up, in batches,

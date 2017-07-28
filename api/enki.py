@@ -6,6 +6,7 @@ import os
 import json
 import logging
 import re
+from flask.ext.babel import lazy_gettext as _
 
 from sqlalchemy.orm import contains_eager
 
@@ -50,6 +51,7 @@ from core.model import (
     Library,
     Representation,
     Subject,
+    ExternalIntegration,
 )
 
 from core.metadata_layer import (
@@ -65,6 +67,7 @@ from core.metadata_layer import (
 from core.monitor import (
     Monitor,
     IdentifierSweepMonitor,
+    CollectionMonitor,
 )
 
 from core.opds_import import SimplifiedOPDSLookup
@@ -73,13 +76,12 @@ from core.opds_import import SimplifiedOPDSLookup
 
 class EnkiAPI(BaseCirculationAPI):
 
-    NAME = ExternalIntegration.Enki
     DESCRIPTION = _("Integrate an Enki collection.")
     SETTINGS = [
         { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID") },
         { "key": ExternalIntegration.USERNAME, "label": _("Username") },
         { "key": ExternalIntegration.PASSWORD, "label": _("Password") },
-        { "key": BaseEnkiAPI.URL, "label": _("URL") },
+        { "key": ExternalIntegration.URL, "label": _("URL") },
     ] + BaseCirculationAPI.SETTINGS
 
     PRODUCTION_BASE_URL = "http://enkilibrary.org/API/"
@@ -90,6 +92,7 @@ class EnkiAPI(BaseCirculationAPI):
     ENKI_DATASOURCE = u"Enki"
     ENKI_EXTERNAL = ENKI_DATASOURCE
     ENKI_ID = u"Enki ID"
+    NAME = ENKI_EXTERNAL
 
     SET_DELIVERY_MECHANISM_AT = BaseCirculationAPI.BORROW_STEP
     SERVICE_NAME = "Enki"
@@ -426,13 +429,12 @@ class EnkiImport(CollectionMonitor):
     """Import Enki titles.
     """
     SERVICE_NAME = "Enki Circulation Monitor"
-    PROTOCOL = ExternalIntegration.ENKI
+    PROTOCOL = EnkiAPI.ENKI_DATASOURCE
     FIVE_MINUTES = datetime.timedelta(minutes=5)
     INTERVAL_SECONDS = 500
 
-    def __init__(self, _db, name="Enki Import", collection, api_class=EnkiAPI):
+    def __init__(self, _db, collection, name="Enki Import", api_class=EnkiAPI):
 	super(EnkiImport, self).__init__(_db, collection)
-        )
         self.batch_size = batch_size
         self.api = api_class(collection)
         self.analytics = Analytics(_db)

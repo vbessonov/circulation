@@ -89,6 +89,7 @@ class EnkiAPI(BaseCirculationAPI):
 
     ENKI_DATASOURCE = u"Enki"
     ENKI_EXTERNAL = ENKI_DATASOURCE
+    ENKI_ID = u"Enki ID"
 
     SET_DELIVERY_MECHANISM_AT = BaseCirculationAPI.BORROW_STEP
     SERVICE_NAME = "Enki"
@@ -328,7 +329,7 @@ class EnkiBibliographicCoverageProvider(BibliographicCoverageProvider):
         for identifier_string in identifier_strings:
             if identifier_string not in seen_identifiers:
                 identifier, ignore = Identifier.for_foreign_id(
-                    self._db, Identifier.ENKI_ID, identifier_string
+                    self._db, api.ENKI_ID, identifier_string
                 )
                 result = CoverageFailure(
                     identifier, "Book not found in Enki", data_source=self.output_source, transient=True
@@ -375,7 +376,7 @@ class BibliographicParser(object):
         if not sort_name:
             sort_name = "Unknown"
         contributors.append(ContributorData(sort_name=sort_name))
-        primary_identifier = IdentifierData(Identifier.ENKI_ID, element["id"])
+        primary_identifier = IdentifierData(api.ENKI_ID, element["id"])
 	metadata = Metadata(
         data_source=DataSource.ENKI,
         title=element["title"],
@@ -421,23 +422,22 @@ class BibliographicParser(object):
 
         return bibliographic, availability
 
-class EnkiImport(Monitor):
+class EnkiImport(CollectionMonitor):
     """Import Enki titles.
     """
-
-    VERY_LONG_AGO = datetime.datetime(1970, 1, 1)
+    SERVICE_NAME = "Enki Circulation Monitor"
+    PROTOCOL = ExternalIntegration.ENKI
     FIVE_MINUTES = datetime.timedelta(minutes=5)
+    INTERVAL_SECONDS = 500
 
-    def __init__(self, _db, name="Enki Import",
-                 interval_seconds=60, batch_size=50, api=None):
-	super(EnkiImport, self).__init__(
-            _db, name, interval_seconds=interval_seconds,
-            default_start_time = self.VERY_LONG_AGO
+    def __init__(self, _db, name="Enki Import", collection, api_class=EnkiAPI):
+	super(EnkiImport, self).__init__(_db, collection)
         )
         self.batch_size = batch_size
-        self.api = api or EnkiAPI.from_environment(self._db)
+        self.api = api_class(collection)
+        self.analytics = Analytics(_db)
         self.bibliographic_coverage_provider = (
-            EnkiBibliographicCoverageProvider(self._db, enki_api=api)
+            EnkiBibliographicCoverageProvider(self.collection, api_class=self)
         )
 
     def run_once(self, start, cutoff):
@@ -507,7 +507,7 @@ class EnkiCollectionReaper(IdentifierSweepMonitor):
 
     def identifier_query(self):
         return self._db.query(Identifier).filter(
-            Identifier.type==Identifier.ENKI_ID)
+            Identifier.type==api.ENKI_ID)
 
     def process_batch(self, identifiers):
         for identifier in identifiers:

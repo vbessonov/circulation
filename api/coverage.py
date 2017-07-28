@@ -41,7 +41,7 @@ class OPDSImportCoverageProvider(CollectionCoverageProvider):
     using the Simplified lookup protocol.
     """
     DEFAULT_BATCH_SIZE = 25
-    
+
     def __init__(self, collection, lookup_client, **kwargs):
         """Constructor.
 
@@ -135,7 +135,7 @@ class OPDSImportCoverageProvider(CollectionCoverageProvider):
 
 class MetadataWranglerCoverageProvider(OPDSImportCoverageProvider):
 
-    """Make sure that the metadata wrangler has weighed in on all 
+    """Make sure that the metadata wrangler has weighed in on all
     Identifiers licensed to a Collection.
     """
 
@@ -143,13 +143,13 @@ class MetadataWranglerCoverageProvider(OPDSImportCoverageProvider):
     OPERATION = CoverageRecord.IMPORT_OPERATION
     DATA_SOURCE_NAME = DataSource.METADATA_WRANGLER
     INPUT_IDENTIFIER_TYPES = [
-        Identifier.OVERDRIVE_ID, 
+        Identifier.OVERDRIVE_ID,
         Identifier.THREEM_ID,
         Identifier.AXIS_360_ID,
         Identifier.ONECLICK_ID,
-        Identifier.ENKI_ID,
+        EnkiAPI.ENKI_ID,
     ]
-    
+
     def __init__(self, collection, lookup_client=None, **kwargs):
         _db = Session.object_session(collection)
         lookup_client = lookup_client or MetadataWranglerOPDSLookup.from_config(
@@ -175,7 +175,7 @@ class MetadataWranglerCoverageProvider(OPDSImportCoverageProvider):
         for identifier in batch:
             if identifier.type in [
                     Identifier.AXIS_360_ID, Identifier.THREEM_ID,
-                    Identifier.ONECLICK_ID, Identifier.ENKI_ID,
+                    Identifier.ONECLICK_ID, EnkiAPI.ENKI_ID,
             ]:
                 for e in identifier.equivalencies:
                     if e.output.type == Identifier.ISBN:
@@ -385,7 +385,7 @@ class ContentServerBibliographicCoverageProvider(OPDSImportCoverageProvider):
     SERVICE_NAME = "Open-access content server bibliographic coverage provider"
     DATA_SOURCE_NAME = DataSource.OA_CONTENT_SERVER
     INPUT_IDENTIFIER_TYPES = None
-    
+
     def __init__(self, collection, lookup_client, *args, **kwargs):
         if not lookup_client:
             content_server_url = (
@@ -404,12 +404,12 @@ class ContentServerBibliographicCoverageProvider(OPDSImportCoverageProvider):
         """
         work, new_work = license_pool.calculate_work(even_if_no_author=True)
         work.set_presentation_ready()
-        
+
     def items_that_need_coverage(self, *args, **kwargs):
         """Only identifiers already associated with an open-access LicensePool
         need coverage.
         """
-        qu = super(ContentServerBibliographicCoverageProvider, 
+        qu = super(ContentServerBibliographicCoverageProvider,
                    self).items_that_need_coverage(*args, **kwargs)
         qu = qu.join(Identifier.licensed_through).filter(
             LicensePool.open_access==True
@@ -421,7 +421,7 @@ class MockOPDSImportCoverageProvider(OPDSImportCoverageProvider):
 
     SERVICE_NAME = "Mock Provider"
     DATA_SOURCE_NAME = DataSource.OA_CONTENT_SERVER
-    
+
     def __init__(self, collection, *args, **kwargs):
         super(MockOPDSImportCoverageProvider, self).__init__(
             collection, None, *args, **kwargs

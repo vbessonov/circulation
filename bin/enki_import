@@ -5,12 +5,6 @@ import sys
 bin_dir = os.path.split(__file__)[0]
 package_dir = os.path.join(bin_dir, "..")
 sys.path.append(os.path.abspath(package_dir))
-<<<<<<< HEAD
-from core.scripts import RunMonitorScript
-from api.enki import EnkiImport
-RunMonitorScript(EnkiImport).run()
-=======
 from core.scripts import RunCollectionMonitorScript
 from api.enki import EnkiImport
 RunCollectionMonitorScript(EnkiImport).run()
->>>>>>> f4fd8ee4435218487dbc7625d47310fa567ac4bf

@@ -198,6 +198,12 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
                    item_id=bibliotheca_id, patron_id=patron_id)
         body = self.TEMPLATE % args 
         return self.request('GetItemACSM', body, method="PUT")
+
+    def get_audio_fulfillment_file(self, patron_id, bibliotheca_id):
+        args = dict(request_type='AudioFulfillmentRequest',
+                   item_id=bibliotheca_id, patron_id=patron_id)
+        body = self.TEMPLATE % args 
+        return self.request('GetItemAudioFulfillment', body, method="POST")
     
     def checkin(self, patron, pin, licensepool):
         patron_id = patron.authorization_identifier

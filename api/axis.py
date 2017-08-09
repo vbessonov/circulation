@@ -249,8 +249,8 @@ class Axis360CirculationMonitor(CollectionMonitor):
     DEFAULT_START_TIME = datetime(1970, 1, 1)
     FIVE_MINUTES = timedelta(minutes=5)
 
-    def __init__(self, _db, collection, api_class=Axis360API, metadata_client=None):
-        super(Axis360CirculationMonitor, self).__init__(_db, collection)
+    def __init__(self, collection, api_class=Axis360API, metadata_client=None):
+        super(Axis360CirculationMonitor, self).__init__(collection)
         if isinstance(api_class, Axis360API):
             # Use a preexisting Axis360API instance rather than
             # creating a new one.

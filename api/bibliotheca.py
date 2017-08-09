@@ -720,8 +720,8 @@ class BibliothecaEventMonitor(CollectionMonitor):
     SERVICE_NAME = "Bibliotheca Event Monitor"
     DEFAULT_START_TIME = datetime.timedelta(365*3)
     
-    def __init__(self, _db, collection, api_class=BibliothecaAPI):
-        super(BibliothecaEventMonitor, self).__init__(_db, collection)
+    def __init__(self, collection, api_class=BibliothecaAPI):
+        super(BibliothecaEventMonitor, self).__init__(collection)
         self.api = api_class(collection)
         self.bibliographic_coverage_provider = BibliothecaBibliographicCoverageProvider(
             collection, self.api

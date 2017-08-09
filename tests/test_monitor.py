@@ -83,7 +83,7 @@ class TestMetadataWranglerCollectionUpdateMonitor(DatabaseTest):
         )
 
         monitor = MetadataWranglerCollectionUpdateMonitor(
-            self._db, collection, lookup)
+            collection, lookup)
         monitor.run_once(None, None)
 
         # The original Identifier has information from the

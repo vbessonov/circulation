@@ -776,9 +776,9 @@ class OneClickCirculationMonitor(CollectionMonitor):
     INTERVAL_SECONDS = 1200
     DEFAULT_BATCH_SIZE = 50
     
-    def __init__(self, collection, batch_size=None, api_class=OneClickAPI,
+    def __init__(self, _db, collection, batch_size=None, api_class=OneClickAPI,
                  api_class_kwargs={}):
-        super(OneClickCirculationMonitor, self).__init__(collection)
+        super(OneClickCirculationMonitor, self).__init__(_db, collection)
         self.batch_size = batch_size or self.DEFAULT_BATCH_SIZE
 
         self.api = api_class(self.collection, **api_class_kwargs)

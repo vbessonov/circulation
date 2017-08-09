@@ -71,9 +71,9 @@ class MetadataWranglerCollectionUpdateMonitor(CollectionMonitor):
     SERVICE_NAME = "Metadata Wrangler Collection Updates"
     DEFAULT_START_TIME = CollectionMonitor.NEVER
 
-    def __init__(self, _db, collection, lookup=None):
+    def __init__(self, collection, lookup=None):
         super(MetadataWranglerCollectionUpdateMonitor, self).__init__(
-            _db, collection
+            collection
         )
         self.lookup = lookup or MetadataWranglerOPDSLookup.from_config(
             self._db, collection=collection

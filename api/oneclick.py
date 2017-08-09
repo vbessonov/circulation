@@ -778,8 +778,7 @@ class OneClickCirculationMonitor(CollectionMonitor):
     
     def __init__(self, collection, batch_size=None, api_class=OneClickAPI,
                  api_class_kwargs={}):
-        _db = Session.object_session(collection)
-        super(OneClickCirculationMonitor, self).__init__(_db, collection)
+        super(OneClickCirculationMonitor, self).__init__(collection)
         self.batch_size = batch_size or self.DEFAULT_BATCH_SIZE
 
         self.api = api_class(self.collection, **api_class_kwargs)

@@ -5,6 +5,7 @@ from circulation_exceptions import *
 from problem_details import *
 from flask.ext.babel import lazy_gettext as _
 from core.model import Library, get_one
+import logging
 
 class BaseCirculationManagerController(object):
     """Define minimal standards for a circulation manager controller,
@@ -64,6 +65,9 @@ class BaseCirculationManagerController(object):
         patron = self.manager.auth.authenticated_patron(
             self._db, authorization_header
         )
+        from core.model import Session
+        logging.error("Database used to get patron: %s", self._db)
+        logging.error("Session for request patron: %s", Session.object_session(patron))
         if not patron:
             return INVALID_CREDENTIALS
 

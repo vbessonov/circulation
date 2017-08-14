@@ -77,6 +77,12 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
         (Representation.MP3_MEDIA_TYPE, adobe_drm) : 'MP3'
     }
 
+    def __init__(self, _db, collection):
+        super(BibliothecaAPI, self).__init__(_db, collection)
+        self.log.error("DB associated with BibliothecaAPI: %s", _db)
+        self.log.error("Collection associated with BibliothecaAPI: %s",
+                       Session.object_session(collection))
+    
     def get_events_between(self, start, end, cache_result=False):
         """Return event objects for events between the given times."""
         start = start.strftime(self.ARGUMENT_TIME_FORMAT)

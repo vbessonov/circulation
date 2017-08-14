@@ -48,6 +48,8 @@ class CirculationInfo(object):
             with the LicensePool.
         :param identifier: The string identifying the LicensePool.
         """
+        logging.error("Collection associated with CirculationInfo: %s",
+                      Session.object_session(collection))
         self.collection = collection
         self.data_source_name = data_source_name
         self.identifier_type = identifier_type

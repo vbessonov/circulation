@@ -709,6 +709,10 @@ class LoanController(CirculationManagerController):
         credential = self.manager.auth.get_credential_from_header(header)
         problem_doc = None
 
+        from core.model import Session
+        if Session.object_session(collection) != Session.object_session(patron):
+            set_trace()
+
         try:
             loan, hold, is_new = self.circulation.borrow(
                 patron, credential, pool, mechanism

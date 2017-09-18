@@ -24,8 +24,6 @@ from core.opds_import import (
 from core.external_search import ExternalSearchIndex
 from core.util.http import RemoteIntegrationException
 
-from coverage import MetadataWranglerCoverageProvider
-
 class SearchIndexMonitor(WorkSweepMonitor):
     """Make sure the search index is up-to-date for every work."""
     SERVICE_NAME = "Search index update"

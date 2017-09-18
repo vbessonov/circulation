@@ -318,6 +318,17 @@ class TestNoveListCoverageProvider(DatabaseTest):
             title=u"The Great American Novel"
         )
 
+    def test_initialization(self):
+        # The coverage provider can be created without a cutoff_time.
+        api = NoveListCoverageProvider(self._db, cutoff_time=None)
+        eq_(None, api.cutoff_time)
+
+        # Without a given cutoff_time, it will default to 15 days ago.
+        api = NoveListCoverageProvider(self._db)
+        assert api.cutoff_time
+        delta = datetime.datetime.utcnow() - api.cutoff_time
+        eq_(15, delta.days)
+
     def test_process_item(self):
         identifier = self._identifier()
         self.novelist.api.setup(None, self.metadata)

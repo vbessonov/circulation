@@ -2,6 +2,7 @@ import json
 import logging
 import urllib
 from collections import Counter
+from datetime import datetime, timedelta
 from nose.tools import set_trace
 from flask.ext.babel import lazy_gettext as _
 
@@ -440,6 +441,17 @@ class NoveListCoverageProvider(IdentifierCoverageProvider):
     DATA_SOURCE_NAME = DataSource.NOVELIST
     DEFAULT_BATCH_SIZE = 25
     INPUT_IDENTIFIER_TYPES = [Identifier.ISBN]
+
+    DEFAULT_COVERAGE_AGE = 15*24*60*60  # 15 days
+
+    def __init__(self, _db, api=None, **kwargs):
+        self.api = api or NoveListAPI.from_config(_db)
+
+        if 'cutoff_time' not in kwargs:
+            cutoff_delta = timedelta(seconds=self.DEFAULT_COVERAGE_AGE)
+            kwargs['cutoff_time'] = datetime.utcnow() - cutoff_delta
+
+        super(NoveListCoverageProvider, self).__init__(_db, **kwargs)
     
     def process_item(self, identifier):
         metadata = self.api.lookup(identifier)
@@ -457,7 +469,7 @@ class NoveListCoverageProvider(IdentifierCoverageProvider):
         # This will capture equivalent ISBNs and less appealing metadata in
         # its unfettered state on the NoveList identifier alone.
         edition, ignore = metadata.edition(self._db)
-        metadata.apply(edition, collection=None)
+        self.set_metadata(edition.primary_identifier, metadata)
 
         if edition.series or edition.series_position:
             metadata.primary_identifier = identifier
@@ -469,6 +481,6 @@ class NoveListCoverageProvider(IdentifierCoverageProvider):
             metadata.identifiers = []
             # Before creating an edition for the original identifier.
             novelist_edition, ignore = metadata.edition(self._db)
-            metadata.apply(novelist_edition, collection=None)
+            self.set_metadata(novelist_edition.primary_identifier, metadata)
 
         return identifier

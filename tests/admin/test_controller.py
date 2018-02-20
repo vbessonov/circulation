@@ -15,7 +15,11 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_OAEP
 
 from ..test_controller import CirculationControllerTest
-from api.admin.controller import setup_admin_controllers, AdminAnnotator
+from api.admin.controller import (
+    setup_admin_controllers,
+    AdminAnnotator,
+    SettingsController,
+)
 from api.admin.problem_details import *
 from api.admin.routes import setup_admin
 from api.config import (
@@ -47,6 +51,7 @@ from core.model import (
     WorkGenre
 )
 from core.lane import Lane
+from core.s3 import S3Uploader
 from core.testing import (
     AlwaysSuccessfulCoverageProvider,
     NeverSuccessfulCoverageProvider,
@@ -227,6 +232,86 @@ class TestWorkController(AdminControllerTest):
             eq_(1, len(unsuppress_links))
             assert lp.identifier.identifier in unsuppress_links[0]
 
+    def test_roles(self):
+        roles = self.manager.admin_work_controller.roles()
+        assert Contributor.ILLUSTRATOR_ROLE in roles.values()
+        assert Contributor.NARRATOR_ROLE in roles.values()
+        eq_(Contributor.ILLUSTRATOR_ROLE,
+            roles[Contributor.MARC_ROLE_CODES[Contributor.ILLUSTRATOR_ROLE]])
+        eq_(Contributor.NARRATOR_ROLE,
+            roles[Contributor.MARC_ROLE_CODES[Contributor.NARRATOR_ROLE]])
+
+    def test_languages(self):
+        languages = self.manager.admin_work_controller.languages()
+        assert 'en' in languages.keys()
+        assert 'fre' in languages.keys()
+        names = [name for sublist in languages.values() for name in sublist]
+        assert 'English' in names
+        assert 'French' in names
+
+    def test_media(self):
+        media = self.manager.admin_work_controller.media()
+        assert Edition.BOOK_MEDIUM in media.values()
+        assert Edition.medium_to_additional_type[Edition.BOOK_MEDIUM] in media.keys()
+
+    def _make_test_edit_request(self, data):
+        [lp] = self.english_1.license_pools
+        with self.request_context_with_library("/"):
+            flask.request.form = ImmutableMultiDict(data)
+            return self.manager.admin_work_controller.edit(
+                lp.identifier.type, lp.identifier.identifier
+            )
+
+    def test_edit_unknown_role(self):
+        response = self._make_test_edit_request(
+            [('contributor-role', self._str),
+             ('contributor-name', self._str)])
+        eq_(400, response.status_code)
+        eq_(UNKNOWN_ROLE.uri, response.uri)
+
+    def test_edit_invalid_series_position(self):
+        response = self._make_test_edit_request(
+            [('series', self._str),
+             ('series_position', 'five')])
+        eq_(400, response.status_code)
+        eq_(INVALID_SERIES_POSITION.uri, response.uri)
+
+    def test_edit_unknown_medium(self):
+        response = self._make_test_edit_request(
+            [('medium', self._str)])
+        eq_(400, response.status_code)
+        eq_(UNKNOWN_MEDIUM.uri, response.uri)
+
+    def test_edit_unknown_language(self):
+        response = self._make_test_edit_request(
+            [('language', self._str)])
+        eq_(400, response.status_code)
+        eq_(UNKNOWN_LANGUAGE.uri, response.uri)
+
+    def test_edit_invalid_date_format(self):
+        response = self._make_test_edit_request(
+            [('issued', self._str)])
+        eq_(400, response.status_code)
+        eq_(INVALID_DATE_FORMAT.uri, response.uri)
+
+    def test_edit_invalid_rating_not_number(self):
+        response = self._make_test_edit_request(
+            [('rating', 'abc')])
+        eq_(400, response.status_code)
+        eq_(INVALID_RATING.uri, response.uri)
+
+    def test_edit_invalid_rating_above_scale(self):
+        response = self._make_test_edit_request(
+            [('rating', 9999)])
+        eq_(400, response.status_code)
+        eq_(INVALID_RATING.uri, response.uri)
+
+    def test_edit_invalid_rating_below_scale(self):
+        response = self._make_test_edit_request(
+            [('rating', -3)])
+        eq_(400, response.status_code)
+        eq_(INVALID_RATING.uri, response.uri)
+
     def test_edit(self):
         [lp] = self.english_1.license_pools
 
@@ -243,8 +328,18 @@ class TestWorkController(AdminControllerTest):
             flask.request.form = ImmutableMultiDict([
                 ("title", "New title"),
                 ("subtitle", "New subtitle"),
+                ("contributor-role", "Author"),
+                ("contributor-name", "New Author"),
+                ("contributor-role", "Narrator"),
+                ("contributor-name", "New Narrator"),
                 ("series", "New series"),
                 ("series_position", "144"),
+                ("medium", "Audio"),
+                ("language", "French"),
+                ("publisher", "New Publisher"),
+                ("imprint", "New Imprint"),
+                ("issued", "2017-11-05"),
+                ("rating", "2"),
                 ("summary", "<p>New summary</p>")
             ])
             response = self.manager.admin_work_controller.edit(
@@ -255,21 +350,50 @@ class TestWorkController(AdminControllerTest):
             assert "New title" in self.english_1.simple_opds_entry
             eq_("New subtitle", self.english_1.subtitle)
             assert "New subtitle" in self.english_1.simple_opds_entry
+            eq_("New Author", self.english_1.author)
+            assert "New Author" in self.english_1.simple_opds_entry
+            [author, narrator] = sorted(
+                self.english_1.presentation_edition.contributions,
+                key=lambda x: x.contributor.display_name)
+            eq_("New Author", author.contributor.display_name)
+            eq_("Author, New", author.contributor.sort_name)
+            eq_("Primary Author", author.role)
+            eq_("New Narrator", narrator.contributor.display_name)
+            eq_("Narrator, New", narrator.contributor.sort_name)
+            eq_("Narrator", narrator.role)
             eq_("New series", self.english_1.series)
             assert "New series" in self.english_1.simple_opds_entry
             eq_(144, self.english_1.series_position)
             assert "144" in self.english_1.simple_opds_entry
+            eq_("Audio", self.english_1.presentation_edition.medium)
+            eq_("fre", self.english_1.presentation_edition.language)
+            eq_("New Publisher", self.english_1.publisher)
+            eq_("New Imprint", self.english_1.presentation_edition.imprint)
+            eq_(datetime(2017, 11, 5), self.english_1.presentation_edition.issued)
+            eq_(0.25, self.english_1.quality)
             eq_("<p>New summary</p>", self.english_1.summary_text)
             assert "&lt;p&gt;New summary&lt;/p&gt;" in self.english_1.simple_opds_entry
             eq_(1, staff_edition_count())
 
         with self.request_context_with_library("/"):
-            # Change the summary again
+            # Change the summary again and add an author.
             flask.request.form = ImmutableMultiDict([
                 ("title", "New title"),
                 ("subtitle", "New subtitle"),
+                ("contributor-role", "Author"),
+                ("contributor-name", "New Author"),
+                ("contributor-role", "Narrator"),
+                ("contributor-name", "New Narrator"),
+                ("contributor-role", "Author"),
+                ("contributor-name", "Second Author"),
                 ("series", "New series"),
                 ("series_position", "144"),
+                ("medium", "Audio"),
+                ("language", "French"),
+                ("publisher", "New Publisher"),
+                ("imprint", "New Imprint"),
+                ("issued", "2017-11-05"),
+                ("rating", "2"),
                 ("summary", "abcd")
             ])
             response = self.manager.admin_work_controller.edit(
@@ -278,15 +402,34 @@ class TestWorkController(AdminControllerTest):
             eq_(200, response.status_code)
             eq_("abcd", self.english_1.summary_text)
             assert 'New summary' not in self.english_1.simple_opds_entry
+            [author, narrator, author2] = sorted(
+                self.english_1.presentation_edition.contributions,
+                key=lambda x: x.contributor.display_name)
+            eq_("New Author", author.contributor.display_name)
+            eq_("Author, New", author.contributor.sort_name)
+            eq_("Primary Author", author.role)
+            eq_("New Narrator", narrator.contributor.display_name)
+            eq_("Narrator, New", narrator.contributor.sort_name)
+            eq_("Narrator", narrator.role)
+            eq_("Second Author", author2.contributor.display_name)
+            eq_("Author", author2.role)
             eq_(1, staff_edition_count())
 
         with self.request_context_with_library("/"):
-            # Now delete the subtitle and series and summary entirely
+            # Now delete the subtitle, narrator, series, and summary entirely
             flask.request.form = ImmutableMultiDict([
                 ("title", "New title"),
+                ("contributor-role", "Author"),
+                ("contributor-name", "New Author"),
                 ("subtitle", ""),
                 ("series", ""),
                 ("series_position", ""),
+                ("medium", "Audio"),
+                ("language", "French"),
+                ("publisher", "New Publisher"),
+                ("imprint", "New Imprint"),
+                ("issued", "2017-11-05"),
+                ("rating", "2"),
                 ("summary", "")
             ])
             response = self.manager.admin_work_controller.edit(
@@ -294,10 +437,13 @@ class TestWorkController(AdminControllerTest):
             )
             eq_(200, response.status_code)
             eq_(None, self.english_1.subtitle)
+            [author] = self.english_1.presentation_edition.contributions
+            eq_("New Author", author.contributor.display_name)
             eq_(None, self.english_1.series)
             eq_(None, self.english_1.series_position)
             eq_("", self.english_1.summary_text)
             assert 'New subtitle' not in self.english_1.simple_opds_entry
+            assert "Narrator" not in self.english_1.simple_opds_entry
             assert 'New series' not in self.english_1.simple_opds_entry
             assert '144' not in self.english_1.simple_opds_entry
             assert 'abcd' not in self.english_1.simple_opds_entry
@@ -325,21 +471,6 @@ class TestWorkController(AdminControllerTest):
             assert '169' in self.english_1.simple_opds_entry
             assert "&lt;p&gt;Final summary&lt;/p&gt;" in self.english_1.simple_opds_entry
             eq_(1, staff_edition_count())
-
-        with self.request_context_with_library("/"):
-            # Set the series position to a non-numerical value
-            flask.request.form = ImmutableMultiDict([
-                ("title", "New title"),
-                ("subtitle", "Final subtitle"),
-                ("series", "Final series"),
-                ("series_position", "abc"),
-                ("summary", "<p>Final summary</p>")
-            ])
-            response = self.manager.admin_work_controller.edit(
-                lp.identifier.type, lp.identifier.identifier
-            )
-            eq_(400, response.status_code)
-            eq_(169, self.english_1.series_position)
 
     def test_edit_classifications(self):
         # start with a couple genres based on BISAC classifications from Axis 360
@@ -773,6 +904,79 @@ class TestWorkController(AdminControllerTest):
                 eq_(response['classifications'][i]['source'], source.name)
                 eq_(response['classifications'][i]['weight'], classification.weight)
 
+    def test_custom_lists_get(self):
+        staff_data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
+        list, ignore = create(self._db, CustomList, name=self._str, library=self._default_library, data_source=staff_data_source)
+        work = self._work(with_license_pool=True)
+        list.add_entry(work)
+        identifier = work.presentation_edition.primary_identifier
+
+        with self.request_context_with_library("/"):
+            response = self.manager.admin_work_controller.custom_lists(identifier.type, identifier.identifier)
+            lists = response.get('custom_lists')
+            eq_(1, len(lists))
+            eq_(list.id, lists[0].get("id"))
+            eq_(list.name, lists[0].get("name"))
+
+    def test_custom_lists_edit_with_missing_list(self):
+        work = self._work(with_license_pool=True)
+        identifier = work.presentation_edition.primary_identifier
+
+        with self.request_context_with_library("/", method="POST"):
+            flask.request.form = MultiDict([
+                ("id", "4"),
+                ("name", "name"),
+            ])
+            response = self.manager.admin_custom_lists_controller.custom_lists()
+            eq_(MISSING_CUSTOM_LIST, response)
+
+    def test_custom_lists_edit_success(self):
+        staff_data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
+        list, ignore = create(self._db, CustomList, name=self._str, library=self._default_library, data_source=staff_data_source)
+        work = self._work(with_license_pool=True)
+        self.add_to_materialized_view([work])
+        identifier = work.presentation_edition.primary_identifier
+
+        # Create a Lane that depends on this CustomList for its membership.
+        lane = self._lane()
+        lane.customlists.append(list)
+        eq_(0, lane.size)
+
+        # Add the list to the work.
+        with self.request_context_with_library("/", method="POST"):
+            flask.request.form = MultiDict([
+                ("lists", json.dumps([{ "id": str(list.id), "name": list.name }]))
+            ])
+            response = self.manager.admin_work_controller.custom_lists(identifier.type, identifier.identifier)
+            eq_(200, response.status_code)
+            eq_(1, len(work.custom_list_entries))
+            eq_(1, len(list.entries))
+            eq_(list, work.custom_list_entries[0].customlist)
+            eq_(True, work.custom_list_entries[0].featured)
+            eq_(1, lane.size)
+
+        # Now remove the list.
+        with self.request_context_with_library("/", method="POST"):
+            flask.request.form = MultiDict([
+                ("lists", json.dumps([])),
+            ])
+            response = self.manager.admin_work_controller.custom_lists(identifier.type, identifier.identifier)
+            eq_(200, response.status_code)
+            eq_(0, len(work.custom_list_entries))
+            eq_(0, len(list.entries))
+            eq_(0, lane.size)
+
+        # Add a list that didn't exist before.
+        with self.request_context_with_library("/", method="POST"):
+            flask.request.form = MultiDict([
+                ("lists", json.dumps([{ "name": "new list" }]))
+            ])
+            response = self.manager.admin_work_controller.custom_lists(identifier.type, identifier.identifier)
+            eq_(200, response.status_code)
+            eq_(1, len(work.custom_list_entries))
+            new_list = CustomList.find(self._db, "new list", staff_data_source, self._default_library)
+            eq_(new_list, work.custom_list_entries[0].customlist)
+            eq_(True, work.custom_list_entries[0].featured)
 
 class TestSignInController(AdminControllerTest):
 
@@ -1076,12 +1280,9 @@ class TestCustomListsController(AdminControllerTest):
 
         one_entry, ignore = create(self._db, CustomList, name=self._str, library=self._default_library)
         edition = self._edition()
-        [c1] = edition.author_contributors
-        c1.display_name = self._str
-        c2, ignore = self._contributor()
-        c2.display_name = self._str
-        edition.add_contributor(c2, Contributor.AUTHOR_ROLE)
         one_entry.add_entry(edition)
+        collection = self._collection()
+        collection.customlists = [one_entry]
 
         no_entries, ignore = create(self._db, CustomList, name=self._str, library=self._default_library)
 
@@ -1093,17 +1294,17 @@ class TestCustomListsController(AdminControllerTest):
 
             eq_(one_entry.id, l1.get("id"))
             eq_(one_entry.name, l1.get("name"))
-            eq_(1, len(l1.get("entries")))
-            [entry] = l1.get("entries")
-            eq_(edition.permanent_work_id, entry.get("pwid"))
-            eq_(edition.title, entry.get("title"))
-            eq_(2, len(entry.get("authors")))
-            eq_(set([c1.display_name, c2.display_name]),
-                set(entry.get("authors")))
+            eq_(1, l1.get("entry_count"))
+            eq_(1, len(l1.get("collections")))
+            [c] = l1.get("collections")
+            eq_(collection.name, c.get("name"))
+            eq_(collection.id, c.get("id"))
+            eq_(collection.protocol, c.get("protocol"))
 
             eq_(no_entries.id, l2.get("id"))
             eq_(no_entries.name, l2.get("name"))
-            eq_(0, len(l2.get("entries")))
+            eq_(0, l2.get("entry_count"))
+            eq_(0, len(l2.get("collections")))
 
     def test_custom_lists_post_errors(self):
         with self.request_context_with_library("/", method='POST'):
@@ -1145,13 +1346,35 @@ class TestCustomListsController(AdminControllerTest):
             response = self.manager.admin_custom_lists_controller.custom_lists()
             eq_(CUSTOM_LIST_NAME_ALREADY_IN_USE, response)
 
+        with self.request_context_with_library("/", method='POST'):
+            flask.request.form = MultiDict([
+                ("name", "name"),
+                ("collections", json.dumps([12345])),
+            ])
+            response = self.manager.admin_custom_lists_controller.custom_lists()
+            eq_(MISSING_COLLECTION, response)
+
+    def test_custom_lists_post_collection_with_wrong_library(self):
+        # This collection is not associated with any libraries.
+        collection = self._collection()
+        with self.request_context_with_library("/", method='POST'):
+            flask.request.form = MultiDict([
+                ("name", "name"),
+                ("collections", json.dumps([collection.id])),
+            ])
+            response = self.manager.admin_custom_lists_controller.custom_lists()
+            eq_(COLLECTION_NOT_ASSOCIATED_WITH_LIBRARY, response)
+
     def test_custom_lists_create(self):
         work = self._work(with_open_access_download=True)
+        collection = self._collection()
+        collection.libraries = [self._default_library]
 
         with self.request_context_with_library("/", method="POST"):
             flask.request.form = MultiDict([
                 ("name", "List"),
                 ("entries", json.dumps([dict(pwid=work.presentation_edition.permanent_work_id)])),
+                ("collections", json.dumps([collection.id])),
             ])
 
             response = self.manager.admin_custom_lists_controller.custom_lists()
@@ -1165,8 +1388,44 @@ class TestCustomListsController(AdminControllerTest):
             eq_(work, list.entries[0].work)
             eq_(work.presentation_edition, list.entries[0].edition)
             eq_(True, list.entries[0].featured)
+            eq_([collection], list.collections)
 
-    def test_custom_lists_edit(self):
+    def test_custom_list_get(self):
+        data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
+        list, ignore = create(self._db, CustomList, name=self._str, library=self._default_library, data_source=data_source)
+        edition = self._edition()
+        [c1] = edition.author_contributors
+        c1.display_name = self._str
+        c2, ignore = self._contributor()
+        c2.display_name = self._str
+        edition.add_contributor(c2, Contributor.AUTHOR_ROLE)
+        list.add_entry(edition)
+        collection = self._collection()
+        collection.customlists = [list]
+        with self.request_context_with_library("/"):
+            response = self.manager.admin_custom_lists_controller.custom_list(list.id)
+            eq_(list.id, response.get("id"))
+            eq_(list.name, response.get("name"))
+            eq_(1, response.get("entry_count"))
+            eq_(1, len(response.get("entries")))
+            [entry] = response.get("entries")
+            eq_(edition.permanent_work_id, entry.get("pwid"))
+            eq_(edition.title, entry.get("title"))
+            eq_(2, len(entry.get("authors")))
+            eq_(set([c1.display_name, c2.display_name]),
+                set(entry.get("authors")))
+            eq_(1, len(response.get("collections")))
+            [c] = response.get("collections")
+            eq_(collection.name, c.get("name"))
+            eq_(collection.id, c.get("id"))
+            eq_(collection.protocol, c.get("protocol"))
+
+    def test_custom_list_get_errors(self):
+        with self.request_context_with_library("/"):
+            response = self.manager.admin_custom_lists_controller.custom_list(123)
+            eq_(MISSING_CUSTOM_LIST, response)
+
+    def test_custom_list_edit(self):
         data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
         list, ignore = create(self._db, CustomList, name=self._str, data_source=data_source)
         list.library = self._default_library
@@ -1184,21 +1443,30 @@ class TestCustomListsController(AdminControllerTest):
         self.add_to_materialized_view([w1, w2, w3])
 
         new_entries = [dict(pwid=work.presentation_edition.permanent_work_id) for work in [w2, w3]]
+
+        c1 = self._collection()
+        c1.libraries = [self._default_library]
+        c2 = self._collection()
+        c2.libraries = [self._default_library]
+        list.collections = [c1]
+        new_collections = [c2]
         
         with self.request_context_with_library("/", method="POST"):
             flask.request.form = MultiDict([
                 ("id", str(list.id)),
                 ("name", "new name"),
                 ("entries", json.dumps(new_entries)),
+                ("collections", json.dumps([c.id for c in new_collections])),
             ])
 
-            response = self.manager.admin_custom_lists_controller.custom_lists()
+            response = self.manager.admin_custom_lists_controller.custom_list(list.id)
             eq_(200, response.status_code)
             eq_(list.id, int(response.response[0]))
 
             eq_("new name", list.name)
             eq_(set([w2, w3]),
                 set([entry.work for entry in list.entries]))
+            eq_(new_collections, list.collections)
 
         # The lane's estimated size has been updated.
         eq_(2, lane.size)
@@ -1392,7 +1660,7 @@ class TestLanesController(AdminControllerTest):
                 ("parent_id", parent.id),
                 ("display_name", "lane"),
                 ("custom_list_ids", json.dumps([list.id])),
-                ("inherit_parent_restrictions", False),
+                ("inherit_parent_restrictions", "false"),
             ])
             response = self.manager.admin_lanes_controller.lanes()
             eq_(201, response.status_code)
@@ -1430,7 +1698,7 @@ class TestLanesController(AdminControllerTest):
                 ("id", str(lane.id)),
                 ("display_name", "new name"),
                 ("custom_list_ids", json.dumps([list2.id])),
-                ("inherit_parent_restrictions", True),
+                ("inherit_parent_restrictions", "true"),
             ])
 
             response = self.manager.admin_lanes_controller.lanes()
@@ -1522,7 +1790,7 @@ class TestLanesController(AdminControllerTest):
 
     def test_hide_lane_errors(self):
         with self.request_context_with_library("/"):
-            response = self.manager.admin_lanes_controller.hide_lane(123)
+            response = self.manager.admin_lanes_controller.hide_lane(123456789)
             eq_(MISSING_LANE, response)
 
     def test_reset(self):
@@ -1760,6 +2028,84 @@ class TestSettingsController(AdminControllerTest):
         response = self.responses.pop()
         return HTTP.process_debuggable_response(response)
 
+    def test_get_integration_protocols(self):
+        """Test the _get_integration_protocols helper method."""
+        class Protocol(object):
+            __module__ = 'my name'
+            NAME = 'my label'
+            DESCRIPTION = 'my description'
+            SITEWIDE = True
+            SETTINGS = [1,2,3]
+            CHILD_SETTINGS = [4,5]
+            LIBRARY_SETTINGS = [6]
+            CARDINALITY = 1
+
+        [result] = SettingsController._get_integration_protocols([Protocol])
+        expect = dict(
+            sitewide=True, description='my description',
+            settings=[1, 2, 3], library_settings=[6],
+            child_settings=[4, 5], label='my label',
+            cardinality=1, name='my name'
+        )
+        eq_(expect, result)
+
+        # Remove the CARDINALITY setting
+        del Protocol.CARDINALITY
+
+        # And look in a different place for the name.
+        [result] = SettingsController._get_integration_protocols(
+            [Protocol], protocol_name_attr='NAME'
+        )
+
+        eq_('my label', result['name'])
+        assert 'cardinality' not in result
+
+    def test_create_integration(self):
+        """Test the _create_integration helper method."""
+
+        m = self.manager.admin_settings_controller._create_integration
+
+        protocol_definitions = [
+            dict(name="allow many"),
+            dict(name="allow one", cardinality=1),
+        ]
+        goal = "some goal"
+
+        # You get an error if you don't pass in a protocol.
+        eq_(
+            (NO_PROTOCOL_FOR_NEW_SERVICE, False),
+            m(protocol_definitions, None, goal)
+        )
+
+        # You get an error if you do provide a protocol but no definition
+        # for it can be found.
+        eq_(
+            (UNKNOWN_PROTOCOL, False),
+            m(protocol_definitions, "no definition", goal)
+        )
+
+        # If the protocol has multiple cardinality you can create as many
+        # integrations using that protocol as you want.
+        i1, is_new1 = m(protocol_definitions, "allow many", goal)
+        eq_(True, is_new1)
+
+        i2, is_new2 = m(protocol_definitions, "allow many", goal)
+        eq_(True, is_new2)
+
+        assert i1 != i2
+        for i in [i1, i2]:
+            eq_("allow many", i.protocol)
+            eq_(goal, i.goal)
+
+        # If the protocol has single cardinality, you can only create one
+        # integration using that protocol before you start getting errors.
+        i1, is_new1 = m(protocol_definitions, "allow one", goal)
+        eq_(True, is_new1)
+
+        i2, is_new2 = m(protocol_definitions, "allow one", goal)
+        eq_(False, is_new2)
+        eq_(DUPLICATE_INTEGRATION, i2)
+
     def test_libraries_get_with_no_libraries(self):
         # Delete any existing library created by the controller test setup.
         library = get_one(self._db, Library)
@@ -1875,6 +2221,7 @@ class TestSettingsController(AdminControllerTest):
                 ("name", "The New York Public Library"),
                 ("short_name", "nypl"),
                 (Configuration.WEBSITE_URL, "https://library.library/"),
+                (Configuration.TINY_COLLECTION_LANGUAGES, 'ger'),
                 (Configuration.DEFAULT_NOTIFICATION_EMAIL_ADDRESS, "email@example.com"),
                 (Configuration.FEATURED_LANE_SIZE, "5"),
                 (Configuration.DEFAULT_FACET_KEY_PREFIX + FacetConstants.ORDER_FACET_GROUP_NAME,
@@ -1906,6 +2253,17 @@ class TestSettingsController(AdminControllerTest):
                 library).value)
         eq_("data:image/png;base64,%s" % base64.b64encode(image_data),
             ConfigurationSetting.for_library(Configuration.LOGO, library).value)
+
+        # When the library was created, default lanes were also created
+        # according to its language setup. This library has one tiny
+        # collection (not a good choice for a real library), so only
+        # two lanes were created: "Other Languages" and then "German"
+        # underneath it.
+        [other_languages, german] = library.lanes
+        eq_(None, other_languages.parent)
+        eq_(['ger'], other_languages.languages)
+        eq_(other_languages, german.parent)
+        eq_(['ger'], german.languages)
 
     def test_libraries_post_edit(self):
         # A library already exists.
@@ -1994,15 +2352,70 @@ class TestSettingsController(AdminControllerTest):
             assert ExternalIntegration.OVERDRIVE in names
             assert ExternalIntegration.OPDS_IMPORT in names
 
-    def test_collections_get_with_multiple_collections(self):
+    def test_collections_get_protocols(self):
+
+        [c1] = self._default_library.collections
+
+        # When there is no storage integration configured,
+        # the protocols will not offer a 'mirror_integration_id'
+        # setting.
+        with self.app.test_request_context("/"):
+            response = self.manager.admin_settings_controller.collections()
+            protocols = response.get('protocols')
+            for protocol in protocols:
+                assert all([s.get('key') != 'mirror_integration_id' 
+                            for s in protocol['settings']])
+
+        # When storage integrations are configured, each protocol will
+        # offer a 'mirror_integration_id' setting.
+        storage1 = self._external_integration(
+            name="integration 1",
+            protocol=ExternalIntegration.S3,
+            goal=ExternalIntegration.STORAGE_GOAL
+        )
+        storage2 = self._external_integration(
+            name="integration 2",
+            protocol="Some other protocol",
+            goal=ExternalIntegration.STORAGE_GOAL
+        )
+
+        with self.app.test_request_context("/"):
+            controller = self.manager.admin_settings_controller
+            response = controller.collections()
+            protocols = response.get('protocols')
+            for protocol in protocols:
+                [setting] = [x for x in protocol['settings']
+                             if x.get('key') == 'mirror_integration_id']
+                eq_("Mirror", setting['label'])
+                options = setting['options']
+
+                # The first option is to disable mirroring on this
+                # collection altogether.
+                no_mirror = options[0]
+                eq_(controller.NO_MIRROR_INTEGRATION, no_mirror['key'])
+
+                # The other options are to use one of the storage
+                # integrations to do the mirroring.
+                use_mirrors = [(x['key'], x['label'])
+                               for x in options[1:]]
+                expect = [(integration.id, integration.name)
+                          for integration in (storage1, storage2)]
+                eq_(expect, use_mirrors)
+
+    def test_collections_get_collections_with_multiple_collections(self):
 
         [c1] = self._default_library.collections
 
         c2 = self._collection(
             name="Collection 2", protocol=ExternalIntegration.OVERDRIVE,
         )
+        c2_storage = self._external_integration(
+            protocol=ExternalIntegration.S3,
+            goal=ExternalIntegration.STORAGE_GOAL
+        )
         c2.external_account_id = "1234"
         c2.external_integration.password = "b"
+        c2.mirror_integration_id=c2_storage.id
 
         c3 = self._collection(
             name="Collection 3", protocol=ExternalIntegration.OVERDRIVE,
@@ -2017,7 +2430,8 @@ class TestSettingsController(AdminControllerTest):
             self._db, "ebook_loan_duration", l1, c3.external_integration).value = "14"
 
         with self.app.test_request_context("/"):
-            response = self.manager.admin_settings_controller.collections()
+            controller = self.manager.admin_settings_controller
+            response = controller.collections()
             coll2, coll3, coll1 = sorted(
                 response.get("collections"), key = lambda c: c.get('name')
             )
@@ -2033,12 +2447,22 @@ class TestSettingsController(AdminControllerTest):
             eq_(c2.protocol, coll2.get("protocol"))
             eq_(c3.protocol, coll3.get("protocol"))
 
-            eq_(c1.external_account_id, coll1.get("settings").get("external_account_id"))
-            eq_(c2.external_account_id, coll2.get("settings").get("external_account_id"))
-            eq_(c3.external_account_id, coll3.get("settings").get("external_account_id"))
+            settings1 = coll1.get("settings", {})
+            settings2 = coll2.get("settings", {})
+            settings3 = coll3.get("settings", {})
 
-            eq_(c1.external_integration.password, coll1.get("settings").get("password"))
-            eq_(c2.external_integration.password, coll2.get("settings").get("password"))
+            eq_(controller.NO_MIRROR_INTEGRATION,
+                settings1.get("mirror_integration_id"))
+            eq_(c2_storage.id, settings2.get("mirror_integration_id"))
+            eq_(controller.NO_MIRROR_INTEGRATION,
+                settings3.get("mirror_integration_id"))
+
+            eq_(c1.external_account_id, settings1.get("external_account_id"))
+            eq_(c2.external_account_id, settings2.get("external_account_id"))
+            eq_(c3.external_account_id, settings3.get("external_account_id"))
+
+            eq_(c1.external_integration.password, settings1.get("password"))
+            eq_(c2.external_integration.password, settings2.get("password"))
 
             eq_(c2.id, coll3.get("parent_id"))
 
@@ -2352,6 +2776,94 @@ class TestSettingsController(AdminControllerTest):
 
         # The collection now has a parent.
         eq_(parent, collection.parent)
+
+    def _base_collections_post_request(self, collection):
+        """A template for POST requests to the collections controller."""
+        return [
+            ("id", collection.id),
+            ("name", "Collection 1"),
+            ("protocol", ExternalIntegration.RB_DIGITAL),
+            ("external_account_id", "1234"),
+            ("username", "user2"),
+            ("password", "password"),
+            ("url", "http://rb/"),
+        ]
+
+    def test_collections_post_edit_mirror_integration(self):
+        # The collection exists.
+        collection = self._collection(
+            name="Collection 1",
+            protocol=ExternalIntegration.RB_DIGITAL
+        )
+
+        # There is a storage integration not associated with the collection.
+        storage = self._external_integration(
+            protocol=ExternalIntegration.S3,
+            goal=ExternalIntegration.STORAGE_GOAL
+        )
+        eq_(None, collection.mirror_integration_id)
+
+        # It's possible to associate the storage integration with the
+        # collection.
+        base_request = self._base_collections_post_request(collection)
+        with self.app.test_request_context("/", method="POST"):
+            request = MultiDict(
+                base_request + [("mirror_integration_id", storage.id)]
+            )
+            flask.request.form = request
+            response = self.manager.admin_settings_controller.collections()
+            eq_(response.status_code, 200)
+            eq_(storage.id, collection.mirror_integration_id)
+
+        # It's possible to unset the mirror integration ID.
+        controller = self.manager.admin_settings_controller
+        with self.app.test_request_context("/", method="POST"):
+            request = MultiDict(
+                base_request + [("mirror_integration_id",
+                                 str(controller.NO_MIRROR_INTEGRATION))]
+            )
+            flask.request.form = request
+            response = controller.collections()
+            eq_(response.status_code, 200)
+            eq_(None, collection.mirror_integration_id)
+
+        # Providing a nonexistent integration ID gives an error.
+        with self.app.test_request_context("/", method="POST"):
+            request = MultiDict(
+                base_request + [("mirror_integration_id", -200)]
+            )
+            flask.request.form = request
+            response = self.manager.admin_settings_controller.collections()
+            eq_(response, MISSING_SERVICE)
+
+    def test_cannot_set_non_storage_integration_as_mirror_integration(self):
+        # The collection exists.
+        collection = self._collection(
+            name="Collection 1",
+            protocol=ExternalIntegration.RB_DIGITAL
+        )
+
+        # There is a storage integration not associated with the collection,
+        # which makes it possible to associate storage integrations
+        # with collections through the collections controller.
+        storage = self._external_integration(
+            protocol=ExternalIntegration.S3,
+            goal=ExternalIntegration.STORAGE_GOAL
+        )
+
+        # Trying to set a non-storage integration (such as the
+        # integration associated with the collection's licenses) as
+        # the collection's mirror integration gives an error.
+        base_request = self._base_collections_post_request(collection)
+        with self.app.test_request_context("/", method="POST"):
+            request = MultiDict(
+                base_request + [
+                    ("mirror_integration_id", collection.external_integration.id)
+                ]
+            )
+            flask.request.form = request
+            response = self.manager.admin_settings_controller.collections()
+            eq_(response, INTEGRATION_GOAL_CONFLICT)
 
     def test_collections_post_edit_library_specific_configuration(self):
         # The collection exists.
@@ -2939,7 +3451,11 @@ class TestSettingsController(AdminControllerTest):
         with self.app.test_request_context("/", method="POST"):
             flask.request.form = MultiDict([
                 ("protocol", SimpleAuthenticationProvider.__module__),
-                ("libraries", json.dumps([{ "short_name": library.short_name }])),
+                ("libraries", json.dumps([{
+                    "short_name": library.short_name,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE_NONE,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_FIELD: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_BARCODE,
+                }])),
             ] + common_args)
             response = self.manager.admin_settings_controller.patron_auth_services()
             eq_(response.uri, MULTIPLE_BASIC_AUTH_SERVICES.uri)
@@ -2952,11 +3468,29 @@ class TestSettingsController(AdminControllerTest):
                 ("protocol", SimpleAuthenticationProvider.__module__),
                 ("libraries", json.dumps([{
                     "short_name": library.short_name,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE_NONE,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_FIELD: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_BARCODE,
                     AuthenticationProvider.EXTERNAL_TYPE_REGULAR_EXPRESSION: "(invalid re",
                 }])),
             ] + common_args)
             response = self.manager.admin_settings_controller.patron_auth_services()
             eq_(response, INVALID_EXTERNAL_TYPE_REGULAR_EXPRESSION)
+
+        library, ignore = create(
+            self._db, Library, name="Library", short_name="L",
+        )
+        with self.app.test_request_context("/", method="POST"):
+            flask.request.form = MultiDict([
+                ("protocol", SimpleAuthenticationProvider.__module__),
+                ("libraries", json.dumps([{
+                    "short_name": library.short_name,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE_REGEX,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_FIELD: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_BARCODE,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION: "(invalid re",
+                }])),
+            ] + common_args)
+            response = self.manager.admin_settings_controller.patron_auth_services()
+            eq_(response, INVALID_LIBRARY_IDENTIFIER_RESTRICTION_REGULAR_EXPRESSION)
 
     def test_patron_auth_services_post_create(self):
         library, ignore = create(
@@ -2968,6 +3502,9 @@ class TestSettingsController(AdminControllerTest):
                 ("libraries", json.dumps([{
                     "short_name": library.short_name,
                     AuthenticationProvider.EXTERNAL_TYPE_REGULAR_EXPRESSION: "^(.)",
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE_REGEX,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_FIELD: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_BARCODE,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION: "^1234",
                 }])),
             ] + self._common_basic_auth_arguments())
             response = self.manager.admin_settings_controller.patron_auth_services()
@@ -3032,6 +3569,8 @@ class TestSettingsController(AdminControllerTest):
                 ("libraries", json.dumps([{
                     "short_name": l2.short_name,
                     AuthenticationProvider.EXTERNAL_TYPE_REGULAR_EXPRESSION: "^(.)",
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE_NONE,
+                    AuthenticationProvider.LIBRARY_IDENTIFIER_FIELD: AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_BARCODE,
                 }])),
             ] + self._common_basic_auth_arguments())
             response = self.manager.admin_settings_controller.patron_auth_services()
@@ -3752,7 +4291,7 @@ class TestSettingsController(AdminControllerTest):
                 ("protocol", ExternalIntegration.ELASTICSEARCH),
             ])
             response = self.manager.admin_settings_controller.search_services()
-            eq_(response, MULTIPLE_SEARCH_SERVICES)
+            eq_(response.uri, MULTIPLE_SITEWIDE_SERVICES.uri)
 
         service, ignore = create(
             self._db, ExternalIntegration,
@@ -3838,6 +4377,53 @@ class TestSettingsController(AdminControllerTest):
 
         service = get_one(self._db, ExternalIntegration, id=search_service.id)
         eq_(None, service)
+
+    def test_sitewide_service_management(self):
+        """The configuration of storage and search collections is delegated to
+        the _manage_sitewide_service and _delete_integration methods.
+
+        Since search collections are tested above, this provides
+        test coverage for storage collections.
+        """
+        class Mock(SettingsController):
+            def _manage_sitewide_service(self,*args):
+                self.manage_called_with = args
+
+            def _delete_integration(self, *args):
+                self.delete_called_with = args
+
+        controller = Mock(self.manager)
+
+        # Test storage services first.
+        EI = ExternalIntegration
+        with self.app.test_request_context("/"):
+            controller.storage_services()
+            goal, apis, key_name, problem = controller.manage_called_with
+            eq_(EI.STORAGE_GOAL, goal)
+            assert S3Uploader in apis
+            eq_('storage_services', key_name)
+            assert 'new storage service' in problem
+
+        with self.app.test_request_context("/"):
+            id = object()
+            controller.storage_service(id)
+            eq_((id, EI.STORAGE_GOAL), controller.delete_called_with)
+
+        # Search services work the same way but pass in different
+        # arguments.
+        with self.app.test_request_context("/"):
+            controller.search_services()
+            goal, apis, key_name, problem = controller.manage_called_with
+            eq_(EI.SEARCH_GOAL, goal)
+            assert ExternalSearchIndex in apis
+            eq_('search_services', key_name)
+            assert 'new search service' in problem
+
+        with self.app.test_request_context("/"):
+            id = object()
+            controller.search_service(id)
+            eq_((id, EI.SEARCH_GOAL),
+                controller.delete_called_with)
 
     def test_discovery_services_get_with_no_services_creates_default(self):
         with self.app.test_request_context("/"):

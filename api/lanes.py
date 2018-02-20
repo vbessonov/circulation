@@ -1,5 +1,5 @@
 from nose.tools import set_trace
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.orm import aliased
 from flask_babel import lazy_gettext as _
 import time
@@ -63,6 +63,40 @@ def load_lanes(_db, library):
     map(_db.expunge, to_expunge)
     return top_level
 
+
+def _lane_configuration_from_collection_sizes(estimates):
+    """Sort a library's collections into 'large', 'small', and 'tiny'
+    subcollections based on language.
+
+    :param estimates: A Counter.
+
+    :return: A 3-tuple (large, small, tiny). 'large' will contain the
+    collection with the largest language, and any languages with a
+    collection more than 10% the size of the largest
+    collection. 'small' will contain any languages with a collection
+    more than 1% the size of the largest collection, and 'tiny' will
+    contain all other languages represented in `estimates`.
+    """
+    if not estimates:
+        # There are no holdings. Assume we have a large English
+        # collection and nothing else.
+        return [u'eng'], [], []
+
+    large = []
+    small = []
+    tiny = []
+
+    [(ignore, largest)] = estimates.most_common(1)
+    for language, count in estimates.most_common():
+        if count > largest * 0.1:
+            large.append(language)
+        elif count > largest * 0.01:
+            small.append(language)
+        else:
+            tiny.append(language)
+    return large, small, tiny
+
+
 def create_default_lanes(_db, library):
     """Reset the lanes for the given library to the default.
 
@@ -92,23 +126,17 @@ def create_default_lanes(_db, library):
 
     top_level_lanes = []
 
+    # Hopefully this library is configured with explicit guidance as
+    # to how the languages should be set up.
     large = Configuration.large_collection_languages(library) or []
     small = Configuration.small_collection_languages(library) or []
     tiny = Configuration.tiny_collection_languages(library) or []
 
-    # If there are no language configuration settings, estimate the
-    # current collection size to determine the lanes.
+    # If there are no language configuration settings, we can estimate
+    # the current collection size to determine the lanes.
     if not large and not small and not tiny:
         estimates = library.estimated_holdings_by_language()
-        [(ignore, largest)] = estimates.most_common(1)
-        for language, count in estimates.most_common():
-            if count > largest * 0.1:
-                large.append(language)
-            elif count > largest * 0.01:
-                small.append(language)
-            else:
-                tiny.append(language)
-
+        large, small, tiny = _lane_configuration_from_collection_sizes(estimates)
     priority = 0
     for language in large:
         priority = create_lanes_for_large_collection(_db, library, language, priority=priority)
@@ -997,3 +1025,51 @@ class ContributorLane(DynamicLane):
 
         return super(ContributorLane, self).apply_filters(
             _db, qu, facets, pagination, featured=featured)
+
+class CrawlableCustomListFacets(Facets):
+    @classmethod
+    def default(cls, library):
+        enabled_facets = {
+            Facets.ORDER_FACET_GROUP_NAME : [Facets.ORDER_LAST_UPDATE],
+            Facets.AVAILABILITY_FACET_GROUP_NAME : [Facets.AVAILABLE_ALL],
+            Facets.COLLECTION_FACET_GROUP_NAME : [Facets.COLLECTION_FULL],
+        }
+        return cls(
+            library,
+            collection=cls.COLLECTION_FULL,
+            availability=cls.AVAILABLE_ALL,
+            order=cls.ORDER_LAST_UPDATE,
+            enabled_facets=enabled_facets,
+            order_ascending=cls.ORDER_DESCENDING,
+        )
+
+    @classmethod
+    def order_facet_to_database_field(cls, order_facet):
+        if order_facet == cls.ORDER_LAST_UPDATE:
+            from core.model import MaterializedWorkWithGenre as work_model
+            return func.greatest(work_model.last_update_time, work_model.first_appearance)
+        else:
+            return Facets.order_facet_to_database_field(order_facet)
+
+class CrawlableCustomListBasedLane(DynamicLane):
+    """A lane that consists of all works in a single CustomList."""
+
+    uses_customlists = True
+
+    def initialize(self, library, list):
+        super(CrawlableCustomListBasedLane, self).initialize(library, list.name)
+        self.customlists = [list]
+
+    def bibliographic_filter_clause(self, _db, qu, featured=False):
+        """Filter out any books that aren't in the list, in addition to
+        the normal filters."""
+        qu, clauses = super(CrawlableCustomListBasedLane, self).bibliographic_filter_clause(_db, qu, featured)
+
+        from core.model import MaterializedWorkWithGenre as work_model
+        customlist_clause = work_model.list_id==self.customlists[0].id
+
+        if clauses:
+            clause = and_(clauses, customlist_clause)
+        else:
+            clause = customlist_clause
+        return qu, clause

@@ -141,6 +141,14 @@ def work_classifications(identifier_type, identifier):
 def work_complaints(identifier_type, identifier):
     return app.manager.admin_work_controller.complaints(identifier_type, identifier)
 
+@library_route('/admin/works/<identifier_type>/<path:identifier>/lists', methods=['GET', 'POST'])
+@has_library
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def work_custom_lists(identifier_type, identifier):
+    return app.manager.admin_work_controller.custom_lists(identifier_type, identifier)
+
 @library_route('/admin/works/<identifier_type>/<path:identifier>/edit', methods=['POST'])
 @has_library
 @returns_problem_detail
@@ -188,6 +196,21 @@ def resolve_complaints(identifier_type, identifier):
 @requires_csrf_token
 def edit_classifications(identifier_type, identifier):
     return app.manager.admin_work_controller.edit_classifications(identifier_type, identifier)
+
+@app.route('/admin/roles')
+@returns_json_or_response_or_problem_detail
+def roles():
+    return app.manager.admin_work_controller.roles()
+
+@app.route('/admin/languages')
+@returns_json_or_response_or_problem_detail
+def languages():
+    return app.manager.admin_work_controller.languages()
+
+@app.route('/admin/media')
+@returns_json_or_response_or_problem_detail
+def media():
+    return app.manager.admin_work_controller.media()
 
 @library_route('/admin/complaints')
 @has_library
@@ -401,6 +424,20 @@ def search_services():
 def search_service(service_id):
     return app.manager.admin_settings_controller.search_service(service_id)
 
+@app.route("/admin/storage_services", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def storage_services():
+    return app.manager.admin_settings_controller.storage_services()
+
+@app.route("/admin/storage_service/<service_id>", methods=["DELETE"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def storage_service(service_id):
+    return app.manager.admin_settings_controller.storage_service(service_id)
+
 @app.route("/admin/discovery_services", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
@@ -444,7 +481,7 @@ def library_registrations():
 def custom_lists():
     return app.manager.admin_custom_lists_controller.custom_lists()
 
-@library_route("/admin/custom_list/<list_id>", methods=["DELETE"])
+@library_route("/admin/custom_list/<list_id>", methods=["GET", "POST", "DELETE"])
 @has_library
 @returns_json_or_response_or_problem_detail
 @requires_admin

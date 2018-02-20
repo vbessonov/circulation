@@ -132,10 +132,13 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
         )
         return monitor.process_items([licensepool.identifier])
 
-    def patron_activity(self, patron, pin):
+    def _patron_activity_request(self, patron):
         patron_id = patron.authorization_identifier
         path = "circulation/patron/%s" % patron_id
-        response = self.request(path)
+        return self.request(path)
+
+    def patron_activity(self, patron, pin):
+        response = self._patron_activity_request(patron)
         collection = self.collection
         return PatronCirculationParser(self.collection).process_all(response.content)
 
@@ -347,14 +350,19 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
         # of the LicensePool and its Work.
         manifest.update_bibliographic_metadata(license_pool)
 
-        # Add Findaway-specific information as extra metadata.
+        # Add Findaway-specific DRM information as an 'encrypted' object
+        # within the metadata object.
+        encrypted = dict(
+            scheme='http://librarysimplified.org/terms/drm/scheme/FAE'
+        )
+        manifest.metadata['encrypted'] = encrypted
         for findaway_extension in [
                 'accountId', 'checkoutId', 'fulfillmentId', 'licenseId',
                 'sessionKey'
         ]:
             value = findaway_license.get(findaway_extension, None)
             output_key = 'findaway:' + findaway_extension
-            manifest.metadata[output_key] = value
+            encrypted[output_key] = value
 
         # Add the spine items. All of them are in the same format.
         # None of them will have working 'href' fields -- it's just to
@@ -365,14 +373,10 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
         else:
             logging.error("Unknown Findaway audio format encountered: %s",
                           audio_format)
+            part_media_type = None
 
-        # TODO: The items are in an ordered list, but each one also
-        # has an explicit 'sequence'. For now we'll pass it on but
-        # assume that it is redundant and the ordered list is always
-        # correct.
-        #
-        # TODO: Each item has a 'part' which always seems to be zero.
-        # Its purpose is unknown. For now, we simply pass it on.
+        part_key = 'findaway:part'
+        sequence_key = 'findaway:sequence'
         total_duration = 0
         for part in findaway_license.get('items'):
             title = part.get('title')
@@ -386,17 +390,24 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
 
             kwargs = {}
 
-            sequence = part.get('sequence')
-            kwargs["findaway:sequence"] = sequence 
+            part_number = int(part.get('part', 0))
+            kwargs[part_key] = part_number
 
-            part_number = part.get('part')
-            kwargs["findaway:part"] = part_number
+            sequence = int(part.get('sequence', 0))
+            kwargs[sequence_key] = sequence
 
             manifest.add_spine(
-                href=None, type=None, title=title, duration=duration,
-                **kwargs
+                href=None, title=title, duration=duration,
+                type=part_media_type, **kwargs
             )
             total_duration += duration
+
+        # Make sure the spine items are sorted by part (~="part" in a
+        # book) and then sequence (~="chapter" in a book).
+        def sort_key(item):
+            return (item[part_key], item[sequence_key])
+        manifest.spine.sort(key=sort_key)
+
         manifest.metadata['duration'] = total_duration
         return DeliveryMechanism.FINDAWAY_DRM, unicode(manifest)
 

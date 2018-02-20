@@ -33,6 +33,7 @@ from core.model import (
     Collection,
     Complaint,
     ConfigurationSetting,
+    Contributor,
     CustomList,
     DataSource,
     Edition,
@@ -44,6 +45,7 @@ from core.model import (
     Library,
     LicensePool,
     Loan,
+    Measurement,
     Patron,
     PresentationCalculationPolicy,
     Representation,
@@ -56,9 +58,13 @@ from core.util.problem_detail import (
     ProblemDetail, 
     JSON_MEDIA_TYPE as PROBLEM_DETAIL_JSON_MEDIA_TYPE,
 )
+from core.mirror import MirrorUploader
 from core.util.http import HTTP
 from problem_details import *
-from core.util import fast_query_count
+from core.util import (
+    fast_query_count,
+    LanguageCodes,
+)
 
 from api.config import (
     Configuration, 
@@ -101,6 +107,7 @@ from api.firstbook import FirstBookAuthenticationAPI
 from api.clever import CleverAuthenticationAPI
 
 from core.opds_import import OPDSImporter
+from api.feedbooks import FeedbooksOPDSImporter
 from api.opds_for_distributors import OPDSForDistributorsAPI
 from api.overdrive import OverdriveAPI
 from api.odilo import OdiloAPI
@@ -373,7 +380,7 @@ class SignInController(AdminController):
 
 class WorkController(CirculationManagerController):
 
-    STAFF_WEIGHT = 1
+    STAFF_WEIGHT = 1000
 
     def details(self, identifier_type, identifier):
         """Return an OPDS entry with detailed information for admins.
@@ -411,8 +418,60 @@ class WorkController(CirculationManagerController):
         
         return response
 
+    def roles(self):
+        """Return a mapping from MARC codes to contributor roles."""
+        # TODO: The admin interface only allows a subset of the roles
+        # listed in model.py since it uses the OPDS representation of
+        # the data, and some of the roles map to the same MARC code.
+        CODES = Contributor.MARC_ROLE_CODES
+        marc_to_role = dict()
+        for role in [
+            Contributor.ACTOR_ROLE,
+            Contributor.ADAPTER_ROLE,
+            Contributor.AFTERWORD_ROLE,
+            Contributor.ARTIST_ROLE,
+            Contributor.ASSOCIATED_ROLE,
+            Contributor.AUTHOR_ROLE,
+            Contributor.COMPILER_ROLE,
+            Contributor.COMPOSER_ROLE,
+            Contributor.CONTRIBUTOR_ROLE,
+            Contributor.COPYRIGHT_HOLDER_ROLE,
+            Contributor.DESIGNER_ROLE,
+            Contributor.DIRECTOR_ROLE,
+            Contributor.EDITOR_ROLE,
+            Contributor.ENGINEER_ROLE,
+            Contributor.FOREWORD_ROLE,
+            Contributor.ILLUSTRATOR_ROLE,
+            Contributor.INTRODUCTION_ROLE,
+            Contributor.LYRICIST_ROLE,
+            Contributor.MUSICIAN_ROLE,
+            Contributor.NARRATOR_ROLE,
+            Contributor.PERFORMER_ROLE,
+            Contributor.PHOTOGRAPHER_ROLE,
+            Contributor.PRODUCER_ROLE,
+            Contributor.TRANSCRIBER_ROLE,
+            Contributor.TRANSLATOR_ROLE,
+            ]:
+            marc_to_role[CODES[role]] = role
+        return marc_to_role
+
+    def languages(self):
+        """Return the supported language codes and their English names."""
+        return LanguageCodes.english_names
+
+    def media(self):
+        """Return the supported media types for a work and their schema.org values."""
+        return Edition.additional_type_to_medium
+
     def edit(self, identifier_type, identifier):
         """Edit a work's metadata."""
+
+        # TODO: It would be nice to use the metadata layer for this, but
+        # this code handles empty values differently than other metadata
+        # sources. When a staff member deletes a value, that indicates
+        # they think it should be empty. This needs to be indicated in the
+        # db so that it can overrule other data sources that set a value,
+        # unlike other sources which set empty fields to None.
 
         work = self.load_work(flask.request.library, identifier_type, identifier)
         if isinstance(work, ProblemDetail):
@@ -441,6 +500,47 @@ class WorkController(CirculationManagerController):
             staff_edition.subtitle = unicode(new_subtitle)
             changed = True
 
+        # The form data includes roles and names for contributors in the same order.
+        new_contributor_roles = flask.request.form.getlist("contributor-role")
+        new_contributor_names = [unicode(n) for n in flask.request.form.getlist("contributor-name")]
+        # The first author in the form is considered the primary author, even
+        # though there's no separate MARC code for that.
+        for i, role in enumerate(new_contributor_roles):
+            if role == Contributor.AUTHOR_ROLE:
+                new_contributor_roles[i] = Contributor.PRIMARY_AUTHOR_ROLE
+                break
+        roles_and_names = zip(new_contributor_roles, new_contributor_names)
+
+        # Remove any contributions that weren't in the form, and remove contributions
+        # that already exist from the list so they won't be added again.
+        deleted_contributions = False
+        for contribution in staff_edition.contributions:
+            if (contribution.role, contribution.contributor.display_name) not in roles_and_names:
+                self._db.delete(contribution)
+                deleted_contributions = True
+                changed = True
+            else:
+                roles_and_names.remove((contribution.role, contribution.contributor.display_name))
+        if deleted_contributions:
+            # Ensure the staff edition's contributions are up-to-date when
+            # calculating the presentation edition later.
+            self._db.refresh(staff_edition)
+
+        # Any remaining roles and names are new contributions.
+        for role, name in roles_and_names:
+            # There may be one extra role at the end from the input for
+            # adding a contributor, in which case it will have no
+            # corresponding name and can be ignored.
+            if name:
+                if role not in Contributor.MARC_ROLE_CODES.keys():
+                    self._db.rollback()
+                    return UNKNOWN_ROLE.detailed(
+                        _("Role %(role)s is not one of the known contributor roles.",
+                          role=role))
+                contributor = staff_edition.add_contributor(name=name, roles=[role])
+                contributor.display_name = name
+                changed = True
+
         new_series = flask.request.form.get("series")
         if work.series != new_series:
             if work.series and not new_series:
@@ -449,19 +549,95 @@ class WorkController(CirculationManagerController):
             changed = True
 
         new_series_position = flask.request.form.get("series_position")
-        if new_series_position:
+        if new_series_position != None and new_series_position != '':
             try:
                 new_series_position = int(new_series_position)
             except ValueError:
+                self._db.rollback()
                 return INVALID_SERIES_POSITION
         else:
             new_series_position = None
         if work.series_position != new_series_position:
-            if work.series_position and not new_series_position:
+            if work.series_position and new_series_position == None:
                 new_series_position = NO_NUMBER
             staff_edition.series_position = new_series_position
             changed = True
 
+        new_medium = flask.request.form.get("medium")
+        if new_medium:
+            if new_medium not in Edition.medium_to_additional_type.keys():
+                self._db.rollback()
+                return UNKNOWN_MEDIUM.detailed(
+                    _("Medium %(medium)s is not one of the known media.",
+                      medium=new_medium))
+            staff_edition.medium = new_medium
+            changed = True
+
+        new_language = flask.request.form.get("language")
+        if new_language != None and new_language != '':
+            new_language = LanguageCodes.string_to_alpha_3(new_language)
+            if not new_language:
+                self._db.rollback()
+                return UNKNOWN_LANGUAGE
+        else:
+            new_language = None
+        if new_language != staff_edition.language:
+            staff_edition.language = new_language
+            changed = True
+
+        new_publisher = flask.request.form.get("publisher")
+        if new_publisher != staff_edition.publisher:
+            if staff_edition.publisher and not new_publisher:
+                new_publisher = NO_VALUE
+            staff_edition.publisher = unicode(new_publisher)
+            changed = True
+
+        new_imprint = flask.request.form.get("imprint")
+        if new_imprint != staff_edition.imprint:
+            if staff_edition.imprint and not new_imprint:
+                new_imprint = NO_VALUE
+            staff_edition.imprint = unicode(new_imprint)
+            changed = True
+
+        new_issued = flask.request.form.get("issued")
+        if new_issued != None and new_issued != '':
+            try:
+                new_issued = datetime.strptime(new_issued, '%Y-%m-%d')
+            except ValueError:
+                self._db.rollback()
+                return INVALID_DATE_FORMAT
+        else:
+            new_issued = None
+        if new_issued != staff_edition.issued:
+            staff_edition.issued = new_issued
+            changed = True
+
+        # TODO: This lets library staff add a 1-5 rating, which is used in the
+        # quality calculation. However, this doesn't work well if there are any
+        # other measurements that contribute to the quality. The form will show
+        # the calculated quality rather than the staff rating, which will be
+        # confusing. It might also be useful to make it more clear how this
+        # relates to the quality threshold in the library settings.
+        changed_rating = False
+        new_rating = flask.request.form.get("rating")
+        if new_rating != None and new_rating != '':
+            try:
+                new_rating = float(new_rating)
+            except ValueError:
+                self._db.rollback()
+                return INVALID_RATING
+            scale = Measurement.RATING_SCALES[DataSource.LIBRARY_STAFF]
+            if new_rating < scale[0] or new_rating > scale[1]:
+                self._db.rollback()
+                return INVALID_RATING.detailed(
+                    _("The rating must be a number between %(low)s and %(high)s.",
+                      low=scale[0], high=scale[1]))
+            if (new_rating - scale[0]) / (scale[1] - scale[0]) != work.quality:
+                primary_identifier.add_measurement(staff_data_source, Measurement.RATING, new_rating, weight=WorkController.STAFF_WEIGHT)
+                changed = True
+                changed_rating = True
+
+        changed_summary = False
         new_summary = flask.request.form.get("summary") or ""
         if new_summary != work.summary_text:
             old_summary = None
@@ -479,6 +655,7 @@ class WorkController(CirculationManagerController):
                 self._db.delete(old_summary)
 
             changed = True
+            changed_summary = True
 
         if changed:
             # Even if the presentation doesn't visibly change, we want
@@ -489,9 +666,11 @@ class WorkController(CirculationManagerController):
                 classify=True,
                 regenerate_opds_entries=True,
                 update_search_index=True,
-                choose_summary=True
+                calculate_quality=changed_rating,
+                choose_summary=changed_summary,
             )
             work.calculate_presentation(policy=policy)
+
         return Response("", 200)
 
     def suppress(self, identifier_type, identifier):
@@ -778,6 +957,64 @@ class WorkController(CirculationManagerController):
         complaint_types = [complaint.type for complaint in work.complaints if not complaint.resolved]
         return Counter(complaint_types)
 
+    def custom_lists(self, identifier_type, identifier):
+        library = flask.request.library
+        work = self.load_work(library, identifier_type, identifier)
+        if isinstance(work, ProblemDetail):
+            return work
+
+        staff_data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
+
+        if flask.request.method == "GET":
+            lists = []
+            for entry in work.custom_list_entries:
+                list = entry.customlist
+                lists.append(dict(id=list.id, name=list.name))
+            return dict(custom_lists=lists)
+
+        if flask.request.method == "POST":
+            lists = flask.request.form.get("lists")
+            if lists:
+                lists = json.loads(lists)
+            else:
+                lists = []
+
+            affected_lanes = set()
+
+            # Remove entries for lists that were not in the submitted form.
+            submitted_ids = [l.get("id") for l in lists if l.get("id")]
+            for entry in work.custom_list_entries:
+                if entry.list_id not in submitted_ids:
+                    list = entry.customlist
+                    list.remove_entry(work)
+                    for lane in Lane.affected_by_customlist(list):
+                        affected_lanes.add(lane)
+
+            # Add entries for any new lists.
+            for list_info in lists:
+                id = list_info.get("id")
+                name = list_info.get("name")
+
+                if id:
+                    is_new = False
+                    list = get_one(self._db, CustomList, id=int(id), name=name, library=library, data_source=staff_data_source)
+                    if not list:
+                        self._db.rollback()
+                        return MISSING_CUSTOM_LIST.detailed(_("Could not find list \"%(list_name)s\"", list_name=name))
+                else:
+                    list, is_new = create(self._db, CustomList, name=name, data_source=staff_data_source, library=library)
+                    list.created = datetime.now()
+                entry, was_new = list.add_entry(work, featured=True)
+                if was_new:
+                    for lane in Lane.affected_by_customlist(list):
+                        affected_lanes.add(lane)
+
+            # If any list changes affected lanes, update their sizes.
+            for lane in affected_lanes:
+                lane.update_size(self._db)
+
+            return Response(unicode(_("Success")), 200)
+
     
 class FeedController(CirculationManagerController):
 
@@ -825,94 +1062,129 @@ class CustomListsController(CirculationManagerController):
     def custom_lists(self):
         library = flask.request.library
 
-        data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
-
         if flask.request.method == "GET":
             custom_lists = []
             for list in library.custom_lists:
-                entries = []
-                for entry in list.entries:
-                    if entry.edition:
-                        entries.append(dict(pwid=entry.edition.permanent_work_id,
-                                            title=entry.edition.title,
-                                            authors=[author.display_name for author in entry.edition.author_contributors],
-                        ))
-                custom_lists.append(dict(id=list.id, name=list.name, entries=entries))
+                collections = []
+                for collection in list.collections:
+                    collections.append(dict(id=collection.id, name=collection.name, protocol=collection.protocol))
+                custom_lists.append(dict(id=list.id, name=list.name, collections=collections, entry_count=len(list.entries)))
             return dict(custom_lists=custom_lists)
 
         if flask.request.method == "POST":
             id = flask.request.form.get("id")
             name = flask.request.form.get("name")
             entries = flask.request.form.get("entries")
+            collections = flask.request.form.get("collections")
+            return self._create_or_update_list(library, name, entries, collections, id)
 
-            old_list_with_name = CustomList.find(self._db, data_source, name, library)
-
-            if id:
-                is_new = False
-                list = get_one(self._db, CustomList, id=int(id), data_source=data_source)
-                if not list:
-                    return MISSING_CUSTOM_LIST
-                if list.library != library:
-                    return CANNOT_CHANGE_LIBRARY_FOR_CUSTOM_LIST
-                if old_list_with_name and old_list_with_name != list:
-                    return CUSTOM_LIST_NAME_ALREADY_IN_USE
-            elif old_list_with_name:
-                return CUSTOM_LIST_NAME_ALREADY_IN_USE
-            else:
-                list, is_new = create(self._db, CustomList, name=name, data_source=data_source)
-                list.created = datetime.now()
-                list.library = library
-
-            list.updated = datetime.now()
-            list.name = name
-
-            if entries:
-                entries = json.loads(entries)
-            else:
-                entries = []
-
-            old_entries = [x for x in list.entries if x.edition]
-            membership_change = False
-            for entry in entries:
-                pwid = entry.get("pwid")
-                work = self._db.query(
-                    Work
-                ).join(
-                    Edition, Edition.id==Work.presentation_edition_id
-                ).filter(
-                    Edition.permanent_work_id==pwid
-                ).one()
-
-                if work:
-                    entry, entry_is_new = list.add_entry(work, featured=True)
-                    if entry_is_new:
-                        membership_change = True
-
-            new_pwids = [entry.get("pwid") for entry in entries]
-            for entry in old_entries:
-                if entry.edition.permanent_work_id not in new_pwids:
-                    list.remove_entry(entry.edition)
-                    membership_change = True
-
-            if membership_change:
-                # If this list was used to populate any lanes, those
-                # lanes need to have their counts updated.
-                for lane in Lane.affected_by_customlist(list):
-                    lane.update_size(self._db)
-
-            if is_new:
-                return Response(unicode(list.id), 201)
-            else:
-                return Response(unicode(list.id), 200)
-
-    def custom_list(self, list_id):
+    def _create_or_update_list(self, library, name, entries, collections, id=None):
         data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
 
-        if flask.request.method == "DELETE":
-            list = get_one(self._db, CustomList, id=list_id, data_source=data_source)
+        old_list_with_name = CustomList.find(self._db, name, library=library)
+
+        if id:
+            is_new = False
+            list = get_one(self._db, CustomList, id=int(id), data_source=data_source)
             if not list:
                 return MISSING_CUSTOM_LIST
+            if list.library != library:
+                return CANNOT_CHANGE_LIBRARY_FOR_CUSTOM_LIST
+            if old_list_with_name and old_list_with_name != list:
+                return CUSTOM_LIST_NAME_ALREADY_IN_USE
+        elif old_list_with_name:
+            return CUSTOM_LIST_NAME_ALREADY_IN_USE
+        else:
+            list, is_new = create(self._db, CustomList, name=name, data_source=data_source)
+            list.created = datetime.now()
+            list.library = library
 
+        list.updated = datetime.now()
+        list.name = name
+
+        if entries:
+            entries = json.loads(entries)
+        else:
+            entries = []
+
+        old_entries = [x for x in list.entries if x.edition]
+        membership_change = False
+        for entry in entries:
+            pwid = entry.get("pwid")
+            work = self._db.query(
+                Work
+            ).join(
+                Edition, Edition.id==Work.presentation_edition_id
+            ).filter(
+                Edition.permanent_work_id==pwid
+            ).one()
+
+            if work:
+                entry, entry_is_new = list.add_entry(work, featured=True)
+                if entry_is_new:
+                    membership_change = True
+
+        new_pwids = [entry.get("pwid") for entry in entries]
+        for entry in old_entries:
+            if entry.edition.permanent_work_id not in new_pwids:
+                list.remove_entry(entry.edition)
+                membership_change = True
+
+        if membership_change:
+            # If this list was used to populate any lanes, those
+            # lanes need to have their counts updated.
+            for lane in Lane.affected_by_customlist(list):
+                lane.update_size(self._db)
+
+        if collections:
+            collections = json.loads(collections)
+        else:
+            collections = []
+        new_collections = []
+        for collection_id in collections:
+            collection = get_one(self._db, Collection, id=collection_id)
+            if not collection:
+                self._db.rollback()
+                return MISSING_COLLECTION
+            if list.library not in collection.libraries:
+                self._db.rollback()
+                return COLLECTION_NOT_ASSOCIATED_WITH_LIBRARY
+            new_collections.append(collection)
+        list.collections = new_collections
+
+        if is_new:
+            return Response(unicode(list.id), 201)
+        else:
+            return Response(unicode(list.id), 200)
+
+    def custom_list(self, list_id):
+        library = flask.request.library
+        data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
+
+        list = get_one(self._db, CustomList, id=list_id, data_source=data_source)
+        if not list:
+            return MISSING_CUSTOM_LIST
+
+        if flask.request.method == "GET":
+            entries = []
+            for entry in list.entries:
+                if entry.edition:
+                    entries.append(dict(pwid=entry.edition.permanent_work_id,
+                                        title=entry.edition.title,
+                                        authors=[author.display_name for author in entry.edition.author_contributors],
+                    ))
+            collections = []
+            for collection in list.collections:
+                collections.append(dict(id=collection.id, name=collection.name, protocol=collection.protocol))
+            return dict(id=list.id, name=list.name, entries=entries, collections=collections, entry_count=len(entries))
+
+        elif flask.request.method == "POST":
+            name = flask.request.form.get("name")
+            entries = flask.request.form.get("entries")
+            collections = flask.request.form.get("collections")
+            return self._create_or_update_list(library, name, entries, collections, list_id)
+
+        elif flask.request.method == "DELETE":
             # Build the list of affected lanes before modifying the
             # CustomList.
             affected_lanes = Lane.affected_by_customlist(list)
@@ -947,7 +1219,11 @@ class LanesController(CirculationManagerController):
             parent_id = flask.request.form.get("parent_id")
             display_name = flask.request.form.get("display_name")
             custom_list_ids = json.loads(flask.request.form.get("custom_list_ids", "[]"))
-            inherit_parent_restrictions = flask.request.form.get("inherit_parent_restrictions", False)
+            inherit_parent_restrictions = flask.request.form.get("inherit_parent_restrictions")
+            if inherit_parent_restrictions == "true":
+                inherit_parent_restrictions = True
+            else:
+                inherit_parent_restrictions = False
 
             if not display_name:
                 return NO_DISPLAY_NAME_FOR_LANE
@@ -1255,6 +1531,8 @@ class SettingsController(CirculationManagerController):
 
     METADATA_SERVICE_URI_TYPE = 'application/opds+json;profile=https://librarysimplified.org/rel/profile/metadata-service'
 
+    NO_MIRROR_INTEGRATION = u"NO_MIRROR"
+
     def libraries(self):
         if flask.request.method == 'GET':
             libraries = []
@@ -1363,6 +1641,11 @@ class SettingsController(CirculationManagerController):
                     ))
 
         if is_new:
+            # Now that the configuration settings are in place, create
+            # a default set of lanes.
+            create_default_lanes(self._db, library)
+
+        if is_new:
             return Response(unicode(library.uuid), 201)
         else:
             return Response(unicode(library.uuid), 200)
@@ -1375,7 +1658,8 @@ class SettingsController(CirculationManagerController):
             self._db.delete(library)
             return Response(unicode(_("Deleted")), 200)
 
-    def _get_integration_protocols(self, provider_apis, protocol_name_attr="__module__"):
+    @classmethod
+    def _get_integration_protocols(cls, provider_apis, protocol_name_attr="__module__"):
         protocols = []
         for api in provider_apis:
             protocol = dict()
@@ -1394,15 +1678,19 @@ class SettingsController(CirculationManagerController):
                 protocol["sitewide"] = sitewide
 
             settings = getattr(api, "SETTINGS", [])
-            protocol["settings"] = settings
+            protocol["settings"] = list(settings)
 
             child_settings = getattr(api, "CHILD_SETTINGS", None)
             if child_settings != None:
-                protocol["child_settings"] = child_settings
+                protocol["child_settings"] = list(child_settings)
 
             library_settings = getattr(api, "LIBRARY_SETTINGS", None)
             if library_settings != None:
-                protocol["library_settings"] = library_settings
+                protocol["library_settings"] = list(library_settings)
+
+            cardinality = getattr(api, 'CARDINALITY', None)
+            if cardinality != None:
+                protocol['cardinality'] = cardinality
 
             protocols.append(protocol)
         return protocols
@@ -1530,6 +1818,8 @@ class SettingsController(CirculationManagerController):
         return True
 
     def _delete_integration(self, integration_id, goal):
+        if flask.request.method != "DELETE":
+            return
         integration = get_one(self._db, ExternalIntegration,
                               id=integration_id, goal=goal)
         if not integration:
@@ -1547,8 +1837,16 @@ class SettingsController(CirculationManagerController):
                          OneClickAPI,
                          EnkiAPI,
                          ODLWithConsolidatedCopiesAPI,
+                         FeedbooksOPDSImporter,
                         ]
         protocols = self._get_integration_protocols(provider_apis, protocol_name_attr="NAME")
+
+        # If there are storage integrations, add a mirror integration
+        # setting to every protocol's 'settings' block.
+        mirror_integration_setting = self._mirror_integration_setting()
+        if mirror_integration_setting:
+            for protocol in protocols:
+                protocol['settings'].append(mirror_integration_setting)
 
         if flask.request.method == 'GET':
             collections = []
@@ -1570,7 +1868,9 @@ class SettingsController(CirculationManagerController):
                     for setting in protocol.get("settings"):
                         key = setting.get("key")
                         if key not in collection["settings"]:
-                            if setting.get("type") == "list":
+                            if key == 'mirror_integration_id':
+                                value = c.mirror_integration_id or self.NO_MIRROR_INTEGRATION
+                            elif setting.get("type") == "list":
                                 value = c.external_integration.setting(key).json_value
                             else:
                                 value = c.external_integration.setting(key).value
@@ -1638,7 +1938,7 @@ class SettingsController(CirculationManagerController):
         else:
             collection.parent = None
             settings = protocol.get("settings")
-        
+
         for setting in settings:
             key = setting.get("key")
             if key == "external_account_id":
@@ -1650,6 +1950,22 @@ class SettingsController(CirculationManagerController):
                         _("The collection configuration is missing a required setting: %(setting)s",
                           setting=setting.get("label")))
                 collection.external_account_id = value
+            elif key == 'mirror_integration_id':
+                value = flask.request.form.get(key)
+                if value == self.NO_MIRROR_INTEGRATION:
+                    integration_id = None
+                else:
+                    integration = get_one(
+                        self._db, ExternalIntegration, id=value
+                    )
+                    if not integration:
+                        self._db.rollback()
+                        return MISSING_SERVICE
+                    if integration.goal != ExternalIntegration.STORAGE_GOAL:
+                        self._db.rollback()
+                        return INTEGRATION_GOAL_CONFLICT
+                    integration_id = integration.id
+                collection.mirror_integration_id = integration_id
             else:
                 result = self._set_integration_setting(collection.external_integration, setting)
                 if isinstance(result, ProblemDetail):
@@ -1681,6 +1997,76 @@ class SettingsController(CirculationManagerController):
             return Response(unicode(collection.id), 201)
         else:
             return Response(unicode(collection.id), 200)
+
+    def _mirror_integration_setting(self):
+        """Create a setting interface for selecting a storage integration to
+        be used when mirroring items from a collection.
+        """
+        integrations = self._db.query(ExternalIntegration).filter(
+            ExternalIntegration.goal==ExternalIntegration.STORAGE_GOAL
+        ).order_by(
+            ExternalIntegration.name
+        ).all()
+        if not integrations:
+            return
+        mirror_integration_setting = {
+            "key": "mirror_integration_id",
+            "label": _("Mirror"),
+            "description": _("Any cover images or free books encountered while importing content from this collection can be mirrored to a server you control."),
+            "type": "select",
+            "options" : [
+                dict(
+                    key=self.NO_MIRROR_INTEGRATION,
+                    label=_("None - Do not mirror cover images or free books")
+                )
+            ]
+        }
+        for integration in integrations:
+            mirror_integration_setting['options'].append(
+                dict(key=integration.id, label=integration.name)
+            )
+        return mirror_integration_setting
+
+    def _create_integration(self, protocol_definitions, protocol, goal):
+        """Create a new ExternalIntegration for the given protocol and
+        goal, assuming that doing so is compatible with the protocol's
+        definition.
+
+        :return: A 2-tuple (result, is_new). `result` will be an
+            ExternalIntegration if one could be created, and a
+            ProblemDetail otherwise.
+        """
+        if not protocol:
+            return NO_PROTOCOL_FOR_NEW_SERVICE, False
+        matches = [x for x in protocol_definitions if x.get('name') == protocol]
+        if not matches:
+            return UNKNOWN_PROTOCOL, False
+        definition = matches[0]
+
+        # Most of the time there can be multiple ExternalIntegrations with
+        # the same protocol and goal...
+        allow_multiple = True
+        m = create
+        args = (self._db, ExternalIntegration)
+        kwargs = dict(protocol=protocol, goal=goal)
+        if definition.get('cardinality') == 1:
+            # ...but not all the time.
+            allow_multiple = False
+            existing = get_one(*args, **kwargs)
+            if existing is not None:
+                # We were asked to create a new ExternalIntegration
+                # but there's already one for this protocol, which is not
+                # allowed.
+                return DUPLICATE_INTEGRATION, False
+            m = get_one_or_create
+
+        integration, is_new = m(*args, **kwargs)
+        if not is_new and not allow_multiple:
+            # This can happen, despite our check above, in a race
+            # condition where two clients try simultaneously to create
+            # two integrations of the same type.
+            return DUPLICATE_INTEGRATION, False
+        return integration, is_new
 
     def collection(self, collection_id):
         if flask.request.method == "DELETE":
@@ -1823,13 +2209,11 @@ class SettingsController(CirculationManagerController):
             if protocol != auth_service.protocol:
                 return CANNOT_CHANGE_PROTOCOL
         else:
-            if protocol:
-                auth_service, is_new = create(
-                    self._db, ExternalIntegration, protocol=protocol,
-                    goal=ExternalIntegration.PATRON_AUTH_GOAL
-                )
-            else:
-                return NO_PROTOCOL_FOR_NEW_SERVICE
+            auth_service, is_new = self._create_integration(
+                protocols, protocol, ExternalIntegration.PATRON_AUTH_GOAL
+            )
+            if isinstance(auth_service, ProblemDetail):
+                return auth_service
 
         name = flask.request.form.get("name")
         if name:
@@ -1869,14 +2253,30 @@ class SettingsController(CirculationManagerController):
                     self._db.rollback()
                     return INVALID_EXTERNAL_TYPE_REGULAR_EXPRESSION
 
+            # Check that the library's identifier restriction regular express is valid, it its set
+            # and its a regular expression.
+            identifier_restriction_type = ConfigurationSetting.for_library_and_externalintegration(
+                self._db, AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE,
+                library, auth_service).value
+            identifier_restriction = ConfigurationSetting.for_library_and_externalintegration(
+                self._db, AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION,
+                library, auth_service).value
+            if identifier_restriction and identifier_restriction_type == AuthenticationProvider.LIBRARY_IDENTIFIER_RESTRICTION_TYPE_REGEX:
+                try:
+                    re.compile(identifier_restriction)
+                except Exception, e:
+                    self._db.rollback()
+                    return INVALID_LIBRARY_IDENTIFIER_RESTRICTION_REGULAR_EXPRESSION
+
         if is_new:
             return Response(unicode(auth_service.id), 201)
         else:
             return Response(unicode(auth_service.id), 200)
 
     def patron_auth_service(self, service_id):
-        if flask.request.method == "DELETE":
-            return self._delete_integration(service_id, ExternalIntegration.PATRON_AUTH_GOAL)
+        return self._delete_integration(
+            service_id, ExternalIntegration.PATRON_AUTH_GOAL
+        )
 
     def sitewide_settings(self):
         if flask.request.method == 'GET':
@@ -1940,13 +2340,11 @@ class SettingsController(CirculationManagerController):
             if protocol != service.protocol:
                 return CANNOT_CHANGE_PROTOCOL
         else:
-            if protocol:
-                service, is_new = create(
-                    self._db, ExternalIntegration, protocol=protocol,
-                    goal=ExternalIntegration.METADATA_GOAL
-                )
-            else:
-                return NO_PROTOCOL_FOR_NEW_SERVICE
+            service, is_new = self._create_integration(
+                protocols, protocol, ExternalIntegration.METADATA_GOAL
+            )
+            if isinstance(service, ProblemDetail):
+                return service
 
         name = flask.request.form.get("name")
         if name:
@@ -1979,8 +2377,9 @@ class SettingsController(CirculationManagerController):
             return Response(unicode(service.id), 200)
 
     def metadata_service(self, service_id):
-        if flask.request.method == "DELETE":
-            return self._delete_integration(service_id, ExternalIntegration.METADATA_GOAL)
+        return self._delete_integration(
+            service_id, ExternalIntegration.METADATA_GOAL
+        )
 
     def sitewide_registration(self, integration, do_get=HTTP.debuggable_get,
                               do_post=HTTP.debuggable_post, key=None
@@ -2100,13 +2499,11 @@ class SettingsController(CirculationManagerController):
             if protocol != service.protocol:
                 return CANNOT_CHANGE_PROTOCOL
         else:
-            if protocol:
-                service, is_new = create(
-                    self._db, ExternalIntegration, protocol=protocol,
-                    goal=ExternalIntegration.ANALYTICS_GOAL
-                )
-            else:
-                return NO_PROTOCOL_FOR_NEW_SERVICE
+            service, is_new = self._create_integration(
+                protocols, protocol, ExternalIntegration.ANALYTICS_GOAL
+            )
+            if isinstance(service, ProblemDetail):
+                return service
 
         name = flask.request.form.get("name")
         if name:
@@ -2128,8 +2525,9 @@ class SettingsController(CirculationManagerController):
             return Response(unicode(service.id), 200)
 
     def analytics_service(self, service_id):
-        if flask.request.method == "DELETE":
-            return self._delete_integration(service_id, ExternalIntegration.ANALYTICS_GOAL)
+        return self._delete_integration(
+            service_id, ExternalIntegration.ANALYTICS_GOAL
+        )
 
     def cdn_services(self):
         protocols = [
@@ -2164,13 +2562,11 @@ class SettingsController(CirculationManagerController):
             if protocol != service.protocol:
                 return CANNOT_CHANGE_PROTOCOL
         else:
-            if protocol:
-                service, is_new = create(
-                    self._db, ExternalIntegration, protocol=protocol,
-                    goal=ExternalIntegration.CDN_GOAL
-                )
-            else:
-                return NO_PROTOCOL_FOR_NEW_SERVICE
+            service, is_new = self._create_integration(
+                protocols, protocol, ExternalIntegration.CDN_GOAL
+            )
+            if isinstance(service, ProblemDetail):
+                return service
 
         name = flask.request.form.get("name")
         if name:
@@ -2192,20 +2588,22 @@ class SettingsController(CirculationManagerController):
             return Response(unicode(service.id), 200)
 
     def cdn_service(self, service_id):
-        if flask.request.method == "DELETE":
-            return self._delete_integration(service_id, ExternalIntegration.CDN_GOAL)
+        return self._delete_integration(
+            service_id, ExternalIntegration.CDN_GOAL
+        )
 
-    def search_services(self):
-        provider_apis = [ExternalSearchIndex,
-                        ]
-        protocols = self._get_integration_protocols(provider_apis, protocol_name_attr="NAME")
+    def _manage_sitewide_service(
+            self, goal, provider_apis, service_key_name, 
+            multiple_sitewide_services_detail, protocol_name_attr='NAME'
+    ):
+        protocols = self._get_integration_protocols(provider_apis, protocol_name_attr=protocol_name_attr)
 
         if flask.request.method == 'GET':
-            services = self._get_integration_info(ExternalIntegration.SEARCH_GOAL, protocols)
-            return dict(
-                search_services=services,
-                protocols=protocols,
-            )
+            services = self._get_integration_info(goal, protocols)
+            return {
+                service_key_name : services,
+                'protocols' : protocols,
+            }
 
         id = flask.request.form.get("id")
 
@@ -2215,7 +2613,7 @@ class SettingsController(CirculationManagerController):
 
         is_new = False
         if id:
-            service = get_one(self._db, ExternalIntegration, id=id, goal=ExternalIntegration.SEARCH_GOAL)
+            service = get_one(self._db, ExternalIntegration, id=id, goal=goal)
             if not service:
                 return MISSING_SERVICE
             if protocol != service.protocol:
@@ -2224,11 +2622,13 @@ class SettingsController(CirculationManagerController):
             if protocol:
                 service, is_new = get_one_or_create(
                     self._db, ExternalIntegration, protocol=protocol,
-                    goal=ExternalIntegration.SEARCH_GOAL
+                    goal=goal
                 )
                 if not is_new:
                     self._db.rollback()
-                    return MULTIPLE_SEARCH_SERVICES
+                    return MULTIPLE_SITEWIDE_SERVICES.detailed(
+                        multiple_sitewide_services_detail
+                    )
             else:
                 return NO_PROTOCOL_FOR_NEW_SERVICE
 
@@ -2251,9 +2651,30 @@ class SettingsController(CirculationManagerController):
         else:
             return Response(unicode(service.id), 200)
 
+    def search_services(self):
+        detail = _("You tried to create a new search service, but a search service is already configured.")
+        return self._manage_sitewide_service(
+            ExternalIntegration.SEARCH_GOAL, [ExternalSearchIndex],
+            'search_services', detail
+        )
+
     def search_service(self, service_id):
-        if flask.request.method == "DELETE":
-            return self._delete_integration(service_id, ExternalIntegration.SEARCH_GOAL)
+        return self._delete_integration(
+            service_id, ExternalIntegration.SEARCH_GOAL
+        )
+
+    def storage_services(self):
+        detail = _("You tried to create a new storage service, but a storage service is already configured.")
+        return self._manage_sitewide_service(
+            ExternalIntegration.STORAGE_GOAL,
+            MirrorUploader.IMPLEMENTATION_REGISTRY.values(),
+            'storage_services', detail
+        )
+
+    def storage_service(self, service_id):
+        return self._delete_integration(
+            service_id, ExternalIntegration.STORAGE_GOAL
+        )
 
     def discovery_services(self):
         protocols = [
@@ -2297,13 +2718,11 @@ class SettingsController(CirculationManagerController):
             if protocol != service.protocol:
                 return CANNOT_CHANGE_PROTOCOL
         else:
-            if protocol:
-                service, is_new = create(
-                    self._db, ExternalIntegration, protocol=protocol,
-                    goal=ExternalIntegration.DISCOVERY_GOAL
-                )
-            else:
-                return NO_PROTOCOL_FOR_NEW_SERVICE
+            service, is_new = self._create_integration(
+                protocols, protocol, ExternalIntegration.DISCOVERY_GOAL
+            )
+            if isinstance(service, ProblemDetail):
+                return service
 
         name = flask.request.form.get("name")
         if name:
@@ -2325,8 +2744,9 @@ class SettingsController(CirculationManagerController):
             return Response(unicode(service.id), 200)
 
     def discovery_service(self, service_id):
-        if flask.request.method == "DELETE":
-            return self._delete_integration(service_id, ExternalIntegration.DISCOVERY_GOAL)
+        return self._delete_integration(
+            service_id, ExternalIntegration.DISCOVERY_GOAL
+        )
 
     def library_registrations(self, do_get=HTTP.debuggable_get, 
                               do_post=HTTP.debuggable_post, key=None):

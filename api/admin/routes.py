@@ -31,6 +31,7 @@ import csv, codecs, cStringIO
 from StringIO import StringIO
 import urllib
 from datetime import timedelta
+import logging
 
 # An admin's session will expire after this amount of time and
 # the admin will have to log in again.
@@ -50,8 +51,11 @@ def setup_admin(_db=None):
     # from the cookie before this function runs, but it creates a
     # null session on the first request because the secret key
     # isn't set yet.
+    logging.getLogger("before_first_request").error("flask.session %s" % flask.session)
     if not flask.session and flask.request:
+        logging.getLogger("before_first_request").error("reopening flask session")
         flask.session = app.open_session(flask.request)
+        logging.getLogger("before_first_request").error("new flask.session %s" % flask.session)
 
 
 def allows_admin_auth_setup(f):

@@ -170,12 +170,13 @@ class AdminController(object):
             )
         return None
 
-    def authenticated_admin_from_request(self):
+    def authenticated_admin_from_request(self, email=None):
         """Returns an authenticated admin or a problem detail."""
         if not self.auth:
             return ADMIN_AUTH_NOT_CONFIGURED
 
-        email = flask.session.get("admin_email")
+        email = email or flask.session.get("admin_email")
+
         if email:
             admin = get_one(self._db, Admin, email=email)
             if admin and self.auth.active_credentials(admin):
@@ -199,8 +200,6 @@ class AdminController(object):
         # A permanent session expires after a fixed time, rather than
         # when the user closes the browser.
         flask.session.permanent = True
-
-        logging.getLogger("admin controller").error("set email in flask.session %s" % flask.session)
 
         # If this is the first time an admin has been authenticated,
         # make sure there is a value set for the sitewide BASE_URL_KEY

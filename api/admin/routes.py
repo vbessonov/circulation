@@ -51,12 +51,12 @@ def setup_admin(_db=None):
     # from the cookie before this function runs, but it creates a
     # null session on the first request because the secret key
     # isn't set yet.
-    logging.getLogger("before_first_request").error("flask.session %s" % flask.session)
+    app.admin_email = None
     if not flask.session and flask.request:
-        logging.getLogger("before_first_request").error("reopening flask session")
-        flask.session = app.open_session(flask.request)
-        logging.getLogger("before_first_request").error("new flask.session %s" % flask.session)
-
+        session = app.open_session(flask.request)
+        email = session.get("admin_email")
+        if email:
+            app.admin_email = email
 
 def allows_admin_auth_setup(f):
     @wraps(f)
@@ -81,7 +81,7 @@ def requires_admin(f):
             setting_up = False
 
         if not setting_up:
-            admin = app.manager.admin_sign_in_controller.authenticated_admin_from_request()
+            admin = app.manager.admin_sign_in_controller.authenticated_admin_from_request(app.admin_email)
             if isinstance(admin, ProblemDetail):
                 return app.manager.admin_sign_in_controller.error_response(admin)
             elif isinstance(admin, Response):

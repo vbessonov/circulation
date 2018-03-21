@@ -200,6 +200,8 @@ class AdminController(object):
         # when the user closes the browser.
         flask.session.permanent = True
 
+        logging.getLogger("admin controller").error("set email in flask.session %s" % flask.session)
+
         # If this is the first time an admin has been authenticated,
         # make sure there is a value set for the sitewide BASE_URL_KEY
         # setting. If it's not set, set it to the hostname of the

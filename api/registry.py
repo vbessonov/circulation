@@ -127,6 +127,12 @@ class Registration(object):
     PRODUCTION_STAGE = "production"
     VALID_REGISTRATION_STAGES = [TESTING_STAGE, PRODUCTION_STAGE]
 
+    # A registry may assign a unique identifier for the library and
+    # return it on registration. If the registry provides a web or
+    # mobile application, the unique identifier may be used in URLs
+    # for that application.
+    REGISTRY_IDENTIFIER = u"registry-identifier"
+
     def __init__(self, registry, library):
         self.registry = registry
         self.integration = self.registry.integration
@@ -373,7 +379,7 @@ class Registration(object):
             shared_secret = encryptor.decrypt(base64.b64decode(shared_secret))
         except ValueError, e:
             return SHARED_SECRET_DECRYPTION_ERROR.detailed(
-                _("Could not decrypt shared secret %s") % shared_secret
+                _("Could not decrypt shared secret %(shared_secret)s", shared_secret=shared_secret)
             )
         return shared_secret
 
@@ -392,6 +398,7 @@ class Registration(object):
         metadata = catalog.get("metadata", {})
         short_name = metadata.get("short_name")
         shared_secret = metadata.get("shared_secret")
+        identifier = metadata.get("id")
 
         if short_name:
              setting = self.setting(ExternalIntegration.USERNAME)
@@ -405,6 +412,9 @@ class Registration(object):
 
             setting = self.setting(ExternalIntegration.PASSWORD)
             setting.value = shared_secret
+        if id:
+            setting = self.setting(self.REGISTRY_IDENTIFIER)
+            setting.value = identifier
 
         # We have successfully completed the registration.
         self.status_field.value = self.SUCCESS_STATUS

@@ -591,8 +591,8 @@ class TestRegistration(DatabaseTest):
         # The stage field has been set to the requested value.
         eq_(new_stage, reg.stage_field.value)
 
-        # Now try with a result that includes a short name and
-        # a shared secret.
+        # Now try with a result that includes a short name,
+        # a shared secret, and an identifier.
 
         class Mock(Registration):
             def _decrypt_shared_secret(self, encryptor, shared_secret):
@@ -601,7 +601,8 @@ class TestRegistration(DatabaseTest):
 
         reg = Mock(self.registry, self._default_library)
         catalog = dict(
-            metadata=dict(short_name="SHORT", shared_secret="ciphertext")
+            metadata=dict(short_name="SHORT", shared_secret="ciphertext",
+                          id="urn:uuid:6bf0c16e-1151-4974-a369-639d8a6b49bf")
         )
         result = reg._process_registration_result(
             catalog, encryptor, "another new stage"
@@ -614,6 +615,10 @@ class TestRegistration(DatabaseTest):
         # Shared secret was decrypted and is set.
         eq_((encryptor, "ciphertext"), reg._decrypt_shared_secret_called_with)
         eq_("cleartext", reg.setting(ExternalIntegration.PASSWORD).value)
+
+        # Identifier is set.
+        eq_("urn:uuid:6bf0c16e-1151-4974-a369-639d8a6b49bf",
+            reg.setting(reg.REGISTRY_IDENTIFIER).value)
 
         eq_("another new stage", reg.stage_field.value)
 

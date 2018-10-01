@@ -1,0 +1,1 @@
+The [Code of Conduct](https://confluence.nypl.org/display/SIM/Code+of+Conduct) for the Library Simplified project is hosted on [the Library Simplified Confluence page](https://confluence.nypl.org/display/SIM/Code+of+Conduct).

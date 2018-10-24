@@ -2154,7 +2154,7 @@ class TestCustomListsController(AdminControllerTest):
         with self.request_context_with_library_and_admin("/", method="POST"):
             flask.request.form = MultiDict([
                 ("name", "List"),
-                ("entries", json.dumps([dict(identifier_urn=work.presentation_edition.primary_identifier.urn)])),
+                ("entries", json.dumps([dict(id=work.presentation_edition.primary_identifier.urn)])),
                 ("collections", json.dumps([collection.id])),
             ])
 
@@ -2174,35 +2174,29 @@ class TestCustomListsController(AdminControllerTest):
     def test_custom_list_get(self):
         data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
         list, ignore = create(self._db, CustomList, name=self._str, library=self._default_library, data_source=data_source)
-        edition = self._edition()
 
-        [c1] = edition.author_contributors
-        c1.display_name = self._str
-        c2, ignore = self._contributor()
-        c2.display_name = self._str
-        edition.add_contributor(c2, Contributor.AUTHOR_ROLE)
-        list.add_entry(edition)
-        collection = self._collection()
-        collection.customlists = [list]
+        work1 = self._work(with_license_pool=True)
+        work2 = self._work(with_license_pool=True)
+        list.add_entry(work1)
+        list.add_entry(work2)
+
         with self.request_context_with_library_and_admin("/"):
             response = self.manager.admin_custom_lists_controller.custom_list(list.id)
-            eq_(list.id, response.get("id"))
-            eq_(list.name, response.get("name"))
-            eq_(1, response.get("entry_count"))
-            eq_(1, len(response.get("entries")))
-            [entry] = response.get("entries")
-            eq_(edition.primary_identifier.urn, entry.get("identifier_urn"))
-            eq_(edition.title, entry.get("title"))
-            eq_(2, len(entry.get("authors")))
-            eq_(Edition.medium_to_additional_type[Edition.BOOK_MEDIUM], entry.get("medium"))
-            eq_(edition.language, entry.get("language"))
-            eq_(set([c1.display_name, c2.display_name]),
-                set(entry.get("authors")))
-            eq_(1, len(response.get("collections")))
-            [c] = response.get("collections")
-            eq_(collection.name, c.get("name"))
-            eq_(collection.id, c.get("id"))
-            eq_(collection.protocol, c.get("protocol"))
+            feed = feedparser.parse(response.get_data())
+
+            eq_(list.name, feed.feed.title)
+            eq_(2, len(feed.entries))
+
+            [self_custom_list_link] = [x['href'] for x in feed.feed['links']
+                              if x['rel'] == "self"]
+            eq_(self_custom_list_link, feed.feed.id)
+
+            [entry1, entry2] = feed.entries
+            eq_(work1.title, entry1.get("title"))
+            eq_(work2.title, entry2.get("title"))
+
+            eq_(work1.presentation_edition.author, entry1.get("author"))
+            eq_(work2.presentation_edition.author, entry2.get("author"))
 
     def test_custom_list_get_errors(self):
         with self.request_context_with_library_and_admin("/"):
@@ -2239,9 +2233,12 @@ class TestCustomListsController(AdminControllerTest):
         list.add_entry(w2)
         self.add_to_materialized_view([w1, w2, w3])
 
-        new_entries = [dict(identifier_urn=work.presentation_edition.primary_identifier.urn,
+        new_entries = [dict(id=work.presentation_edition.primary_identifier.urn,
                             medium=Edition.medium_to_additional_type[work.presentation_edition.medium])
                        for work in [w2, w3]]
+        deletedEntries = [dict(id=work.presentation_edition.primary_identifier.urn,
+                            medium=Edition.medium_to_additional_type[work.presentation_edition.medium])
+                       for work in [w1]]
 
         c1 = self._collection()
         c1.libraries = [self._default_library]
@@ -2255,6 +2252,7 @@ class TestCustomListsController(AdminControllerTest):
                 ("id", str(list.id)),
                 ("name", "new name"),
                 ("entries", json.dumps(new_entries)),
+                ("deletedEntries", json.dumps(deletedEntries)),
                 ("collections", json.dumps([c.id for c in new_collections])),
             ])
 
@@ -6334,12 +6332,11 @@ class TestLibraryRegistration(SettingsControllerTest):
             eq_((Registration.TESTING_STAGE, self.manager.url_for), args)
 
             # We would have made real HTTP requests.
-            eq_(HTTP.debuggable_post, kwargs['do_post'])
-            eq_(HTTP.debuggable_get, kwargs['do_get'])
+            eq_(HTTP.debuggable_post, kwargs.pop('do_post'))
+            eq_(HTTP.debuggable_get, kwargs.pop('do_get'))
 
-            # We would have generated a fresh public key just for this
-            # transaction.
-            eq_(None, kwargs['key'])
+            # No other keyword arguments were passed in.
+            eq_({}, kwargs)
 
 
 class TestCollectionRegistration(SettingsControllerTest):
@@ -6437,7 +6434,11 @@ class TestCollectionRegistration(SettingsControllerTest):
         ])
 
         class Mock(Registration):
-            def push(self, *args, **kwargs):
+            # We reproduce the signature, even though it's not
+            # necessary for what we're testing, so that if the push()
+            # signature changes this test will fail.
+            def push(self, stage, url_for, catalog_url=None, do_get=None,
+                     do_post=None):
                 return REMOTE_INTEGRATION_FAILED
 
         with self.request_context_with_admin("/", method="POST"):
@@ -6464,12 +6465,15 @@ class TestCollectionRegistration(SettingsControllerTest):
             eq_((Registration.PRODUCTION_STAGE, self.manager.url_for), args)
 
             # We would have made real HTTP requests.
-            eq_(HTTP.debuggable_post, kwargs['do_post'])
-            eq_(HTTP.debuggable_get, kwargs['do_get'])
+            eq_(HTTP.debuggable_post, kwargs.pop('do_post'))
+            eq_(HTTP.debuggable_get, kwargs.pop('do_get'))
 
-            # We would have generated a fresh public key just for this
-            # transaction.
-            eq_(None, kwargs['key'])
+            # And passed the collection URL over to the shared collection.
+            eq_(collection.external_account_id, kwargs.pop('catalog_url'))
+
+            # No other weird keyword arguments were passed in.
+            eq_({}, kwargs)
+
 
     def test_sitewide_registration_post_errors(self):
         def assert_remote_integration_error(response, message=None):
@@ -6590,9 +6594,10 @@ class TestCollectionRegistration(SettingsControllerTest):
             goal=ExternalIntegration.METADATA_GOAL, url=self._url
         )
 
-        # An RSA key for testing purposes
-        key = RSA.generate(2048)
-        encryptor = PKCS1_OAEP.new(key)
+        # The service knows this site's public key, and is going
+        # to use it to encrypt a shared secret.
+        public_key, private_key = self.manager.sitewide_key_pair
+        encryptor = Configuration.cipher(public_key)
 
         # A catalog with registration url
         register_link_type = self.manager.admin_settings_controller.METADATA_SERVICE_URI_TYPE
@@ -6610,7 +6615,7 @@ class TestCollectionRegistration(SettingsControllerTest):
             MockRequestsResponse(200, content=json.dumps(catalog), headers=headers)
         )
 
-        # A registration document with secrets
+        # A registration document with an encrypted secret
         shared_secret = os.urandom(24).encode('hex')
         encrypted_secret = base64.b64encode(encryptor.encrypt(shared_secret))
         registration = dict(
@@ -6625,7 +6630,7 @@ class TestCollectionRegistration(SettingsControllerTest):
             ])
             response = self.manager.admin_settings_controller.sitewide_registration(
                 metadata_wrangler_service, do_get=self.do_request,
-                do_post=self.do_request, key=key
+                do_post=self.do_request
             )
         eq_(None, response)
 
@@ -6643,23 +6648,20 @@ class TestCollectionRegistration(SettingsControllerTest):
             assert k in document
 
         # The end result is that our ExternalIntegration for the metadata
-        # wrangler has been updated with a shared secret.
+        # wrangler has been updated with a (decrypted) shared secret.
         eq_(shared_secret, metadata_wrangler_service.password)
 
     def test_sitewide_registration_document(self):
         """Test the document sent along to sitewide registration."""
-        key = RSA.generate(2048)
         controller = self.manager.admin_settings_controller
         with self.request_context_with_admin('/'):
-            doc = controller.sitewide_registration_document(
-                key.exportKey()
-            )
+            doc = controller.sitewide_registration_document()
 
             # The registrar knows where to go to get our public key.
             eq_(doc['url'], controller.url_for('public_key_document'))
 
             # The JWT proves that we control the public/private key pair.
-            public_key = key.publickey().exportKey()
+            public_key, private_key = self.manager.sitewide_key_pair
             parsed = jwt.decode(
                 doc['jwt'], public_key, algorithm='RS256'
             )

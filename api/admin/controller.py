@@ -21,8 +21,6 @@ from sqlalchemy.exc import ProgrammingError
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
 from StringIO import StringIO
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
 from api.authenticator import (
     CannotCreateLocalPatron,
     PatronData,
@@ -40,6 +38,7 @@ from core.model import (
     ConfigurationSetting,
     Contributor,
     CustomList,
+    CustomListEntry,
     DataSource,
     Edition,
     ExternalIntegration,
@@ -60,7 +59,7 @@ from core.model import (
     Work,
     WorkGenre,
 )
-from core.lane import Lane
+from core.lane import (Lane, WorkList)
 from core.log import (LogConfiguration, SysLogger, Loggly)
 from core.util.problem_detail import (
     ProblemDetail,
@@ -95,11 +94,10 @@ from password_admin_authentication_provider import PasswordAdminAuthenticationPr
 
 from api.controller import CirculationManagerController
 from api.coverage import MetadataWranglerCollectionRegistrar
-from core.app_server import entry_response
 from core.app_server import (
     entry_response,
     feed_response,
-    load_pagination_from_request
+    load_pagination_from_request,
 )
 from core.opds import AcquisitionFeed
 from opds import AdminAnnotator, AdminFeed
@@ -151,6 +149,8 @@ from api.adobe_vendor_id import AuthdataUtility
 from core.external_search import ExternalSearchIndex
 
 from core.selftest import HasSelfTests
+
+from core.util.opds_writer import OPDSFeed
 
 def setup_admin_controllers(manager):
     """Set up all the controllers that will be used by the admin parts of the web app."""
@@ -1506,11 +1506,35 @@ class CustomListsController(AdminCirculationManagerController):
         if flask.request.method == "POST":
             id = flask.request.form.get("id")
             name = flask.request.form.get("name")
-            entries = flask.request.form.get("entries")
-            collections = flask.request.form.get("collections")
-            return self._create_or_update_list(library, name, entries, collections, id)
+            entries = self._getJSONFromRequest(flask.request.form.get("entries"))
+            collections = self._getJSONFromRequest(flask.request.form.get("collections"))
+            return self._create_or_update_list(library, name, entries, collections, id=id)
 
-    def _create_or_update_list(self, library, name, entries, collections, id=None):
+    def _getJSONFromRequest(self, values):
+        if values:
+            values = json.loads(values)
+        else:
+            values = []
+
+        return values
+
+    def _get_work_from_urn(self, library, urn):
+        identifier, ignore = Identifier.parse_urn(self._db, urn)
+        query = self._db.query(
+            Work
+        ).join(
+            LicensePool, LicensePool.work_id==Work.id
+        ).join(
+            Collection, LicensePool.collection_id==Collection.id
+        ).filter(
+            LicensePool.identifier_id==identifier.id
+        ).filter(
+            Collection.id.in_([c.id for c in library.all_collections])
+        )
+        work = query.one()
+        return work
+
+    def _create_or_update_list(self, library, name, entries, collections, deletedEntries=None, id=None):
         data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
 
         old_list_with_name = CustomList.find(self._db, name, library=library)
@@ -1533,41 +1557,25 @@ class CustomListsController(AdminCirculationManagerController):
 
         list.updated = datetime.now()
         list.name = name
-
-        if entries:
-            entries = json.loads(entries)
-        else:
-            entries = []
-
-        old_entries = [x for x in list.entries if x.edition]
         membership_change = False
-        for entry in entries:
-            urn = entry.get("identifier_urn")
 
-            identifier, ignore = Identifier.parse_urn(self._db, urn)
-            query = self._db.query(
-                Work
-            ).join(
-                LicensePool, LicensePool.work_id==Work.id
-            ).join(
-                Collection, LicensePool.collection_id==Collection.id
-            ).filter(
-                LicensePool.identifier_id==identifier.id
-            ).filter(
-                Collection.id.in_([c.id for c in library.all_collections])
-            )
-            work = query.one()
+        for entry in entries:
+            urn = entry.get("id")
+            work = self._get_work_from_urn(library, urn)
 
             if work:
                 entry, entry_is_new = list.add_entry(work, featured=True)
                 if entry_is_new:
                     membership_change = True
 
-        new_urns = [entry.get("identifier_urn") for entry in entries]
-        for entry in old_entries:
-            if entry.edition.primary_identifier.urn not in new_urns:
-                list.remove_entry(entry.edition)
-                membership_change = True
+        if deletedEntries:
+            for entry in deletedEntries:
+                urn = entry.get("id")
+                work = self._get_work_from_urn(library, urn)
+
+                if work:
+                    list.remove_entry(work)
+                    membership_change = True
 
         if membership_change:
             # If this list was used to populate any lanes, those
@@ -1575,10 +1583,6 @@ class CustomListsController(AdminCirculationManagerController):
             for lane in Lane.affected_by_customlist(list):
                 lane.update_size(self._db)
 
-        if collections:
-            collections = json.loads(collections)
-        else:
-            collections = []
         new_collections = []
         for collection_id in collections:
             collection = get_one(self._db, Collection, id=collection_id)
@@ -1596,6 +1600,11 @@ class CustomListsController(AdminCirculationManagerController):
         else:
             return Response(unicode(list.id), 200)
 
+    def url_for_custom_list(self, library, list):
+        def url_fn(after):
+            return self.url_for("custom_list", after=after, library_short_name=library.short_name, list_id=list.id)
+        return url_fn
+
     def custom_list(self, list_id):
         library = flask.request.library
         self.require_librarian(library)
@@ -1606,32 +1615,37 @@ class CustomListsController(AdminCirculationManagerController):
             return MISSING_CUSTOM_LIST
 
         if flask.request.method == "GET":
-            entries = []
-            for entry in list.entries:
-                if entry.edition:
-                    url = self.url_for(
-                        "permalink",
-                        identifier_type=entry.edition.primary_identifier.type,
-                        identifier=entry.edition.primary_identifier.identifier,
-                        library_short_name=library.short_name,
-                    )
-                    entries.append(dict(identifier_urn=entry.edition.primary_identifier.urn,
-                                        title=entry.edition.title,
-                                        authors=[author.display_name for author in entry.edition.author_contributors],
-                                        medium=Edition.medium_to_additional_type.get(entry.edition.medium, None),
-                                        url=url,
-                                        language=entry.edition.language,
-                    ))
-            collections = []
-            for collection in list.collections:
-                collections.append(dict(id=collection.id, name=collection.name, protocol=collection.protocol))
-            return dict(id=list.id, name=list.name, entries=entries, collections=collections, entry_count=len(entries))
+            pagination = load_pagination_from_request()
+            if isinstance(pagination, ProblemDetail):
+                return pagination
+
+            query = self._db.query(Work).join(Work.custom_list_entries).filter(CustomListEntry.list_id==list_id)
+            url = self.url_for(
+                "custom_list", list_name=list.name,
+                library_short_name=library.short_name,
+                list_id=list_id,
+            )
+
+            worklist = WorkList()
+            worklist.initialize(library, customlists=[list])
+
+            annotator = self.manager.annotator(worklist)
+            url_fn = self.url_for_custom_list(library, list)
+
+            feed = AcquisitionFeed.from_query(
+                query, self._db, list.name,
+                url, pagination, url_fn, annotator
+            )
+            annotator.annotate_feed(feed, worklist)
+
+            return feed_response(unicode(feed), cache_for=0)
 
         elif flask.request.method == "POST":
             name = flask.request.form.get("name")
-            entries = flask.request.form.get("entries")
-            collections = flask.request.form.get("collections")
-            return self._create_or_update_list(library, name, entries, collections, list_id)
+            entries = self._getJSONFromRequest(flask.request.form.get("entries"))
+            collections = self._getJSONFromRequest(flask.request.form.get("collections"))
+            deletedEntries = self._getJSONFromRequest(flask.request.form.get("deletedEntries"))
+            return self._create_or_update_list(library, name, entries, collections, deletedEntries=deletedEntries, id=list_id)
 
         elif flask.request.method == "DELETE":
             # Deleting requires a library manager.
@@ -2706,7 +2720,7 @@ class SettingsController(AdminCirculationManagerController):
 
     def collection_library_registrations(
             self, do_get=HTTP.debuggable_get, do_post=HTTP.debuggable_post,
-            key=None, registration_class=Registration
+            registration_class=Registration
     ):
         """Use the ODPS Directory Registration Protocol to register a
         Collection with its remote source of truth.
@@ -2757,7 +2771,7 @@ class SettingsController(AdminCirculationManagerController):
             registered = registration.push(
                 Registration.PRODUCTION_STAGE, self.url_for,
                 catalog_url=collection.external_account_id,
-                do_get=do_get, do_post=do_post, key=key
+                do_get=do_get, do_post=do_post
             )
             if isinstance(registered, ProblemDetail):
                 return registered
@@ -3168,8 +3182,7 @@ class SettingsController(AdminCirculationManagerController):
         )
 
     def metadata_services(
-            self, do_get=HTTP.debuggable_get, do_post=HTTP.debuggable_post,
-            key=None
+        self, do_get=HTTP.debuggable_get, do_post=HTTP.debuggable_post,
     ):
         self.require_system_admin()
         provider_apis = [NYTBestSellerAPI,
@@ -3224,7 +3237,7 @@ class SettingsController(AdminCirculationManagerController):
             service.protocol == ExternalIntegration.METADATA_WRANGLER):
 
             problem_detail = self.sitewide_registration(
-                service, do_get=do_get, do_post=do_post, key=key
+                service, do_get=do_get, do_post=do_post
             )
             if problem_detail:
                 self._db.rollback()
@@ -3241,7 +3254,7 @@ class SettingsController(AdminCirculationManagerController):
         )
 
     def sitewide_registration(self, integration, do_get=HTTP.debuggable_get,
-                              do_post=HTTP.debuggable_post, key=None
+                              do_post=HTTP.debuggable_post
     ):
         """Performs a sitewide registration for a particular service, currently
         only the Metadata Wrangler.
@@ -3287,16 +3300,6 @@ class SettingsController(AdminCirculationManagerController):
             # We have a relative path. Create a full registration url.
             base_url = catalog.get('id')
             register_url = urlparse.urljoin(base_url, register_url)
-        # Generate a public key for this website.
-        if not key:
-            key = RSA.generate(2048)
-        encryptor = PKCS1_OAEP.new(key)
-        public_key = key.publickey().exportKey()
-
-        # Save the public key to the database before generating the public key document.
-        public_key_setting = ConfigurationSetting.sitewide(self._db, Configuration.PUBLIC_KEY)
-        public_key_setting.value = public_key
-        self._db.commit()
 
         # If the integration has an existing shared_secret, use it to access the
         # server and update it.
@@ -3308,15 +3311,14 @@ class SettingsController(AdminCirculationManagerController):
             token = base64.b64encode(integration.password.encode('utf-8'))
             headers['Authorization'] = 'Bearer ' + token
 
-        # Get the public key document URL and register this server.
+        # Register this server using the sitewide registration document
         try:
-            body = self.sitewide_registration_document(key.exportKey())
+            body = self.sitewide_registration_document()
             response = do_post(
                 register_url, body, allowed_response_codes=['2xx'],
                 headers=headers
             )
         except Exception as e:
-            public_key_setting.value = None
             return REMOTE_INTEGRATION_FAILED.detailed(e.message)
 
         if isinstance(response, ProblemDetail):
@@ -3325,28 +3327,32 @@ class SettingsController(AdminCirculationManagerController):
         shared_secret = registration_info.get('metadata', {}).get('shared_secret')
 
         if not shared_secret:
-            public_key_setting.value = None
             return REMOTE_INTEGRATION_FAILED.detailed(
                 _('The service did not provide registration information.')
             )
 
-        public_key_setting.value = None
-        shared_secret = encryptor.decrypt(base64.b64decode(shared_secret))
+        ignore, private_key = self.manager.sitewide_key_pair
+        decryptor = Configuration.cipher(private_key)
+        shared_secret = decryptor.decrypt(base64.b64decode(shared_secret))
         integration.password = unicode(shared_secret)
 
-    def sitewide_registration_document(self, private_key):
+    def sitewide_registration_document(self):
         """Generate the document to be sent as part of a sitewide registration
         request.
 
-        :param private_key: An string containing an RSA private key,
-            e.g. the output of RsaKey.exportKey()
         :return: A dictionary with keys 'url' and 'jwt'. 'url' is the URL to
             this site's public key document, and 'jwt' is a JSON Web Token
             proving control over that URL.
         """
+
+        public_key, private_key = self.manager.sitewide_key_pair
+        # Advertise the public key so that the foreign site can encrypt
+        # things for us.
+        public_key_dict = dict(type='RSA', value=public_key)
         public_key_url = self.url_for('public_key_document')
         in_one_minute = datetime.utcnow() + timedelta(seconds=60)
         payload = {'exp': in_one_minute}
+        # Sign a JWT with the private key to prove ownership of the site.
         token = jwt.encode(payload, private_key, algorithm='RS256')
         return dict(url=public_key_url, jwt=token)
 
@@ -3648,7 +3654,7 @@ class SettingsController(AdminCirculationManagerController):
 
     def discovery_service_library_registrations(
             self, do_get=HTTP.debuggable_get,
-            do_post=HTTP.debuggable_post, key=None,
+            do_post=HTTP.debuggable_post,
             registration_class=None
     ):
         """List the libraries that have been registered with a specific
@@ -3707,7 +3713,7 @@ class SettingsController(AdminCirculationManagerController):
 
             registration = registration_class(registry, library)
             registered = registration.push(
-                stage, self.url_for, do_get=do_get, do_post=do_post, key=key
+                stage, self.url_for, do_get=do_get, do_post=do_post
             )
             if isinstance(registered, ProblemDetail):
                 return registered

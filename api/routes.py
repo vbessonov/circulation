@@ -10,6 +10,7 @@ from flask import (
     make_response,
 )
 from flask_cors.core import get_cors_options, set_cors_headers
+from werkzeug.exceptions import HTTPException
 
 from app import app, babel
 
@@ -20,9 +21,6 @@ from core.app_server import (
 )
 from core.model import ConfigurationSetting
 from core.util.problem_detail import ProblemDetail
-from opds import (
-    CirculationManagerAnnotator,
-)
 from controller import CirculationManager
 from problem_details import REMOTE_INTEGRATION_FAILED
 from flask_babel import lazy_gettext as _
@@ -35,7 +33,7 @@ from flask_babel import lazy_gettext as _
 #  https://github.com/pallets/flask/issues/879
 #
 @app.before_first_request
-def initialize_circulation_manager(): 
+def initialize_circulation_manager():
     if os.environ.get('AUTOINITIALIZE') == "False":
         # It's the responsibility of the importing code to set app.manager
         # appropriately.
@@ -52,7 +50,7 @@ def monkeypatch_try_trigger_before_first_request_functions(self):
     """Called before each request and will ensure that it triggers
     the :attr:`before_first_request_funcs` and only exactly once per
     application instance (which means process usually).
-    
+
     :internal:
     """
     if self._got_first_request:
@@ -61,7 +59,7 @@ def monkeypatch_try_trigger_before_first_request_functions(self):
         if self._got_first_request:
             return
         for func in self.before_first_request_funcs:
-            func() 
+            func()
         self._got_first_request = True
 
 from flask import Flask
@@ -74,8 +72,8 @@ def get_locale():
 
 @app.teardown_request
 def shutdown_session(exception):
-    if (hasattr(app, 'manager') 
-        and hasattr(app.manager, '_db') 
+    if (hasattr(app, 'manager')
+        and hasattr(app.manager, '_db')
         and app.manager._db
     ):
         if exception:
@@ -115,10 +113,10 @@ def allows_patron_web(f):
         else:
             resp = make_response(f(*args, **kwargs))
 
-        patron_web_client_url = app.manager.patron_web_client_url
-        if patron_web_client_url:
+        patron_web_domains = app.manager.patron_web_domains
+        if patron_web_domains:
             options = get_cors_options(
-                app, dict(origins=[patron_web_client_url],
+                app, dict(origins=patron_web_domains,
                           supports_credentials=True)
             )
             set_cors_headers(resp, options)
@@ -130,6 +128,11 @@ h = ErrorHandler(app, app.config['DEBUG'])
 @app.errorhandler(Exception)
 @allows_patron_web
 def exception_handler(exception):
+    if isinstance(exception, HTTPException):
+        # This isn't an exception we need to handle, it's werkzeug's way
+        # of interrupting normal control flow with a specific HTTP response.
+        # Return the exception and it will be used as the response.
+        return exception
     return h.handle(exception)
 
 def has_library(f):
@@ -189,7 +192,7 @@ def library_dir_route(path, *args, **kwargs):
         return default_library_no_slash
     return decorator
 
-@library_route("/")
+@library_route("/", strict_slashes=False)
 @has_library
 @allows_patron_web
 @returns_problem_detail
@@ -222,6 +225,14 @@ def acquisition_groups(lane_identifier):
 @returns_problem_detail
 def feed(lane_identifier):
     return app.manager.opds_feeds.feed(lane_identifier)
+
+@library_dir_route('/navigation', defaults=dict(lane_identifier=None))
+@library_route('/navigation/<lane_identifier>')
+@has_library
+@allows_patron_web
+@returns_problem_detail
+def navigation_feed(lane_identifier):
+    return app.manager.opds_feeds.navigation(lane_identifier)
 
 @library_route('/crawlable')
 @has_library
@@ -287,6 +298,12 @@ def shared_collection_hold_info(collection_name, hold_id):
 def shared_collection_revoke_hold(collection_name, hold_id):
     return app.manager.shared_collection_controller.revoke_hold(collection_name, hold_id)
 
+@library_route('/marc')
+@has_library
+@returns_problem_detail
+def marc_page():
+    return app.manager.marc_records.download_page()
+
 @library_dir_route('/search', defaults=dict(lane_identifier=None))
 @library_route('/search/<lane_identifier>')
 @has_library
@@ -336,7 +353,7 @@ def annotations_for_work(identifier_type, identifier):
     return app.manager.annotations.container_for_work(identifier_type, identifier)
 
 @library_route('/works/<identifier_type>/<path:identifier>/borrow', methods=['GET', 'PUT'])
-@library_route('/works/<identifier_type>/<path:identifier>/borrow/<mechanism_id>', 
+@library_route('/works/<identifier_type>/<path:identifier>/borrow/<mechanism_id>',
            methods=['GET', 'PUT'])
 @has_library
 @allows_patron_web
@@ -349,7 +366,6 @@ def borrow(identifier_type, identifier, mechanism_id=None):
 @library_route('/works/<license_pool_id>/fulfill/<mechanism_id>')
 @has_library
 @allows_patron_web
-@requires_auth
 @returns_problem_detail
 def fulfill(license_pool_id, mechanism_id=None):
     return app.manager.loans.fulfill(license_pool_id, mechanism_id)
@@ -375,8 +391,7 @@ def loan_or_hold_detail(identifier_type, identifier):
 @allows_patron_web
 @returns_problem_detail
 def work():
-    annotator = CirculationManagerAnnotator(app.manager.circulation, None)
-    return app.manager.urn_lookup.work_lookup(annotator, 'work')
+    return app.manager.urn_lookup.work_lookup('work')
 
 @library_dir_route('/works/contributor/<contributor_name>', defaults=dict(languages=None, audiences=None))
 @library_dir_route('/works/contributor/<contributor_name>/<languages>', defaults=dict(audiences=None))
@@ -473,7 +488,7 @@ def adobe_drm_devices():
 @returns_problem_detail
 def adobe_drm_device(device_id):
     return app.manager.adobe_device_management.device_id_handler(device_id)
-    
+
 # Route that redirects to the authentication URL for an OAuth provider
 @library_route('/oauth_authenticate')
 @has_library
@@ -501,21 +516,10 @@ def odl_notify(loan_id):
 def heartbeat():
     return app.manager.heartbeat.heartbeat()
 
-@library_route("/service_status")
-@has_library
-@returns_problem_detail
-def service_status():
-    return app.manager.service_status()
-
-@app.route('/loadstorm-<code>.html')
-@returns_problem_detail
-def loadstorm_verify(code):
-    c = Configuration.integration("Loadstorm", required=True)
-    if code == c['verification_code']:
-        return Response("", 200)
-    else:
-        return Response("", 404)
-
 @app.route('/healthcheck.html')
 def health_check():
     return Response("", 200)
+
+@app.route("/images/<filename>")
+def static_image(filename):
+    return app.manager.static_files.image(filename)

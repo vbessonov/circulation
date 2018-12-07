@@ -12,8 +12,14 @@ from sqlalchemy.orm.exc import (
 )
 from flask_babel import lazy_gettext as _
 
-from config import CannotLoadConfiguration
+from config import (
+    CannotLoadConfiguration,
+    IntegrationException,
+)
 
+from core.selftest import (
+    HasSelfTests,
+)
 from core.opds_import import MetadataWranglerOPDSLookup
 from core.metadata_layer import (
     Metadata,
@@ -24,6 +30,7 @@ from core.model import (
     get_one_or_create,
     CustomList,
     DataSource,
+    Edition,
     ExternalIntegration,
     Identifier,
     Representation,
@@ -43,14 +50,15 @@ class NYTAPI(object):
         return d.strftime(self.DATE_FORMAT)
 
 
-class NYTBestSellerAPI(NYTAPI):
-    
+class NYTBestSellerAPI(NYTAPI, HasSelfTests):
+
     PROTOCOL = ExternalIntegration.NYT
+    GOAL = ExternalIntegration.METADATA_GOAL
     NAME = _("NYT Best Seller API")
     CARDINALITY = 1
 
     SETTINGS = [
-        { "key": ExternalIntegration.PASSWORD, "label": _("API key") },
+        { "key": ExternalIntegration.PASSWORD, "label": _("API key"), "required": True },
     ]
 
     # An NYT integration is shared by all libraries in a circulation manager.
@@ -60,35 +68,50 @@ class NYTBestSellerAPI(NYTAPI):
 
     LIST_NAMES_URL = BASE_URL + "/names.json"
     LIST_URL = BASE_URL + ".json?list=%s"
-    
+
     LIST_OF_LISTS_MAX_AGE = timedelta(days=1)
     LIST_MAX_AGE = timedelta(days=1)
     HISTORICAL_LIST_MAX_AGE = timedelta(days=365)
 
     @classmethod
     def from_config(cls, _db, **kwargs):
-        integration = ExternalIntegration.lookup(
-            _db, ExternalIntegration.NYT,
-            ExternalIntegration.METADATA_GOAL
-        )
+        integration = cls.external_integration(_db)
 
         if not integration:
             message = "No ExternalIntegration found for the NYT."
             raise CannotLoadConfiguration(message)
 
-        if not integration.password:
-            message = "NYT integration improperly configured."
-            raise CannotLoadConfiguration(message)
-
         return cls(_db, api_key=integration.password, **kwargs)
 
     def __init__(self, _db, api_key=None, do_get=None, metadata_client=None):
+        self.log = logging.getLogger("NYT API")
         self._db = _db
+        if not api_key:
+            raise CannotLoadConfiguration("No NYT API key is specified")
         self.api_key = api_key
         self.do_get = do_get or Representation.simple_http_get
         if not metadata_client:
-            metadata_client = MetadataWranglerOPDSLookup.from_config(self._db)
+            try:
+                metadata_client = MetadataWranglerOPDSLookup.from_config(
+                    self._db
+                )
+            except CannotLoadConfiguration, e:
+                self.log.error(
+                    "Metadata wrangler integration is not configured, proceeding without one."
+                )
         self.metadata_client = metadata_client
+
+    @classmethod
+    def external_integration(cls, _db):
+        return ExternalIntegration.lookup(
+            _db, ExternalIntegration.NYT,
+            ExternalIntegration.METADATA_GOAL
+        )
+
+    def _run_self_tests(self, _db):
+        yield self.run_test(
+            "Getting list of best-seller lists", self.list_of_lists
+        )
 
     @property
     def source(self):
@@ -108,8 +131,25 @@ class NYTBestSellerAPI(NYTAPI):
         representation, cached = Representation.get(
             self._db, url, do_get=self.do_get, max_age=max_age, debug=True,
             pause_before=0.1)
-        content = json.loads(representation.content)
-        return content
+        status = representation.status_code
+        if status == 200:
+            # Everything's fine.
+            content = json.loads(representation.content)
+            return content
+
+        diagnostic = "Response from %s was: %r" % (
+            url, representation.content
+        )
+
+        if status == 403:
+            raise IntegrationException(
+                "API authentication failed",
+                "API key is most likely wrong. %s" % diagnostic
+            )
+        else:
+            raise IntegrationException(
+                "Unknown API error (status %s)" % status, diagnostic
+            )
 
     def list_of_lists(self, max_age=LIST_OF_LISTS_MAX_AGE):
         return self.request(self.LIST_NAMES_URL, max_age=max_age)
@@ -144,6 +184,7 @@ class NYTBestSellerAPI(NYTAPI):
             self.update(list, date, self.HISTORICAL_LIST_MAX_AGE)
             self._db.commit()
 
+
 class NYTBestSellerList(list):
 
     def __init__(self, list_info, metadata_client):
@@ -158,6 +199,23 @@ class NYTBestSellerList(list):
         self.frequency = timedelta(frequency)
         self.items_by_isbn = dict()
         self.metadata_client = metadata_client
+        self.log = logging.getLogger("NYT Best-seller list %s" % self.name)
+
+    @property
+    def medium(self):
+        """What medium are the books on this list?
+
+        Lists like "Audio Fiction" contain audiobooks; all others
+        contain normal books. (TODO: this isn't quite right; the
+        distinction between ebooks and print books here exists in a
+        way it doesn't with most other sources of Editions.)
+        """
+        name = self.name
+        if not name:
+            return None
+        if name.startswith("Audio "):
+            return Edition.AUDIO_MEDIUM
+        return Edition.BOOK_MEDIUM
 
     @property
     def all_dates(self):
@@ -169,7 +227,7 @@ class NYTBestSellerList(list):
         while date >= end:
             yield date
             old_date = date
-            date = date - self.frequency  
+            date = date - self.frequency
             if old_date > end and date < end:
                 # We overshot the end date.
                 yield end
@@ -183,25 +241,25 @@ class NYTBestSellerList(list):
                     book.get('primary_isbn13') or book.get('primary_isbn10'))
                 if key in self.items_by_isbn:
                     item = self.items_by_isbn[key]
-                    logging.debug("Previously seen ISBN: %r", key)
+                    self.log.debug("Previously seen ISBN: %r", key)
                 else:
-                    item = NYTBestSellerListTitle(li_data)
+                    item = NYTBestSellerListTitle(li_data, self.medium)
                     self.items_by_isbn[key] = item
                     self.append(item)
-                    # logging.debug("Newly seen ISBN: %r, %s", key, len(self))
+                    # self.log.debug("Newly seen ISBN: %r, %s", key, len(self))
             except ValueError, e:
                 # Should only happen when the book has no identifier, which...
                 # should never happen.
-                logging.error("No identifier for %r", li_data)
+                self.log.error("No identifier for %r", li_data)
                 item = None
-                continue              
+                continue
 
             # This is the date the *best-seller list* was published,
             # not the date the book was published.
             list_date = NYTAPI.parse_date(li_data['published_date'])
             if not item.first_appearance or list_date < item.first_appearance:
-                item.first_appearance = list_date 
-            if (not item.most_recent_appearance 
+                item.first_appearance = list_date
+            if (not item.most_recent_appearance
                 or list_date > item.most_recent_appearance):
                 item.most_recent_appearance = list_date
 
@@ -209,7 +267,7 @@ class NYTBestSellerList(list):
         """Turn this NYTBestSeller list into a CustomList object."""
         data_source = DataSource.lookup(_db, DataSource.NYT)
         l, was_new = get_one_or_create(
-            _db, 
+            _db,
             CustomList,
             data_source=data_source,
             foreign_identifier=self.foreign_identifier,
@@ -227,7 +285,7 @@ class NYTBestSellerList(list):
         the current state of the NYTBestSeller list.
         """
         db = Session.object_session(custom_list)
-    
+
         # Add new items to the list.
         for i in self:
             list_item, was_new = i.to_custom_list_entry(
@@ -238,7 +296,7 @@ class NYTBestSellerList(list):
 
 class NYTBestSellerListTitle(TitleFromExternalList):
 
-    def __init__(self, data):
+    def __init__(self, data, medium):
         data = data
         try:
             bestsellers_date = NYTAPI.parse_date(data.get('bestsellers_date'))
@@ -271,11 +329,11 @@ class NYTBestSellerListTitle(TitleFromExternalList):
             # other books in the same series, as well as ISBNs that
             # are just wrong. Assign these equivalencies at a low
             # level of confidence.
-            for isbn in d.get('isbns', []): 
+            for isbn in d.get('isbns', []):
                 isbn13 = isbn.get('isbn13', None)
                 if isbn13:
-                    other_isbns.append( 
-                        IdentifierData(Identifier.ISBN, isbn13, 0.50) 
+                    other_isbns.append(
+                        IdentifierData(Identifier.ISBN, isbn13, 0.50)
                     )
 
 
@@ -291,7 +349,8 @@ class NYTBestSellerListTitle(TitleFromExternalList):
 
         metadata = Metadata(
             data_source=DataSource.NYT,
-            title=title, 
+            title=title,
+            medium=medium,
             language='eng',
             published=published_date,
             publisher=publisher,

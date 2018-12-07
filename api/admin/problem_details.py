@@ -23,6 +23,13 @@ INVALID_ADMIN_CREDENTIALS = pd(
       _("Valid library staff credentials are required."),
 )
 
+ADMIN_NOT_AUTHORIZED = pd(
+    "http://librarysimplified.org/terms/problem/admin-not-authorized",
+    403,
+    _("Admin not authorized"),
+    _("Your admin account is not authorized to make this request."),
+)
+
 GOOGLE_OAUTH_FAILURE = pd(
       "http://librarysimplified.org/terms/problem/google-oauth-failure",
       400,
@@ -118,7 +125,7 @@ UNKNOWN_ROLE = pd(
     "http://librarysimplified.org/terms/problem/unknown-role",
     status_code=400,
     title=_("Unknown role."),
-    detail=_("One of the submitted roles is not one of the known contributor roles."),
+    detail=_("One of the submitted roles is not one of the known roles."),
 )
 
 UNKNOWN_MEDIUM = pd(
@@ -133,6 +140,13 @@ INVALID_RATING = pd(
     status_code=400,
     title=_("Invalid rating."),
     detail=_("The rating must be a number in the rating scale."),
+)
+
+INVALID_IMAGE = pd(
+    "http://librarysimplified.org/terms/problem/invalid-image",
+    status_code=400,
+    title=_("Invalid image"),
+    detail=_("The submitted image is invalid."),
 )
 
 MISSING_LIBRARY_SHORT_NAME = pd(
@@ -163,11 +177,25 @@ MISSING_COLLECTION_NAME = pd(
     detail=_("You must identify the collection by its name."),
 )
 
+MISSING_ANALYTICS_NAME = pd(
+    "http://librarysimplified.org/terms/problem/missing-analytics-name",
+    status_code=400,
+    title=_("Missing analytics name."),
+    detail=_("You must identify the analytics service by its name."),
+)
+
 COLLECTION_NAME_ALREADY_IN_USE = pd(
     "http://librarysimplified.org/terms/problem/collection-name-already-in-use",
     status_code=400,
     title=_("Collection name already in use"),
     detail=_("The collection name must be unique, and there's already a collection with the specified name."),
+)
+
+MISSING_COLLECTION_IDENTIFIER = pd(
+    "http://librarysimplified.org/terms/problem/missing-collection-identifier",
+    status_code=400,
+    title=_("Missing collection identifier"),
+    detail=_("No collection identifier was used."),
 )
 
 CANNOT_DELETE_COLLECTION_WITH_CHILDREN = pd(
@@ -254,13 +282,6 @@ MISSING_PGCRYPTO_EXTENSION = pd(
     detail=_("You tried to store a password for an individual admin, but the database does not have the pgcrypto extension installed."),
 )
 
-SHARED_SECRET_DECRYPTION_ERROR = pd(
-    "http://librarysimplified.org/terms/problem/decryption-error",
-    status_code=502,
-    title=_("Decryption error"),
-    detail=_("Failed to decrypt a shared secret retrieved from another computer.")
-)
-
 MISSING_ADMIN = pd(
     "http://librarysimplified.org/terms/problem/missing-admin",
     status_code=404,
@@ -280,6 +301,27 @@ INVALID_CONFIGURATION_OPTION = pd(
     status_code=400,
     title=_("Invalid configuration option"),
     detail=_("The configuration has an invalid value."),
+)
+
+INVALID_EMAIL = pd(
+    "http://librarysimplified.org/terms/problem/invalid-format",
+    status_code=400,
+    title=_("Invalid email format"),
+    detail=_("You must enter a valid email address."),
+)
+
+INVALID_URL = pd(
+    "http://librarysimplified.org/terms/problem/invalid-format",
+    status_code=400,
+    title=_("Invalid URL format"),
+    detail=_("You must enter a valid URL."),
+)
+
+INVALID_NUMBER = pd(
+    "http://librarysimplified.org/terms/problem/invalid-format",
+    status_code=400,
+    title=_("Invalid number format"),
+    detail=_("You must enter a number."),
 )
 
 INVALID_EXTERNAL_TYPE_REGULAR_EXPRESSION = pd(
@@ -303,6 +345,13 @@ MULTIPLE_BASIC_AUTH_SERVICES = pd(
     detail=_("Each library can only have one patron authentication service using basic auth."),
 )
 
+NO_SUCH_PATRON = pd(
+    "http://librarysimplified.org/terms/problem/no-such-patron",
+    status_code=404,
+    title=_("No such patron"),
+    detail=_("The specified patron doesn't exist, or is associated with a different library."),
+)
+
 MISSING_SITEWIDE_SETTING_KEY = pd(
     "http://librarysimplified.org/terms/problem/missing-sitewide-setting-key",
     status_code=400,
@@ -322,6 +371,13 @@ MULTIPLE_SITEWIDE_SERVICES = pd(
     status_code=400,
     title=_("Multiple sitewide services"),
     detail=_("You tried to create a new sitewide service, but a sitewide service of the same type is already configured."),
+)
+
+MULTIPLE_SERVICES_FOR_LIBRARY = pd(
+    "http://librarysimplified.org/terms/problem/multiple-services-for-library",
+    status_code=400,
+    title=_("Multiple services for library"),
+    detail=_("Each library can only have one service of this type."),
 )
 
 MISSING_CUSTOM_LIST = pd(
@@ -378,14 +434,14 @@ NO_CUSTOM_LISTS_FOR_LANE = pd(
     status_code=400,
     title=_("No custom lists for lane"),
     detail=_("A custom lane must have at least one associated list."),
-)    
+)
 
 LANE_WITH_PARENT_AND_DISPLAY_NAME_ALREADY_EXISTS = pd(
     "http://librarysimplified.org/terms/problem/lane-with-parent-and-display-name-already-exists",
     status_code=400,
     title=_("Lane with parent and display name already exists"),
     detail=_("You cannot create a lane with the same parent and display name as an existing lane."),
-)    
+)
 
 CANNOT_SHOW_LANE_WITH_HIDDEN_PARENT = pd(
     "http://librarysimplified.org/terms/problem/cannot-show-lane-with-hidden-parent",
@@ -399,4 +455,11 @@ COLLECTION_DOES_NOT_SUPPORT_REGISTRATION = pd(
     status_code=400,
     title=_("The collection does not support registration"),
     detail=_("The collection does not support registration."),
+)
+
+FAILED_TO_RUN_SELF_TESTS = pd(
+    "http://librarysimplified.org/terms/problem/failed-to-run-self-tests",
+    status_code=400,
+    title=_("Failed to run self tests for collection."),
+    detail=_("Failed to run self tests for collection.")
 )

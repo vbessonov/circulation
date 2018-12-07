@@ -5,9 +5,6 @@ import base64
 import json
 from flask_babel import lazy_gettext as _
 
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
-
 from core.model import (
     Collection,
     ConfigurationSetting,
@@ -15,12 +12,13 @@ from core.model import (
     get_one,
 )
 from circulation_exceptions import *
+from config import Configuration
 from core.config import CannotLoadConfiguration
 from core.util.http import HTTP
 
 class SharedCollectionAPI(object):
-    """Logic for circulating books to patrons of libraries on other 
-    circulation managers. This can be used for something like ODL where the 
+    """Logic for circulating books to patrons of libraries on other
+    circulation managers. This can be used for something like ODL where the
     circulation manager is responsible for managing loans and holds rather
     than the distributor, or potentially for inter-library loans for other
     collection types.
@@ -133,8 +131,7 @@ class SharedCollectionAPI(object):
                 _("Remote authentication document"))
 
         public_key = public_key.get("value")
-        public_key = RSA.importKey(public_key)
-        encryptor = PKCS1_OAEP.new(public_key)
+        encryptor = Configuration.cipher(public_key)
 
         normalized_url = IntegrationClient.normalize_url(start_url)
         client = get_one(self._db, IntegrationClient, url=normalized_url)
@@ -177,7 +174,7 @@ class SharedCollectionAPI(object):
         fulfillment = api.fulfill_for_external_library(client, loan, mechanism)
         if not fulfillment or not (fulfillment.content_link or fulfillment.content):
             raise CannotFulfill()
-        
+
         if loan.fulfillment is None and not mechanism.delivery_mechanism.is_streaming:
             __transaction = self._db.begin_nested()
             loan.fulfillment = mechanism
@@ -204,14 +201,14 @@ class BaseSharedCollectionAPI(object):
             "label": _("URLs for libraries on other circulation managers that use this collection"),
             "description": _("A URL should include the library's short name (e.g. https://circulation.librarysimplified.org/NYNYPL/), even if it is the only library on the circulation manager."),
             "type": "list",
-            "optional": True,
+            "format": "url",
         },
         {
             "key": Collection.EBOOK_LOAN_DURATION_KEY,
             "label": _("Ebook Loan Duration for libraries on other circulation managers (in Days)"),
             "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
             "description": _("When a patron from another library borrows an ebook from this collection, the circulation manager will ask for a loan that lasts this number of days. This must be equal to or less than the maximum loan duration negotiated with the distributor."),
-            "optional": True,
+            "format": "number",
         }
     ]
 
@@ -223,6 +220,6 @@ class BaseSharedCollectionAPI(object):
 
     def fulfill_for_external_library(self, client, loan, mechanism):
         raise NotImplementedError()
-        
+
     def release_hold_from_external_library(self, client, hold):
         raise NotImplementedError()

@@ -1,5 +1,6 @@
 from flask_babel import lazy_gettext as _
 
+from core.config import IntegrationException
 from core.problem_details import (
     INTEGRATION_ERROR,
     INTERNAL_SERVER_ERROR,
@@ -7,14 +8,19 @@ from core.problem_details import (
 from problem_details import *
 
 
-class CirculationException(Exception):
+class CirculationException(IntegrationException):
     """An exception occured when carrying out a circulation operation.
 
     `status_code` is the status code that should be returned to the patron.
     """
     status_code = 400
 
-class InternalServerError(Exception):
+    def __init__(self, message=None, debug_info=None):
+        message = message or self.__class__.__name__
+        super(CirculationException, self).__init__(message, debug_info)
+
+
+class InternalServerError(IntegrationException):
     status_code = 500
 
     def as_problem_detail_document(self, debug=False):
@@ -74,10 +80,10 @@ class CannotLoan(CirculationException):
     status_code = 500
 
 class OutstandingFines(CannotLoan):
-    """The patron has outstanding fines above the limit in the library's 
+    """The patron has outstanding fines above the limit in the library's
     policy."""
     status_code = 403
-    
+
 class AuthorizationExpired(CannotLoan):
     """The patron's authorization has expired."""
     status_code = 403
@@ -85,7 +91,7 @@ class AuthorizationExpired(CannotLoan):
     def as_problem_detail_document(self, debug=False):
         """Return a suitable problem detail document."""
         return EXPIRED_CREDENTIALS
-    
+
 class AuthorizationBlocked(CannotLoan):
     """The patron's authorization is blocked for some reason other than
     fines or an expired card.
@@ -98,7 +104,7 @@ class AuthorizationBlocked(CannotLoan):
         """Return a suitable problem detail document."""
         return BLOCKED_CREDENTIALS
 
-    
+
 class PatronLoanLimitReached(CannotLoan):
     status_code = 403
 

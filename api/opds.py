@@ -11,17 +11,22 @@ from sqlalchemy.orm import lazyload
 
 from core.cdn import cdnify
 from core.classifier import Classifier
+from core.entrypoint import (
+    EverythingEntryPoint,
+)
 from core.opds import (
     Annotator,
     AcquisitionFeed,
     UnfulfillableWork,
 )
-from core.util.opds_writer import (    
+from core.util.opds_writer import (
     OPDSFeed,
 )
 from core.model import (
+    CirculationEvent,
     ConfigurationSetting,
     Credential,
+    CustomList,
     DataSource,
     DeliveryMechanism,
     Identifier,
@@ -49,6 +54,7 @@ from annotations import AnnotationWriter
 from circulation import BaseCirculationAPI
 from config import Configuration
 from novelist import NoveListAPI
+from core.analytics import Analytics
 
 class CirculationManagerAnnotator(Annotator):
 
@@ -73,10 +79,13 @@ class CirculationManagerAnnotator(Annotator):
         return None
 
     def top_level_title(self):
-        return None
+        return ""
 
     def default_lane_url(self):
         return self.feed_url(None)
+
+    def lane_url(self, lane):
+        return self.feed_url(lane)
 
     def url_for(self, *args, **kwargs):
         if self.test_mode:
@@ -131,6 +140,11 @@ class CirculationManagerAnnotator(Annotator):
             kwargs.update(extra_kwargs)
         return self.cdn_url_for(route, _external=True, **kwargs)
 
+    def navigation_url(self, lane):
+        return self.cdn_url_for(
+            "navigation_feed", lane_identifier=self._lane_identifier(lane),
+            library_short_name=lane.library.short_name, _external=True)
+
     def active_licensepool_for(self, work):
         loan = (self.active_loans_by_work.get(work) or
                 self.active_holds_by_work.get(work))
@@ -145,7 +159,7 @@ class CirculationManagerAnnotator(Annotator):
                 CirculationManagerAnnotator, self).active_licensepool_for(work)
 
     def annotate_work_entry(self, work, active_license_pool, edition, identifier, feed, entry, updated=None):
-        Annotator.annotate_work_entry(
+        super(CirculationManagerAnnotator, self).annotate_work_entry(
             work, active_license_pool, edition, identifier, feed, entry, updated
         )
         active_loan = self.active_loans_by_work.get(work)
@@ -161,10 +175,22 @@ class CirculationManagerAnnotator(Annotator):
         for tag in link_tags:
             entry.append(tag)
 
-    def acquisition_links(self, active_license_pool, active_loan, active_hold, active_fulfillment,
-                          feed, identifier, can_hold=True, can_revoke_hold=True,
-                          set_mechanism_at_borrow=False):
-        """Generate a number of <link> tags that enumerate all acquisition methods."""
+    def acquisition_links(
+            self, active_license_pool, active_loan, active_hold,
+            active_fulfillment, feed, identifier, can_hold=True,
+            can_revoke_hold=True, set_mechanism_at_borrow=False,
+            direct_fulfillment_delivery_mechanisms=[]
+    ):
+        """Generate a number of <link> tags that enumerate all acquisition
+        methods.
+
+        :param direct_fulfillment_delivery_mechanisms: A way to
+        fulfill each LicensePoolDeliveryMechanism in this list will be
+        presented as a link with
+        rel="http://opds-spec.org/acquisition/open-access", indicating
+        that it can be downloaded with no intermediate steps such as
+        authentication.
+        """
         can_borrow = False
         can_fulfill = False
         can_revoke = False
@@ -199,19 +225,19 @@ class CirculationManagerAnnotator(Annotator):
         if can_borrow:
             # Borrowing a book gives you an OPDS entry that gives you
             # fulfillment links.
-            if set_mechanism_at_borrow:
+            if set_mechanism_at_borrow and active_license_pool:
                 # The ebook distributor requires that the delivery
                 # mechanism be set at the point of checkout. This means
                 # a separate borrow link for each mechanism.
                 for mechanism in active_license_pool.delivery_mechanisms:
                     borrow_links.append(
                         self.borrow_link(
-                            identifier,
+                            active_license_pool,
                             mechanism, [mechanism],
                             active_hold
                         )
                     )
-            else:
+            elif active_license_pool:
                 # The ebook distributor does not require that the
                 # delivery mechanism be set at the point of
                 # checkout. This means a single borrow link with
@@ -220,7 +246,7 @@ class CirculationManagerAnnotator(Annotator):
                 # will be set at the point of fulfillment.
                 borrow_links.append(
                     self.borrow_link(
-                        identifier,
+                        active_license_pool,
                         None, active_license_pool.delivery_mechanisms,
                         active_hold
                     )
@@ -248,7 +274,7 @@ class CirculationManagerAnnotator(Annotator):
                     rel=rel, href=url, types=[type])
                 fulfill_links.append(link_tag)
 
-            elif active_loan.fulfillment:
+            elif active_loan and active_loan.fulfillment:
                 # The delivery mechanism for this loan has been
                 # set. There is one link for the delivery mechanism
                 # that was locked in, and links for any streaming
@@ -275,13 +301,31 @@ class CirculationManagerAnnotator(Annotator):
                         )
                     )
 
+        open_access_links = []
+        for lpdm in direct_fulfillment_delivery_mechanisms:
+            # These links use the OPDS 'open-access' link relation not
+            # because they are open access in the licensing sense, but
+            # because they are ways to download the book "without any
+            # requirement, which includes payment and registration."
+            #
+            # To avoid confusion, we explicitly add a dc:rights
+            # statement to each link explaining what the rights are to
+            # this title.
+            direct_fulfill = self.fulfill_link(
+                active_license_pool,
+                active_loan,
+                lpdm.delivery_mechanism,
+                rel=OPDSFeed.OPEN_ACCESS_REL
+            )
+            direct_fulfill.attrib.update(self.rights_attributes(lpdm))
+            open_access_links.append(direct_fulfill)
+
         # If this is an open-access book, add an open-access link for
         # every delivery mechanism with an associated resource.
-        open_access_links = []
-        if active_license_pool.open_access:
+        if active_license_pool and active_license_pool.open_access:
             for lpdm in active_license_pool.delivery_mechanisms:
                 if lpdm.resource:
-                    open_access_links.append(self.open_access_link(lpdm))
+                    open_access_links.append(self.open_access_link(active_license_pool, lpdm))
 
         return [x for x in borrow_links + fulfill_links + open_access_links + revoke_links
                 if x is not None]
@@ -289,26 +333,51 @@ class CirculationManagerAnnotator(Annotator):
     def revoke_link(self, active_license_pool, active_loan, active_hold):
         return None
 
-    def borrow_link(self, identifier,
+    def borrow_link(self, active_license_pool,
                     borrow_mechanism, fulfillment_mechanisms, active_hold=None):
         return None
 
-    def fulfill_link(self, license_pool, active_loan, delivery_mechanism):
+    def fulfill_link(self, license_pool, active_loan, delivery_mechanism,
+                     rel=OPDSFeed.ACQUISITION_REL):
         return None
 
-    def open_access_link(self, lpdm):
+    def open_access_link(self, pool, lpdm):
         _db = Session.object_session(lpdm)
         url = cdnify(lpdm.resource.url)
-        kw = dict(rel=OPDSFeed.OPEN_ACCESS_REL, href=url)
+        kw = dict(rel=OPDSFeed.OPEN_ACCESS_REL, type='')
+
+        # Start off assuming that the URL associated with the
+        # LicensePoolDeliveryMechanism's Resource is the URL we should
+        # send for download purposes. This will be the case unless we
+        # previously mirrored that URL somewhere else.
+        href = lpdm.resource.url
+
         rep = lpdm.resource.representation
-        if rep and rep.media_type:
-            kw['type'] = rep.media_type
+        if rep:
+            if rep.media_type:
+                kw['type'] = rep.media_type
+            href = rep.public_url
+        kw['href'] = cdnify(href)
+
         link_tag = AcquisitionFeed.link(**kw)
+        link_tag.attrib.update(self.rights_attributes(lpdm))
         always_available = OPDSFeed.makeelement(
             "{%s}availability" % OPDSFeed.OPDS_NS, status="available"
         )
         link_tag.append(always_available)
         return link_tag
+
+    def rights_attributes(self, lpdm):
+        """Create a dictionary of tag attributes that explain the
+        rights status of a LicensePoolDeliveryMechanism.
+
+        If nothing is known, the dictionary will be empty.
+        """
+        if not lpdm or not lpdm.rights_status or not lpdm.rights_status.uri:
+            return {}
+        rights_attr = "{%s}rights" % OPDSFeed.DCTERMS_NS
+        return {rights_attr : lpdm.rights_status.uri }
+
 
 class LibraryAnnotator(CirculationManagerAnnotator):
 
@@ -318,7 +387,7 @@ class LibraryAnnotator(CirculationManagerAnnotator):
     ABOUT = Configuration.ABOUT
     LICENSE = Configuration.LICENSE
     REGISTER = Configuration.REGISTER
-    
+
     CONFIGURATION_LINKS = [
         TERMS_OF_SERVICE,
         PRIVACY_POLICY,
@@ -332,14 +401,30 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         Configuration.HELP_WEB,
         Configuration.HELP_URI,
     ]
-    
+
     def __init__(self, circulation, lane, library, patron=None,
                  active_loans_by_work={}, active_holds_by_work={},
                  active_fulfillments_by_work={},
                  facet_view='feed',
                  test_mode=False,
-                 top_level_title="All Books"
+                 top_level_title="All Books",
+                 library_identifies_patrons = True,
+                 facets=None
     ):
+        """Constructor.
+
+        :param library_identifies_patrons: A boolean indicating
+          whether or not this library can distinguish between its
+          patrons. A library might not authenticate patrons at
+          all, or it might distinguish patrons from non-patrons in a
+          way that does not allow it to keep track of individuals.
+
+          If this is false, links that imply the library can
+          distinguish between patrons will not be included. Depending
+          on the configured collections, some extra links may be
+          added, for direct acquisition of titles that would normally
+          require a loan.
+        """
         super(LibraryAnnotator, self).__init__(lane, active_loans_by_work=active_loans_by_work,
                                                active_holds_by_work=active_holds_by_work,
                                                active_fulfillments_by_work=active_fulfillments_by_work,
@@ -351,38 +436,51 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         self.facet_view = facet_view
         self._adobe_id_tags = {}
         self._top_level_title = top_level_title
+        self.identifies_patrons = library_identifies_patrons
+        self.facets = facets or None
 
     def top_level_title(self):
         return self._top_level_title
 
     def permalink_for(self, work, license_pool, identifier):
-        return self.url_for(
+        url = self.url_for(
             'permalink',
             identifier_type=identifier.type,
             identifier=identifier.identifier,
             library_short_name=self.library.short_name,
             _external=True
         )
+        return url, OPDSFeed.ENTRY_TYPE
 
-    def groups_url(self, lane):
+    def groups_url(self, lane, facets=None):
         lane_identifier = self._lane_identifier(lane)
+        if facets:
+            kwargs = dict(facets.items())
+        else:
+            kwargs = {}
+
         return self.cdn_url_for(
             "acquisition_groups",
             lane_identifier=lane_identifier,
             library_short_name=self.library.short_name,
-            _external=True)
+            _external=True,
+            **kwargs
+        )
 
-    def default_lane_url(self):
-        return self.groups_url(None)
+    def default_lane_url(self, facets=None):
+        return self.groups_url(None, facets=facets)
 
     def feed_url(self, lane, facets=None, pagination=None, default_route='feed'):
         extra_kwargs = dict(library_short_name=self.library.short_name)
         return super(LibraryAnnotator, self).feed_url(lane, facets, pagination, default_route, extra_kwargs)
 
-    def search_url(self, lane, query, pagination):
+    def search_url(self, lane, query, pagination, facets=None):
         lane_identifier = self._lane_identifier(lane)
         kwargs = dict(q=query)
-        kwargs.update(dict(pagination.items()))
+        if facets:
+            kwargs.update(dict(facets.items()))
+        if pagination:
+            kwargs.update(dict(pagination.items()))
         return self.url_for(
             "lane_search", lane_identifier=lane_identifier,
             library_short_name=self.library.short_name,
@@ -418,28 +516,28 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             title = lane.display_name
 
         if show_feed:
-            return self.feed_url(lane), title
+            return self.feed_url(lane, self.facets), title
 
-        return self.lane_url(lane), title
+        return self.lane_url(lane, self.facets), title
 
-    def lane_url(self, lane):
+    def lane_url(self, lane, facets=None):
         # If the lane has sublanes, the URL identifying the group will
         # take the user to another set of groups for the
         # sublanes. Otherwise it will take the user to a list of the
         # books in the lane by author.
 
         if lane and isinstance(lane, Lane) and lane.sublanes:
-            url = self.groups_url(lane)
+            url = self.groups_url(lane, facets=facets)
         elif lane and (
             isinstance(lane, Lane)
             or isinstance(lane, DynamicLane)
             ):
-            url = self.feed_url(lane)
+            url = self.feed_url(lane, facets)
         else:
             # This lane isn't part of our lane hierarchy. It's probably
             # a WorkList created to represent the top-level. Use the top-level
             # url for it.
-            url = self.default_lane_url()
+            url = self.default_lane_url(facets=facets)
         return url
 
     def annotate_work_entry(self, work, active_license_pool, edition, identifier, feed, entry):
@@ -447,19 +545,9 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         if isinstance(self.lane, CrawlableCustomListBasedLane) and isinstance(work, BaseMaterializedWork):
             updated = max(work.last_update_time, work.first_appearance, work.availability_time)
 
-        # First, add a permalink.
-        feed.add_link_to_entry(
-            entry, 
-            rel='alternate',
-            type=OPDSFeed.ENTRY_TYPE,
-            href=self.permalink_for(
-                work, active_license_pool, identifier
-            )
-        )
-
         # Add a link for reporting problems.
         feed.add_link_to_entry(
-            entry, 
+            entry,
             rel='issues',
             href=self.url_for(
                 'report',
@@ -515,18 +603,33 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             )
 
         # Add a link to get a patron's annotations for this book.
-        feed.add_link_to_entry(
-            entry,
-            rel="http://www.w3.org/ns/oa#annotationService",
-            type=AnnotationWriter.CONTENT_TYPE,
-            href=self.url_for(
-                'annotations_for_work',
-                identifier_type=identifier.type,
-                identifier=identifier.identifier,
-                library_short_name=self.library.short_name,
-                _external=True
+        if self.identifies_patrons:
+            feed.add_link_to_entry(
+                entry,
+                rel="http://www.w3.org/ns/oa#annotationService",
+                type=AnnotationWriter.CONTENT_TYPE,
+                href=self.url_for(
+                    'annotations_for_work',
+                    identifier_type=identifier.type,
+                    identifier=identifier.identifier,
+                    library_short_name=self.library.short_name,
+                    _external=True
+                )
             )
-        )
+
+        if Analytics.is_configured(self.library):
+            feed.add_link_to_entry(
+                entry,
+                rel="http://librarysimplified.org/terms/rel/analytics/open-book",
+                href=self.url_for(
+                    'track_analytics_event',
+                    identifier_type=identifier.type,
+                    identifier=identifier.identifier,
+                    event_type=CirculationEvent.OPEN_BOOK,
+                    library_short_name=self.library.short_name,
+                    _external=True
+                )
+            )
 
     @classmethod
     def related_books_available(cls, work, library):
@@ -535,19 +638,22 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         """
         contributions = work.sort_author and work.sort_author != Edition.UNKNOWN_AUTHOR
 
-        return (contributions 
+        return (contributions
                 or work.series
                 or NoveListAPI.is_configured(library))
 
     def language_and_audience_key_from_work(self, work):
         language_key = work.language
 
+        audiences = None
         if work.audience == Classifier.AUDIENCE_CHILDREN:
             audiences = [Classifier.AUDIENCE_CHILDREN]
-        if work.audience == Classifier.AUDIENCE_YOUNG_ADULT:
+        elif work.audience == Classifier.AUDIENCE_YOUNG_ADULT:
             audiences = Classifier.AUDIENCES_JUVENILE
-        if work.audience in Classifier.AUDIENCES_ADULT:
+        elif work.audience in Classifier.AUDIENCES_ADULT:
             audiences = list(Classifier.AUDIENCES)
+        else:
+            audiences = []
 
         audience_key=None
         if audiences:
@@ -600,7 +706,7 @@ class LibraryAnnotator(CirculationManagerAnnotator):
                 work_id, work_title
             )
             return
-        
+
         series_name = work.series
         languages, audiences = self.language_and_audience_key_from_work(work)
         href = self.url_for(
@@ -625,16 +731,30 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             self.add_patron(feed)
         else:
             # No patron is authenticated. Show them how to
-            # authenticate.
+            # authenticate (or that authentication is not supported).
             self.add_authentication_document_link(feed)
-        
+
         # Add a 'search' link if the lane is searchable.
         if lane and lane.search_target:
+            search_facet_kwargs = {}
+            if self.facets != None:
+                if self.facets.entrypoint_is_default:
+                    # The currently selected entry point is a default.
+                    # Rather than using it, we want the 'default' behavior
+                    # for search, which is to search everything.
+                    search_facets = self.facets.navigate(
+                        entrypoint=EverythingEntryPoint
+                    )
+                else:
+                    search_facets = self.facets
+                search_facet_kwargs.update(dict(search_facets.items()))
+
+
             lane_identifier = self._lane_identifier(lane)
             search_url = self.url_for(
                 'lane_search', lane_identifier=lane_identifier,
                 library_short_name=self.library.short_name,
-                _external=True
+                _external=True, **search_facet_kwargs
             )
             search_link = dict(
                 rel="search",
@@ -643,33 +763,46 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             )
             feed.add_link_to_feed(feed.feed, **search_link)
 
-        shelf_link = dict(
-            rel="http://opds-spec.org/shelf",
-            type=OPDSFeed.ACQUISITION_FEED_TYPE,
-            href=self.url_for('active_loans', library_short_name=self.library.short_name, _external=True))
-        feed.add_link_to_feed(feed.feed, **shelf_link)
-
-        annotations_link = dict(
-            rel="http://www.w3.org/ns/oa#annotationService",
-            type=AnnotationWriter.CONTENT_TYPE,
-            href=self.url_for('annotations', library_short_name=self.library.short_name, _external=True))
-        feed.add_link_to_feed(feed.feed, **annotations_link)
-
-        if lane and lane.uses_customlists and len(lane.customlists) == 1:
-            crawlable_url = self.url_for(
-                "crawlable_list_feed", list_name=lane.customlists[0].name,
-                library_short_name=self.library.short_name,
-                _external=True
-            )
-            crawlable_link = dict(
-                rel="http://opds-spec.org/crawlable",
+        if self.identifies_patrons:
+            # Since this library authenticates patrons it can offer
+            # a bookshelf and an annotation service.
+            shelf_link = dict(
+                rel="http://opds-spec.org/shelf",
                 type=OPDSFeed.ACQUISITION_FEED_TYPE,
-                href=crawlable_url,
-            )
-            feed.add_link_to_feed(feed.feed, **crawlable_link)
+                href=self.url_for('active_loans', library_short_name=self.library.short_name, _external=True))
+            feed.add_link_to_feed(feed.feed, **shelf_link)
+
+            annotations_link = dict(
+                rel="http://www.w3.org/ns/oa#annotationService",
+                type=AnnotationWriter.CONTENT_TYPE,
+                href=self.url_for('annotations', library_short_name=self.library.short_name, _external=True))
+            feed.add_link_to_feed(feed.feed, **annotations_link)
+
+        if lane and lane.uses_customlists:
+            name = None
+            if hasattr(lane, "customlists") and len(lane.customlists) == 1:
+                name = lane.customlists[0].name
+            else:
+                _db = Session.object_session(self.library)
+                customlist = lane.get_customlists(_db)
+                if customlist:
+                    name = customlist[0].name
+
+            if name:
+                crawlable_url = self.url_for(
+                    "crawlable_list_feed", list_name=name,
+                    library_short_name=self.library.short_name,
+                    _external=True
+                )
+                crawlable_link = dict(
+                    rel="http://opds-spec.org/crawlable",
+                    type=OPDSFeed.ACQUISITION_FEED_TYPE,
+                    href=crawlable_url,
+                )
+                feed.add_link_to_feed(feed.feed, **crawlable_link)
 
         self.add_configuration_links(feed)
-        
+
     def add_configuration_links(self, feed):
         _db = Session.object_session(self.library)
 
@@ -679,12 +812,21 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             else:
                 # This is an ElementTree object.
                 link = OPDSFeed.link(**l)
-                feed.append(link)            
-        
+                feed.append(link)
+
         for rel in self.CONFIGURATION_LINKS:
             setting = ConfigurationSetting.for_library(rel, self.library)
             if setting.value:
                 d = dict(href=setting.value, type="text/html", rel=rel)
+                _add_link(d)
+
+        navigation_urls = ConfigurationSetting.for_library(
+            Configuration.WEB_HEADER_LINKS, self.library).json_value
+        if navigation_urls:
+            navigation_labels = ConfigurationSetting.for_library(
+                Configuration.WEB_HEADER_LABELS, self.library).json_value
+            for (url, label) in zip(navigation_urls, navigation_labels):
+                d = dict(href=url, title=label, type="text/html", rel="related", role="navigation")
                 _add_link(d)
 
         for type, value in Configuration.help_uris(self.library):
@@ -692,15 +834,27 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             if type:
                 d['type'] = type
             _add_link(d)
-        
+
     def acquisition_links(self, active_license_pool, active_loan, active_hold, active_fulfillment,
-                          feed, identifier):
+                          feed, identifier, direct_fulfillment_delivery_mechanisms=None):
+        direct_fulfillment_delivery_mechanisms = direct_fulfillment_delivery_mechanisms or []
         api = None
-        if self.circulation:
+        if self.circulation and active_license_pool:
             api = self.circulation.api_for_license_pool(active_license_pool)
         if api:
             set_mechanism_at_borrow = (
                 api.SET_DELIVERY_MECHANISM_AT == BaseCirculationAPI.BORROW_STEP)
+            if (active_license_pool and not self.identifies_patrons
+                and not active_loan):
+                for lpdm in active_license_pool.delivery_mechanisms:
+                    if api.can_fulfill_without_loan(
+                            None, active_license_pool, lpdm
+                    ):
+                        # This title can be fulfilled without an
+                        # active loan, so we're going to add an acquisition
+                        # link that goes directly to the fulfillment step
+                        # without the 'borrow' step.
+                        direct_fulfillment_delivery_mechanisms.append(lpdm)
         else:
             # This is most likely an open-access book. Just put one
             # borrow link and figure out the rest later.
@@ -711,9 +865,12 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             feed, identifier, can_hold=self.library.allow_holds,
             can_revoke_hold=(active_hold and (not self.circulation or self.circulation.can_revoke_hold(active_license_pool, active_hold))),
             set_mechanism_at_borrow=set_mechanism_at_borrow,
+            direct_fulfillment_delivery_mechanisms=direct_fulfillment_delivery_mechanisms
         )
 
     def revoke_link(self, active_license_pool, active_loan, active_hold):
+        if not self.identifies_patrons:
+            return
         url = self.url_for(
             'revoke_loan_or_hold',
             license_pool_id=active_license_pool.id,
@@ -723,20 +880,23 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         revoke_link_tag = OPDSFeed.makeelement("link", **kw)
         return revoke_link_tag
 
-    def borrow_link(self, identifier,
+    def borrow_link(self, active_license_pool,
                     borrow_mechanism, fulfillment_mechanisms, active_hold=None):
+        if not self.identifies_patrons:
+            return
+        identifier = active_license_pool.identifier
         if borrow_mechanism:
             # Following this link will both borrow the book and set
             # its delivery mechanism.
             mechanism_id = borrow_mechanism.delivery_mechanism.id
         else:
-            # Following this link will borrow the book but not set 
+            # Following this link will borrow the book but not set
             # its delivery mechanism.
             mechanism_id = None
         borrow_url = self.url_for(
-            "borrow", 
+            "borrow",
             identifier_type=identifier.type,
-            identifier=identifier.identifier, 
+            identifier=identifier.identifier,
             mechanism_id=mechanism_id,
             library_short_name=self.library.short_name,
             _external=True)
@@ -773,18 +933,21 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         borrow_link.extend(indirect_acquisitions)
         return borrow_link
 
-    def fulfill_link(self, license_pool, active_loan, delivery_mechanism):
+    def fulfill_link(self, license_pool, active_loan, delivery_mechanism,
+                     rel=OPDSFeed.ACQUISITION_REL):
         """Create a new fulfillment link.
 
         This link may include tags from the OPDS Extensions for DRM.
         """
+        if not self.identifies_patrons and rel != OPDSFeed.OPEN_ACCESS_REL:
+            return
         if isinstance(delivery_mechanism, LicensePoolDeliveryMechanism):
             logging.warn("LicensePoolDeliveryMechanism passed into fulfill_link instead of DeliveryMechanism!")
             delivery_mechanism = delivery_mechanism.delivery_mechanism
         format_types = AcquisitionFeed.format_types(delivery_mechanism)
         if not format_types:
             return None
-            
+
         fulfill_url = self.url_for(
             "fulfill",
             license_pool_id=license_pool.id,
@@ -792,7 +955,6 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             library_short_name=self.library.short_name,
             _external=True
         )
-        rel=OPDSFeed.ACQUISITION_REL
         link_tag = AcquisitionFeed.acquisition_link(
             rel=rel, href=fulfill_url,
             types=format_types
@@ -800,46 +962,45 @@ class LibraryAnnotator(CirculationManagerAnnotator):
 
         children = AcquisitionFeed.license_tags(license_pool, active_loan, None)
         link_tag.extend(children)
-        
+
         children = self.drm_device_registration_tags(
             license_pool, active_loan, delivery_mechanism
         )
         link_tag.extend(children)
         return link_tag
 
-    @classmethod
-    def _adobe_patron_identifier(self, patron):
-        _db = Session.object_session(patron)
-        internal = DataSource.lookup(_db, DataSource.INTERNAL_PROCESSING)
-
-        def refresh(credential):
-            credential.credential = str(uuid.uuid1())
-        patron_identifier = Credential.lookup(
-            _db, internal, AuthdataUtility.ADOBE_ACCOUNT_ID_PATRON_IDENTIFIER, patron,
-            refresher_method=refresh, allow_persistent_token=True
+    def open_access_link(self, pool, lpdm):
+        link_tag = super(LibraryAnnotator, self).open_access_link(pool, lpdm)
+        fulfill_url = self.url_for(
+            "fulfill",
+            license_pool_id=pool.id,
+            mechanism_id=lpdm.delivery_mechanism.id,
+            library_short_name=self.library.short_name,
+            _external=True
         )
-        return patron_identifier.credential
-    
+        link_tag.attrib.update(dict(href=fulfill_url))
+        return link_tag
+
     def drm_device_registration_tags(self, license_pool, active_loan,
                                      delivery_mechanism):
-        """Construct OPDS Extensions for DRM tags that explain how to 
+        """Construct OPDS Extensions for DRM tags that explain how to
         register a device with the DRM server that manages this loan.
         :param delivery_mechanism: A DeliveryMechanism
-        """        
-        if not active_loan or not delivery_mechanism:
+        """
+        if not active_loan or not delivery_mechanism or not self.identifies_patrons:
             return []
-        
+
         if delivery_mechanism.drm_scheme == DeliveryMechanism.ADOBE_DRM:
             # Get an identifier for the patron that will be registered
             # with the DRM server.
             _db = Session.object_session(active_loan)
             patron = active_loan.patron
-            
+
             # Generate a <drm:licensor> tag that can feed into the
             # Vendor ID service.
             return self.adobe_id_tags(patron)
         return []
-   
+
     def adobe_id_tags(self, patron_identifier):
         """Construct tags using the DRM Extensions for OPDS standard that
         explain how to get an Adobe ID for this patron, and how to
@@ -860,29 +1021,17 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             cache_key = patron_identifier
         cached = self._adobe_id_tags.get(cache_key)
         if cached is None:
-            if isinstance(patron_identifier, Patron):
-                # Find the patron's identifier for Adobe ID purposes.
-                patron_identifier = self._adobe_patron_identifier(
-                    patron_identifier
-                )
             cached = []
             authdata = AuthdataUtility.from_config(self.library)
             if authdata:
-                # TODO: We would like to call encode() here, and have
-                # the client use a JWT as authdata, but we can't,
-                # because there's no way to use authdata to deactivate
-                # a device. So we've used this alternate technique
-                # that's much smaller than a JWT and can be smuggled
-                # into username/password.
-                vendor_id, jwt = authdata.encode_short_client_token(patron_identifier)
-
+                vendor_id, token = authdata.short_client_token_for_patron(patron_identifier)
                 drm_licensor = OPDSFeed.makeelement("{%s}licensor" % OPDSFeed.DRM_NS)
                 vendor_attr = "{%s}vendor" % OPDSFeed.DRM_NS
                 drm_licensor.attrib[vendor_attr] = vendor_id
                 patron_key = OPDSFeed.makeelement("{%s}clientToken" % OPDSFeed.DRM_NS)
-                patron_key.text = jwt
+                patron_key.text = token
                 drm_licensor.append(patron_key)
-                
+
                 # Add the link to the DRM Device Management Protocol
                 # endpoint. See:
                 # https://github.com/NYPL-Simplified/Simplified/wiki/DRM-Device-Management
@@ -898,8 +1047,10 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         else:
             cached = copy.deepcopy(cached)
         return cached
-        
+
     def add_patron(self, feed_obj):
+        if not self.identifies_patrons:
+            return
         patron_details = {}
         if self.patron.username:
             patron_details["{%s}username" % OPDSFeed.SIMPLIFIED_NS] = self.patron.username
@@ -914,14 +1065,18 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         manager's Authentication for OPDS document
         for the current library.
         """
+        # Even if self.identifies_patrons is false, we include this link,
+        # because this document is the one that explains there is no
+        # patron authentication at this library.
         feed_obj.add_link_to_feed(
             feed_obj.feed,
             rel='http://opds-spec.org/auth/document',
             href=self.url_for(
-                'authentication_document', 
+                'authentication_document',
                 library_short_name=self.library.short_name, _external=True
             )
         )
+
 
 class SharedCollectionAnnotator(CirculationManagerAnnotator):
 
@@ -942,6 +1097,9 @@ class SharedCollectionAnnotator(CirculationManagerAnnotator):
     def default_lane_url(self):
         return self.feed_url(None, default_route='crawlable_collection_feed')
 
+    def lane_url(self, lane):
+        return self.feed_url(lane, default_route='crawlable_collection_feed')
+
     def feed_url(self, lane, facets=None, pagination=None, default_route='feed'):
         extra_kwargs = dict(collection_name=self.collection.name)
         return super(SharedCollectionAnnotator, self).feed_url(lane, facets, pagination, default_route, extra_kwargs)
@@ -955,7 +1113,7 @@ class SharedCollectionAnnotator(CirculationManagerAnnotator):
         super(SharedCollectionAnnotator, self).annotate_work_entry(
             work, active_license_pool, edition, identifier, feed, entry, updated
         )
-                    
+
     def acquisition_links(self, active_license_pool, active_loan, active_hold, active_fulfillment,
                           feed, identifier):
         """Generate a number of <link> tags that enumerate all acquisition methods."""
@@ -1004,8 +1162,14 @@ class SharedCollectionAnnotator(CirculationManagerAnnotator):
             revoke_link_tag = OPDSFeed.makeelement("link", **kw)
             return revoke_link_tag
 
-    def borrow_link(self, identifier,
+    def borrow_link(self, active_license_pool,
                     borrow_mechanism, fulfillment_mechanisms, active_hold=None):
+        if active_license_pool.open_access:
+            # No need to borrow from a shared collection when the book
+            # already has an open access link.
+            return None
+
+        identifier = active_license_pool.identifier
         if active_hold:
             borrow_url = self.url_for(
                 "shared_collection_borrow",
@@ -1054,7 +1218,8 @@ class SharedCollectionAnnotator(CirculationManagerAnnotator):
         borrow_link.extend(indirect_acquisitions)
         return borrow_link
 
-    def fulfill_link(self, license_pool, active_loan, delivery_mechanism):
+    def fulfill_link(self, license_pool, active_loan, delivery_mechanism,
+                     rel=OPDSFeed.ACQUISITION_REL):
         """Create a new fulfillment link."""
         if isinstance(delivery_mechanism, LicensePoolDeliveryMechanism):
             logging.warn("LicensePoolDeliveryMechanism passed into fulfill_link instead of DeliveryMechanism!")
@@ -1070,7 +1235,6 @@ class SharedCollectionAnnotator(CirculationManagerAnnotator):
             mechanism_id=delivery_mechanism.id,
             _external=True
         )
-        rel=OPDSFeed.ACQUISITION_REL
         link_tag = AcquisitionFeed.acquisition_link(
             rel=rel, href=fulfill_url,
             types=format_types
@@ -1106,14 +1270,14 @@ class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
         feed_obj = AcquisitionFeed(db, "Active loans and holds", url, works, annotator)
         annotator.annotate_feed(feed_obj, None)
         return feed_obj
-    
+
     @classmethod
     def single_loan_feed(cls, circulation, loan, test_mode=False):
         db = Session.object_session(loan)
         work = loan.license_pool.work or loan.license_pool.presentation_edition.work
         annotator = cls(circulation, None, loan.library,
-                        active_loans_by_work={work:loan}, 
-                        active_holds_by_work={}, 
+                        active_loans_by_work={work:loan},
+                        active_holds_by_work={},
                         test_mode=test_mode)
         identifier = loan.license_pool.identifier
         url = annotator.url_for(
@@ -1133,8 +1297,8 @@ class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
         db = Session.object_session(hold)
         work = hold.license_pool.work or hold.license_pool.presentation_edition.work
         annotator = cls(circulation, None, hold.library,
-                        active_loans_by_work={}, 
-                        active_holds_by_work={work:hold}, 
+                        active_loans_by_work={},
+                        active_holds_by_work={work:hold},
                         test_mode=test_mode)
         return AcquisitionFeed.single_entry(db, work, annotator)
 
@@ -1143,8 +1307,8 @@ class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
         db = Session.object_session(loan)
         work = loan.license_pool.work or loan.license_pool.presentation_edition.work
         annotator = cls(circulation, None, loan.library,
-                        active_loans_by_work={}, 
-                        active_holds_by_work={}, 
+                        active_loans_by_work={},
+                        active_holds_by_work={},
                         active_fulfillments_by_work={work:fulfillment},
                         test_mode=test_mode)
         identifier = loan.license_pool.identifier
@@ -1186,7 +1350,7 @@ class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
             'patron_profile', library_short_name=self.library.short_name, _external=True
         )
         return link
-        
+
     def annotate_feed(self, feed, lane):
         """Annotate the feed with top-level DRM device registration tags
         and a link to the User Profile Management Protocol endpoint.
@@ -1207,8 +1371,8 @@ class SharedCollectionLoanAndHoldAnnotator(SharedCollectionAnnotator):
         db = Session.object_session(loan)
         work = loan.license_pool.work or loan.license_pool.presentation_edition.work
         annotator = cls(collection, None,
-                        active_loans_by_work={work:loan}, 
-                        active_holds_by_work={}, 
+                        active_loans_by_work={work:loan},
+                        active_holds_by_work={},
                         test_mode=test_mode)
         identifier = loan.license_pool.identifier
         url = annotator.url_for(
@@ -1227,8 +1391,8 @@ class SharedCollectionLoanAndHoldAnnotator(SharedCollectionAnnotator):
         db = Session.object_session(hold)
         work = hold.license_pool.work or hold.license_pool.presentation_edition.work
         annotator = cls(collection, None,
-                        active_loans_by_work={}, 
-                        active_holds_by_work={work:hold}, 
+                        active_loans_by_work={},
+                        active_holds_by_work={work:hold},
                         test_mode=test_mode)
         return AcquisitionFeed.single_entry(db, work, annotator)
 
@@ -1237,8 +1401,8 @@ class SharedCollectionLoanAndHoldAnnotator(SharedCollectionAnnotator):
         db = Session.object_session(loan)
         work = loan.license_pool.work or loan.license_pool.presentation_edition.work
         annotator = cls(collection, None, loan.library,
-                        active_loans_by_work={}, 
-                        active_holds_by_work={}, 
+                        active_loans_by_work={},
+                        active_holds_by_work={},
                         active_fulfillments_by_work={work:fulfillment},
                         test_mode=test_mode)
         url = annotator.url_for(

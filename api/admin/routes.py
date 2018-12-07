@@ -45,19 +45,11 @@ def setup_admin(_db=None):
     app.secret_key = ConfigurationSetting.sitewide_secret(
         _db, Configuration.SECRET_KEY
     )
-    # Reload the flask session in case an admin was logged in
-    # when the app restarted. The session is initially loaded
-    # from the cookie before this function runs, but it creates a
-    # null session on the first request because the secret key
-    # isn't set yet.
-    if not flask.session and flask.request:
-        flask.session = app.open_session(flask.request)
-
 
 def allows_admin_auth_setup(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        setting_up = (app.manager.admin_sign_in_controller.auth == None)
+        setting_up = (app.manager.admin_sign_in_controller.admin_auth_providers == [])
         return f(*args, setting_up=setting_up, **kwargs)
     return decorated
 
@@ -117,7 +109,7 @@ def returns_json_or_response_or_problem_detail(f):
 def google_auth_callback():
     return app.manager.admin_sign_in_controller.redirect_after_google_sign_in()
 
-@app.route("/admin/sign_in_with_password", methods=["GET", "POST"])
+@app.route("/admin/sign_in_with_password", methods=["POST"])
 @returns_problem_detail
 def password_auth():
     return app.manager.admin_sign_in_controller.password_sign_in()
@@ -126,6 +118,18 @@ def password_auth():
 @returns_problem_detail
 def admin_sign_in():
     return app.manager.admin_sign_in_controller.sign_in()
+
+@app.route('/admin/sign_out')
+@returns_problem_detail
+@requires_admin
+def admin_sign_out():
+    return app.manager.admin_sign_in_controller.sign_out()
+
+@app.route('/admin/change_password', methods=["POST"])
+@returns_problem_detail
+@requires_admin
+def admin_change_password():
+    return app.manager.admin_sign_in_controller.change_password()
 
 @library_route('/admin/works/<identifier_type>/<path:identifier>', methods=['GET'])
 @has_library
@@ -140,6 +144,20 @@ def work_details(identifier_type, identifier):
 @requires_admin
 def work_classifications(identifier_type, identifier):
     return app.manager.admin_work_controller.classifications(identifier_type, identifier)
+
+@library_route('/admin/works/<identifier_type>/<path:identifier>/preview_book_cover', methods=['POST'])
+@has_library
+@returns_problem_detail
+@requires_admin
+def work_preview_book_cover(identifier_type, identifier):
+    return app.manager.admin_work_controller.preview_book_cover(identifier_type, identifier)
+
+@library_route('/admin/works/<identifier_type>/<path:identifier>/change_book_cover', methods=['POST'])
+@has_library
+@returns_problem_detail
+@requires_admin
+def work_change_book_cover(identifier_type, identifier):
+    return app.manager.admin_work_controller.change_book_cover(identifier_type, identifier)
 
 @library_route('/admin/works/<identifier_type>/<path:identifier>/complaints', methods=['GET'])
 @has_library
@@ -218,6 +236,11 @@ def languages():
 @returns_json_or_response_or_problem_detail
 def media():
     return app.manager.admin_work_controller.media()
+
+@app.route('/admin/rights_status')
+@returns_json_or_response_or_problem_detail
+def rights_status():
+    return app.manager.admin_work_controller.rights_status()
 
 @library_route('/admin/complaints')
 @has_library
@@ -308,50 +331,59 @@ def stats():
 @requires_admin
 @requires_csrf_token
 def libraries():
-    return app.manager.admin_settings_controller.libraries()
+    if flask.request.method == 'GET':
+        return app.manager.admin_library_settings_controller.process_get()
+    else:
+        return app.manager.admin_library_settings_controller.process_post()
 
 @app.route("/admin/library/<library_uuid>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def library(library_uuid):
-    return app.manager.admin_settings_controller.library(library_uuid)
+    return app.manager.admin_library_settings_controller.process_delete(library_uuid)
 
 @app.route("/admin/collections", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def collections():
-    return app.manager.admin_settings_controller.collections()
+    return app.manager.admin_collection_settings_controller.process_collections()
+
+@app.route("/admin/collection_self_tests/<identifier>", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def collection_self_tests(identifier):
+    return app.manager.admin_collection_self_tests_controller.process_collection_self_tests(identifier)
 
 @app.route("/admin/collection/<collection_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def collection(collection_id):
-    return app.manager.admin_settings_controller.collection(collection_id)
+    return app.manager.admin_collection_settings_controller.process_delete(collection_id)
 
 @app.route("/admin/collection_library_registrations", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def collection_library_registrations():
-    return app.manager.admin_settings_controller.collection_library_registrations()
+    return app.manager.admin_collection_library_registrations_controller.process_collection_library_registrations()
 
 @app.route("/admin/admin_auth_services", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
-@allows_admin_auth_setup
 @requires_admin
 @requires_csrf_token
 def admin_auth_services():
-    return app.manager.admin_settings_controller.admin_auth_services()
+    return app.manager.admin_auth_services_controller.process_admin_auth_services()
 
 @app.route("/admin/admin_auth_service/<protocol>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def admin_auth_service(protocol):
-    return app.manager.admin_settings_controller.admin_auth_service(protocol)
+    return app.manager.admin_auth_services_controller.process_delete(protocol)
 
 @app.route("/admin/individual_admins", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
@@ -359,133 +391,183 @@ def admin_auth_service(protocol):
 @requires_admin
 @requires_csrf_token
 def individual_admins():
-    return app.manager.admin_settings_controller.individual_admins()
+    if flask.request.method == 'GET':
+        return app.manager.admin_individual_admin_settings_controller.process_get()
+    else:
+        return app.manager.admin_individual_admin_settings_controller.process_post()
 
 @app.route("/admin/individual_admin/<email>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def individual_admin(email):
-    return app.manager.admin_settings_controller.individual_admin(email)
+    return app.manager.admin_individual_admin_settings_controller.process_delete(email)
 
 @app.route("/admin/patron_auth_services", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def patron_auth_services():
-    return app.manager.admin_settings_controller.patron_auth_services()
+    return app.manager.admin_patron_auth_services_controller.process_patron_auth_services()
 
 @app.route("/admin/patron_auth_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def patron_auth_service(service_id):
-    return app.manager.admin_settings_controller.patron_auth_service(service_id)
+    return app.manager.admin_patron_auth_services_controller.process_delete(service_id)
+
+@library_route("/admin/manage_patrons", methods=['POST'])
+@has_library
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def lookup_patron():
+    return app.manager.admin_patron_controller.lookup_patron()
+
+@library_route("/admin/manage_patrons/reset_adobe_id", methods=['POST'])
+@has_library
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def reset_adobe_id():
+    return app.manager.admin_patron_controller.reset_adobe_id()
 
 @app.route("/admin/metadata_services", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def metadata_services():
-    return app.manager.admin_settings_controller.metadata_services()
+    return app.manager.admin_metadata_services_controller.process_metadata_services()
 
 @app.route("/admin/metadata_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def metadata_service(service_id):
-    return app.manager.admin_settings_controller.metadata_service(service_id)
+    return app.manager.admin_metadata_services_controller.process_delete(service_id)
 
 @app.route("/admin/analytics_services", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def analytics_services():
-    return app.manager.admin_settings_controller.analytics_services()
+    return app.manager.admin_analytics_services_controller.process_analytics_services()
 
 @app.route("/admin/analytics_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def analytics_service(service_id):
-    return app.manager.admin_settings_controller.analytics_service(service_id)
+    return app.manager.admin_analytics_services_controller.process_delete(service_id)
 
 @app.route("/admin/cdn_services", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def cdn_services():
-    return app.manager.admin_settings_controller.cdn_services()
+    return app.manager.admin_cdn_services_controller.process_cdn_services()
 
 @app.route("/admin/cdn_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def cdn_service(service_id):
-    return app.manager.admin_settings_controller.cdn_service(service_id)
+    return app.manager.admin_cdn_services_controller.process_delete(service_id)
 
 @app.route("/admin/search_services", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def search_services():
-    return app.manager.admin_settings_controller.search_services()
+    return app.manager.admin_search_services_controller.process_services()
 
 @app.route("/admin/search_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def search_service(service_id):
-    return app.manager.admin_settings_controller.search_service(service_id)
+    return app.manager.admin_search_services_controller.process_delete(service_id)
 
 @app.route("/admin/storage_services", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def storage_services():
-    return app.manager.admin_settings_controller.storage_services()
+    return app.manager.admin_storage_services_controller.process_services()
 
 @app.route("/admin/storage_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def storage_service(service_id):
-    return app.manager.admin_settings_controller.storage_service(service_id)
+    return app.manager.admin_storage_services_controller.process_delete(service_id)
+
+@app.route("/admin/catalog_services", methods=['GET', 'POST'])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def catalog_services():
+    return app.manager.admin_catalog_services_controller.process_catalog_services()
+
+@app.route("/admin/catalog_service/<service_id>", methods=["DELETE"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def catalog_service(service_id):
+    return app.manager.admin_catalog_services_controller.process_delete(service_id)
 
 @app.route("/admin/discovery_services", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def discovery_services():
-    return app.manager.admin_settings_controller.discovery_services()
+    return app.manager.admin_discovery_services_controller.process_discovery_services()
 
 @app.route("/admin/discovery_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def discovery_service(service_id):
-    return app.manager.admin_settings_controller.discovery_service(service_id)
+    return app.manager.admin_discovery_services_controller.process_delete(service_id)
 
 @app.route("/admin/sitewide_settings", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def sitewide_settings():
-    return app.manager.admin_settings_controller.sitewide_settings()
+    if flask.request.method == 'GET':
+        return app.manager.admin_sitewide_configuration_settings_controller.process_get()
+    else:
+        return app.manager.admin_sitewide_configuration_settings_controller.process_post()
 
 @app.route("/admin/sitewide_setting/<key>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def sitewide_setting(key):
-    return app.manager.admin_settings_controller.sitewide_setting(key)
+    return app.manager.admin_sitewide_configuration_settings_controller.process_delete(key)
+
+@app.route("/admin/logging_services", methods=['GET', 'POST'])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def logging_services():
+    return app.manager.admin_logging_services_controller.process_services()
+
+@app.route("/admin/logging_service/<key>", methods=["DELETE"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def logging_service(key):
+    return app.manager.admin_logging_services_controller.process_delete(key)
 
 @app.route("/admin/discovery_service_library_registrations", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
 def discovery_service_library_registrations():
-    return app.manager.admin_settings_controller.discovery_service_library_registrations()
+    return app.manager.admin_discovery_service_library_registrations_controller.process_discovery_service_library_registrations()
 
 @library_route("/admin/custom_lists", methods=["GET", "POST"])
 @has_library
@@ -548,7 +630,7 @@ def reset_lanes():
 @requires_admin
 @requires_csrf_token
 def sitewide_registration():
-    return app.manager.admin_settings_controller.sitewide_registration()
+    return app.manager.admin_sitewide_registration_controller.process_sitewide_registration()
 
 @app.route('/admin/sign_in_again')
 def admin_sign_in_again():
@@ -562,8 +644,7 @@ def admin_sign_in_again():
         return redirect(app.manager.url_for('admin_sign_in', redirect=redirect_url))
     return flask.render_template_string(sign_in_again_template)
 
-@app.route('/admin/web')
-@app.route('/admin/web/')
+@app.route('/admin/web/', strict_slashes=False)
 @app.route('/admin/web/collection/<path:collection>/book/<path:book>')
 @app.route('/admin/web/collection/<path:collection>')
 @app.route('/admin/web/book/<path:book>')
@@ -571,8 +652,7 @@ def admin_sign_in_again():
 def admin_view(collection=None, book=None, etc=None, **kwargs):
     return app.manager.admin_view_controller(collection, book, path=etc)
 
-@app.route('/admin')
-@app.route('/admin/')
+@app.route('/admin/', strict_slashes=False)
 def admin_base(**kwargs):
     return redirect(app.manager.url_for('admin_view'))
 
@@ -580,16 +660,10 @@ def admin_base(**kwargs):
 @returns_problem_detail
 def admin_js():
     directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "node_modules", "simplified-circulation-web", "dist")
-    cache_timeout = ConfigurationSetting.sitewide(
-        app._db, Configuration.STATIC_FILE_CACHE_TIME
-    ).int_value
-    return flask.send_from_directory(directory, "circulation-web.js", cache_timeout=cache_timeout)
+    return app.manager.static_files.static_file(directory, "circulation-web.js")
 
 @app.route('/admin/static/circulation-web.css')
 @returns_problem_detail
 def admin_css():
     directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "node_modules", "simplified-circulation-web", "dist")
-    cache_timeout = ConfigurationSetting.sitewide(
-        app._db, Configuration.STATIC_FILE_CACHE_TIME
-    ).int_value
-    return flask.send_from_directory(directory, "circulation-web.css", cache_timeout=cache_timeout)
+    return app.manager.static_files.static_file(directory, "circulation-web.css")

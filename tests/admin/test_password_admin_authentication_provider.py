@@ -28,10 +28,12 @@ class TestPasswordAdminAuthenticationProvider(DatabaseTest):
         # Both admins with passwords can sign in.
         admin_details, redirect = password_auth.sign_in(self._db, dict(email="admin1@nypl.org", password="pass1", redirect="foo"))
         eq_("admin1@nypl.org", admin_details.get("email"))
+        eq_(PasswordAdminAuthenticationProvider.NAME, admin_details.get("type"))
         eq_("foo", redirect)
 
         admin_details, redirect = password_auth.sign_in(self._db, dict(email="admin2@nypl.org", password="pass2", redirect="foo"))
         eq_("admin2@nypl.org", admin_details.get("email"))
+        eq_(PasswordAdminAuthenticationProvider.NAME, admin_details.get("type"))
         eq_("foo", redirect)
 
         # An admin can't sign in with an incorrect password..
@@ -43,7 +45,7 @@ class TestPasswordAdminAuthenticationProvider(DatabaseTest):
         admin_details, redirect = password_auth.sign_in(self._db, dict(email="admin1@nypl.org", password="pass2", redirect="foo"))
         eq_(INVALID_ADMIN_CREDENTIALS, admin_details)
         eq_(None, redirect)
-        
+
         # The admin with no password can't sign in.
         admin_details, redirect = password_auth.sign_in(self._db, dict(email="admin3@nypl.org", redirect="foo"))
         eq_(INVALID_ADMIN_CREDENTIALS, admin_details)

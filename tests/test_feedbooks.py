@@ -47,13 +47,13 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
 
         defaults = {
             FeedbooksOPDSImporter.REALLY_IMPORT_KEY: "true",
-            FeedbooksOPDSImporter.LANGUAGE_KEY: "de",
             FeedbooksOPDSImporter.REPLACEMENT_CSS_KEY: None,
         }
         for setting, value in defaults.items():
             if setting not in settings:
                 settings[setting] = value
 
+        collection.external_account_id = settings.pop('language', 'de')
         for setting, value in settings.items():
             if value is None:
                 continue
@@ -88,6 +88,11 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
             Exception, "configured to not actually do an import",
             self._importer, **settings
         )
+
+    def test_unique_identifier(self):
+        # The unique account ID is the language of the Feedbooks
+        # feed in use.
+        eq_('de', self.collection.unique_account_id)
 
     def test_error_retrieving_replacement_css(self):
         """The importer cannot be instantiated if a replacement CSS
@@ -228,7 +233,7 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
             FeedbooksOPDSImporter.REPLACEMENT_CSS_KEY : "http://css/"
         }
 
-        # The very first request made is going to be to the 
+        # The very first request made is going to be to the
         # REPLACEMENT_CSS_KEY URL.
         self.http.queue_response(
             200, content="Some new CSS", media_type="text/css",
@@ -264,9 +269,7 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
             content=feed
         )
 
-        [edition], [pool], [work], failures = importer.import_from_feed(
-            feed, immediately_presentation_ready=True,
-        )
+        [edition], [pool], [work], failures = importer.import_from_feed(feed)
 
         eq_({}, failures)
 
@@ -287,7 +290,7 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
         # into a LicensePoolDeliveryMechanism. The other formats were
         # ignored.
         [mechanism] = pool.delivery_mechanisms
-        eq_('http://s3.amazonaws.com/test.content.bucket/FeedBooks/URI/http%3A//www.feedbooks.com/book/677/Discourse%20on%20the%20Method.epub',
+        eq_('https://s3.amazonaws.com/test.content.bucket/FeedBooks/URI/http%3A%2F%2Fwww.feedbooks.com%2Fbook%2F677/Discourse+on+the+Method.epub',
             mechanism.resource.representation.mirror_url
         )
         eq_(u'application/epub+zip', mechanism.delivery_mechanism.content_type)
@@ -326,13 +329,7 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
             content=feed
         )
 
-        response = self.importer.import_from_feed(
-            feed, immediately_presentation_ready=True,
-        )
-
-        [edition], [pool], [work], failures = self.importer.import_from_feed(
-            feed, immediately_presentation_ready=True,
-        )
+        [edition], [pool], [work], failures = self.importer.import_from_feed(feed)
 
         # The work has been created and has metadata.
         eq_("Discourse on the Method", work.title)
@@ -349,14 +346,12 @@ class TestFeedbooksOPDSImporter(DatabaseTest):
         [mechanism] = pool.delivery_mechanisms
         eq_(RightsStatus.IN_COPYRIGHT, mechanism.rights_status.uri)
 
-        # The DeliveryMechanism is set as mirrored, but its 'mirror
-        # URL' is the same as the original URL. This is not the best
-        # outcome--it happens in Identifier.add_link--but it should be
-        # okay.
-
-        eq_('http://www.feedbooks.com/book/677.epub',
-            mechanism.resource.representation.mirror_url
-        )
+        # The DeliveryMechanism has a Representation but the Representation
+        # has not been set as mirrored, because nothing was uploaded.
+        rep = mechanism.resource.representation
+        eq_('http://www.feedbooks.com/book/677.epub', rep.url)
+        eq_(None, rep.mirror_url)
+        eq_(None, rep.mirror_exception)
 
         # The pool is not marked as open-access because although it
         # has open-access links, they're not licensed under terms we
@@ -459,11 +454,10 @@ class TestFeedbooksImportMonitor(DatabaseTest):
         Feedbooks logic.
         """
         collection = self._collection(protocol=ExternalIntegration.FEEDBOOKS)
-        for k, v in (
-                (FeedbooksOPDSImporter.LANGUAGE_KEY, "somelanguage"),
-                (FeedbooksOPDSImporter.REALLY_IMPORT_KEY, "true")
-        ):
-            collection.external_integration.set_setting(k, v)
+        collection.external_account_id = "somelanguage"
+        collection.external_integration.set_setting(
+            FeedbooksOPDSImporter.REALLY_IMPORT_KEY, "true"
+        )
 
         monitor = FeedbooksImportMonitor(
             self._db, collection, import_class=FeedbooksOPDSImporter,

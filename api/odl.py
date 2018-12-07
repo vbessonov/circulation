@@ -102,32 +102,39 @@ class ODLWithConsolidatedCopiesAPI(BaseCirculationAPI, BaseSharedCollectionAPI):
         {
             "key": Collection.EXTERNAL_ACCOUNT_ID_KEY,
             "label": _("Metadata URL (ODL feed)"),
+            "required": True,
+            "format": "url",
         },
         {
             "key": CONSOLIDATED_COPIES_URL_KEY,
             "label": _("Consolidated Copies URL"),
+            "required": True,
         },
         {
             "key": CONSOLIDATED_LOAN_URL_KEY,
             "label": _("Consolidated Loan URL"),
+            "required": True,
         },
         {
             "key": ExternalIntegration.USERNAME,
             "label": _("Library's API username"),
+            "required": True,
         },
         {
             "key": ExternalIntegration.PASSWORD,
             "label": _("Library's API password"),
+            "required": True,
         },
         {
             "key": Collection.DATA_SOURCE_NAME_SETTING,
             "label": _("Data source name"),
+            "required": True,
         },
         {
             "key": Collection.DEFAULT_RESERVATION_PERIOD_KEY,
             "label": _("Default Reservation Period (in Days)"),
             "description": _("The number of days a patron has to check out a book after a hold becomes available."),
-            "type": "number",
+            "format": "number",
             "default": Collection.STANDARD_DEFAULT_RESERVATION_PERIOD,
         },
     ] + BaseSharedCollectionAPI.SETTINGS
@@ -713,7 +720,7 @@ class ODLWithConsolidatedCopiesAPI(BaseCirculationAPI, BaseSharedCollectionAPI):
         # but we don't need it - we compute that based on the circulation
         # manager's internal state instead.
         available = copy_info.get("available")
-            
+
         identifier_data = IdentifierData(Identifier.URI, identifier)
         circulation_data = CirculationData(
             data_source=self.data_source_name,
@@ -974,14 +981,17 @@ class SharedODLAPI(BaseCirculationAPI):
             "key": Collection.EXTERNAL_ACCOUNT_ID_KEY,
             "label": _("Base URL"),
             "description": _("The base URL for the collection on the other circulation manager."),
+            "required": True,
         },
         {
             "key": Collection.DATA_SOURCE_NAME_SETTING,
             "label": _("Data source name"),
+            "required": True,
         },
     ]
 
     SUPPORTS_REGISTRATION = True
+    SUPPORTS_STAGING = False
 
     TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -1262,7 +1272,7 @@ class SharedODLAPI(BaseCirculationAPI):
         ).filter(
             Hold.patron==patron
         )
-        
+
         activity = []
         for loan in loans:
             info_url = loan.external_identifier

@@ -14,6 +14,7 @@ from core.lane import (
     WorkList,
 )
 from core.metadata_layer import Metadata
+from core.lane import FacetsWithEntryPoint
 from core.model import (
     create,
     Contribution,
@@ -34,13 +35,15 @@ from api.lanes import (
     create_default_lanes,
     create_lanes_for_large_collection,
     create_lane_for_small_collection,
-    create_lane_for_tiny_collections,
+    create_lane_for_tiny_collection,
+    create_world_languages_lane,
     _lane_configuration_from_collection_sizes,
     load_lanes,
     ContributorLane,
     CrawlableCollectionBasedLane,
     CrawlableFacets,
     CrawlableCustomListBasedLane,
+    FeaturedSeriesFacets,
     RecommendationLane,
     RelatedBooksLane,
     SeriesLane,
@@ -59,7 +62,7 @@ class TestLaneCreation(DatabaseTest):
         # We have five top-level lanes.
         eq_(5, len(lanes))
         eq_(
-            ['Fiction', 'Nonfiction', 'Young Adult Fiction', 
+            ['Fiction', 'Nonfiction', 'Young Adult Fiction',
              'Young Adult Nonfiction', 'Children and Middle Grade'],
             [x.display_name for x in lanes]
         )
@@ -68,15 +71,16 @@ class TestLaneCreation(DatabaseTest):
             # They all are restricted to English and Spanish.
             eq_(x.languages, languages)
 
-            # They only contain books.
-            eq_([Edition.BOOK_MEDIUM], x.media)
+            # They have no restrictions on media type -- that's handled
+            # with entry points.
+            eq_(None, x.media)
 
         eq_(
             ['Fiction', 'Nonfiction', 'Young Adult Fiction',
              'Young Adult Nonfiction', 'Children and Middle Grade'],
             [x.display_name for x in lanes]
         )
-        
+
 
         # The Adult Fiction and Adult Nonfiction lanes reproduce the
         # genre structure found in the genre definitions.
@@ -87,11 +91,11 @@ class TestLaneCreation(DatabaseTest):
         eq_("Science Fiction", sf.display_name)
         assert 'Science Fiction' in [genre.name for genre in sf.genres]
 
-        [nonfiction_humor] = [x for x in nonfiction.sublanes 
+        [nonfiction_humor] = [x for x in nonfiction.sublanes
                               if 'Humor' in x.display_name]
         eq_(False, nonfiction_humor.fiction)
-        
-        [fiction_humor] = [x for x in fiction.sublanes 
+
+        [fiction_humor] = [x for x in fiction.sublanes
                            if 'Humor' in x.display_name]
         eq_(True, fiction_humor.fiction)
 
@@ -121,7 +125,7 @@ class TestLaneCreation(DatabaseTest):
 
         # Now we have six top-level lanes, with best sellers at the beginning.
         eq_(
-            [u'Best Sellers', 'Fiction', 'Nonfiction', 'Young Adult Fiction', 
+            [u'Best Sellers', 'Fiction', 'Nonfiction', 'Young Adult Fiction',
              'Young Adult Nonfiction', 'Children and Middle Grade'],
             [x.display_name for x in lanes]
         )
@@ -135,11 +139,55 @@ class TestLaneCreation(DatabaseTest):
         nyt_data_source = DataSource.lookup(self._db, DataSource.NYT)
         eq_(nyt_data_source, lanes[0].list_datasource)
 
+    def test_create_world_languages_lane(self):
+        # If there are no small or tiny collections, calling
+        # create_world_languages_lane does not create any lanes or change
+        # the priority.
+        new_priority = create_world_languages_lane(
+            self._db, self._default_library, [], [], priority=10
+        )
+        eq_(10, new_priority)
+        eq_([], self._db.query(Lane).all())
+
+        # If there are lanes to be created, create_world_languages_lane
+        # creates them.
+        new_priority = create_world_languages_lane(
+            self._db, self._default_library,
+            ["eng"], [["spa", "fre"]], priority=10
+        )
+
+        # priority has been incremented to make room for the newly
+        # created lane.
+        eq_(11, new_priority)
+
+        # One new top-level lane has been created. It contains books
+        # from all three languages mentioned in its children.
+        top_level = self._db.query(Lane).filter(Lane.parent==None).one()
+        eq_("World Languages", top_level.display_name)
+        eq_(set(['spa', 'fre', 'eng']), top_level.languages)
+
+        # It has two children -- one for the small English collection and
+        # one for the tiny Spanish/French collection.,
+        small, tiny = top_level.visible_children
+        eq_(u'English', small.display_name)
+        eq_([u'eng'], small.languages)
+
+        eq_(u'espa\xf1ol/fran\xe7ais', tiny.display_name)
+        eq_([u'spa', u'fre'], tiny.languages)
+
+        # The tiny collection has no sublanes, but the small one has
+        # three.  These lanes are tested in more detail in
+        # test_create_lane_for_small_collection.
+        fiction, nonfiction, children = small.sublanes
+        eq_([], tiny.sublanes)
+        eq_("Fiction", fiction.display_name)
+        eq_("Nonfiction", nonfiction.display_name)
+        eq_("Children & Young Adult", children.display_name)
 
     def test_create_lane_for_small_collection(self):
         languages = ['eng', 'spa', 'chi']
         create_lane_for_small_collection(
-            self._db, self._default_library, languages
+            self._db, self._default_library, None, languages
         )
         [lane] = self._db.query(Lane).filter(Lane.parent_id==None).all()
 
@@ -154,8 +202,8 @@ class TestLaneCreation(DatabaseTest):
             eq_([Edition.BOOK_MEDIUM], x.media)
 
         eq_(
-            [set(['Adults Only', 'Adult']), 
-             set(['Adults Only', 'Adult']), 
+            [set(['Adults Only', 'Adult']),
+             set(['Adults Only', 'Adult']),
              set(['Young Adult', 'Children'])],
             [set(x.audiences) for x in sublanes]
         )
@@ -163,27 +211,19 @@ class TestLaneCreation(DatabaseTest):
             [x.fiction for x in sublanes]
         )
 
-    def test_lane_for_other_languages(self):
-        # If no tiny languages are configured, the other languages lane
-        # doesn't show up.
-        create_lane_for_tiny_collections(self._db, self._default_library, [])
-        eq_(0, self._db.query(Lane).filter(Lane.parent_id==None).count())
-
-
-        create_lane_for_tiny_collections(self._db, self._default_library, ['ger', 'fre', 'ita'])
-        [lane] = self._db.query(Lane).filter(Lane.parent_id==None).all()
+    def test_lane_for_tiny_collection(self):
+        parent = self._lane()
+        new_priority = create_lane_for_tiny_collection(
+            self._db, self._default_library, parent, 'ger',
+            priority=3
+        )
+        eq_(4, new_priority)
+        lane = self._db.query(Lane).filter(Lane.parent==parent).one()
         eq_([Edition.BOOK_MEDIUM], lane.media)
-        eq_(['ger', 'fre', 'ita'], lane.languages)
-        eq_("Other Languages", lane.display_name)
-        eq_(
-            ['Deutsch', u'français', 'Italiano'],
-            [x.display_name for x in lane.visible_children]
-        )
-        eq_([['ger'], ['fre'], ['ita']],
-            [x.languages for x in lane.visible_children]
-        )
-        for child in lane.visible_children:
-            eq_([Edition.BOOK_MEDIUM], child.media)
+        eq_(parent, lane.parent)
+        eq_(['ger'], lane.languages)
+        eq_(u'Deutsch', lane.display_name)
+        eq_([], lane.children)
 
     def test_create_default_lanes(self):
         library = self._default_library
@@ -212,16 +252,14 @@ class TestLaneCreation(DatabaseTest):
         # a top-level lane for each small collection, and a lane
         # for everything left over.
         eq_(set(['Fiction', "Nonfiction", "Young Adult Fiction", "Young Adult Nonfiction",
-                 "Children and Middle Grade", u'español', 'Chinese', 'Other Languages']),
+                 "Children and Middle Grade", u'World Languages']),
             set([x.display_name for x in lanes])
         )
 
         [english_fiction_lane] = [x for x in lanes if x.display_name == 'Fiction']
         eq_(0, english_fiction_lane.priority)
-        [chinese_lane] = [x for x in lanes if x.display_name == 'Chinese']
-        eq_(6, chinese_lane.priority)
-        [other_lane] = [x for x in lanes if x.display_name == 'Other Languages']
-        eq_(7, other_lane.priority)
+        [world] = [x for x in lanes if x.display_name == 'World Languages']
+        eq_(5, world.priority)
 
     def test_lane_configuration_from_collection_sizes(self):
 
@@ -403,10 +441,10 @@ class LaneTest(DatabaseTest):
         materialized_expected = []
         if expected:
             materialized_expected = [work.id for work in expected]
-        
+
         query = lane.works(self._db)
         materialized_results = [work.works_id for work in query.all()]
-        
+
         eq_(sorted(materialized_expected), sorted(materialized_results))
 
     def sample_works_for_each_audience(self):
@@ -600,6 +638,29 @@ class TestSeriesLane(LaneTest):
         )
         self.assert_works_queries(adult_lane, [adults_only])
 
+    def test_facets_entry_point_propagated(self):
+        """The facets passed in to SeriesLane.featured_works are converted
+        to a FeaturedSeriesFacets object with the same entry point.
+        """
+        lane = SeriesLane(self._default_library, "A series")
+        def mock_works(_db, facets, pagination):
+            self.called_with = facets
+            # It doesn't matter what the query we return matches; just
+            # return some kind of query.
+            return _db.query(MaterializedWorkWithGenre)
+        lane.works = mock_works
+        entrypoint = object()
+        facets = FacetsWithEntryPoint(entrypoint=entrypoint)
+        lane.featured_works(self._db, facets=facets)
+
+        new_facets = self.called_with
+        assert isinstance(new_facets, FeaturedSeriesFacets)
+        eq_(entrypoint, new_facets.entrypoint)
+
+        # Availability facets have been hard-coded rather than propagated.
+        eq_(FeaturedSeriesFacets.COLLECTION_FULL, new_facets.collection)
+        eq_(FeaturedSeriesFacets.AVAILABLE_ALL, new_facets.availability)
+
 
 class TestContributorLane(LaneTest):
 
@@ -723,7 +784,7 @@ class TestCrawlableFacets(DatabaseTest):
         eq_([w1.id, w2.id], [mw.works_id for mw in qu])
 
     def test_order_by(self):
-        """Crawlable feeds are always ordered by time updated and then by 
+        """Crawlable feeds are always ordered by time updated and then by
         collection ID and work ID.
         """
         from core.model import MaterializedWorkWithGenre as mw
@@ -784,7 +845,7 @@ class TestCrawlableCustomListBasedLane(DatabaseTest):
         route, kwargs = lane.url_arguments
         eq_(CrawlableCustomListBasedLane.ROUTE, route)
         eq_(list.name, kwargs.get("list_name"))
-        
+
 
 class TestCrawlableCollectionBasedLane(DatabaseTest):
 

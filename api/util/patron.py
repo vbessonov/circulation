@@ -5,7 +5,7 @@ from api.circulation_exceptions import *
 
 class PatronUtility(object):
     """Apply circulation-specific logic to Patron model objects."""
-    
+
     @classmethod
     def needs_external_sync(cls, patron):
         """Could this patron stand to have their metadata synced with the
@@ -19,7 +19,7 @@ class PatronUtility(object):
         if not patron.last_external_sync:
             # This patron has never been synced.
             return True
-        
+
         now = datetime.datetime.utcnow()
         if cls.has_borrowing_privileges(patron):
             # A patron who has borrowing privileges gets synced every twelve
@@ -53,7 +53,7 @@ class PatronUtility(object):
         """Raise an exception unless the patron currently has borrowing
         privileges.
 
-        :raise AuthorizationExpired: If the patron's authorization has 
+        :raise AuthorizationExpired: If the patron's authorization has
         expired.
 
         :raise OutstandingFines: If the patron has too many outstanding
@@ -66,7 +66,7 @@ class PatronUtility(object):
 
         if patron.fines:
             max_fines = Configuration.max_outstanding_fines(patron.library)
-            if patron.fines >= max_fines.amount:
+            if max_fines is not None and patron.fines > max_fines.amount:
                 raise OutstandingFines()
 
         from api.authenticator import PatronData
@@ -77,7 +77,7 @@ class PatronUtility(object):
                 # manager is not configured to make that deduction.
                 raise OutstandingFines()
             raise AuthorizationBlocked()
-    
+
     @classmethod
     def authorization_is_active(cls, patron):
         """Return True unless the patron's authorization has expired."""

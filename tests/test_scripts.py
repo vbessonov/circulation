@@ -21,9 +21,22 @@ from api.config import (
     Configuration,
 )
 
+from api.novelist import (
+    NoveListAPI
+)
+
+from core.entrypoint import (
+    AudiobooksEntryPoint,
+    EbooksEntryPoint,
+    EntryPoint,
+)
+
 from core.lane import (
     Lane,
     Facets,
+    FeaturedFacets,
+    Pagination,
+    WorkList,
 )
 
 from core.metadata_layer import (
@@ -50,9 +63,14 @@ from core.model import (
     Timestamp,
 )
 
+from core.opds import AcquisitionFeed
+
 from core.s3 import MockS3Uploader
 
 from core.mirror import MirrorUploader
+
+from core.marc import MARCExporter
+from api.marc import LibraryAnnotator as  MARCLibraryAnnotator
 
 from . import (
     DatabaseTest,
@@ -63,17 +81,18 @@ from scripts import (
     CacheRepresentationPerLane,
     CacheFacetListsPerLane,
     CacheOPDSGroupFeedPerLane,
+    CacheMARCFiles,
     DirectoryImportScript,
     InstanceInitializationScript,
     LanguageListScript,
-    LoanReaperScript,
+    NovelistSnapshotScript,
 )
 
 class TestAdobeAccountIDResetScript(DatabaseTest):
 
     def test_process_patron(self):
         patron = self._patron()
-    
+
         # This patron has old-style and new-style Credentials that link
         # them to Adobe account IDs (hopefully the same ID, though that
         # doesn't matter here.
@@ -111,11 +130,11 @@ class TestAdobeAccountIDResetScript(DatabaseTest):
         script.delete = True
         script.process_patron(patron)
         self._db.commit()
-                
+
         # The two Adobe-related credentials are gone. The other one remains.
         [credential] = patron.credentials
         eq_("Some other type", credential.type)
-    
+
 
 class TestLaneScript(DatabaseTest):
 
@@ -133,12 +152,15 @@ class TestLaneScript(DatabaseTest):
                 k, self._default_library).value = json.dumps(v)
 
 
-class TestRepresentationPerLane(TestLaneScript):
-   
-    def test_language_filter(self):
+class TestCacheRepresentationPerLane(TestLaneScript):
+
+    def test_should_process_lane(self):
+
+        # Test that should_process_lane respects any specified
+        # language restrictions.
         script = CacheRepresentationPerLane(
             self._db, ["--language=fre", "--language=English", "--language=none", "--min-depth=0"],
-            testing=True
+            manager=object()
         )
         eq_(['fre', 'eng'], script.languages)
 
@@ -150,11 +172,12 @@ class TestRepresentationPerLane(TestLaneScript):
 
         no_english_or_french_lane = self._lane(languages=['spa'])
         eq_(False, script.should_process_lane(no_english_or_french_lane))
-            
-    def test_max_and_min_depth(self):
+
+        # Test that should_process_lane respects maximum depth
+        # restrictions.
         script = CacheRepresentationPerLane(
             self._db, ["--max-depth=0", "--min-depth=0"],
-            testing=True
+            manager=object()
         )
         eq_(0, script.max_depth)
 
@@ -171,52 +194,326 @@ class TestRepresentationPerLane(TestLaneScript):
         eq_(False, script.should_process_lane(parent))
         eq_(True, script.should_process_lane(child))
 
-            
+    def test_process_lane(self):
+        # process_lane() calls do_generate() once for every
+        # combination of items yielded by facets() and pagination().
+
+        class MockFacets(object):
+
+            def __init__(self, query):
+                self.query = query
+
+            @property
+            def query_string(self):
+                return self.query
+
+        facets1 = MockFacets("facets1")
+        facets2 = MockFacets("facets2")
+        page1 = Pagination.default()
+        page2 = page1.next_page
+
+        class Mock(CacheRepresentationPerLane):
+            generated = []
+            def do_generate(self, lane, facets, pagination):
+                value = (lane, facets, pagination)
+                self.generated.append(value)
+                return value
+
+            def facets(self, lane):
+                yield facets1
+                yield facets2
+
+            def pagination(self, lane):
+                yield page1
+                yield page2
+
+        lane = self._lane()
+        script = Mock(self._db, manager=object(), cmd_args=[])
+        generated = script.process_lane(lane)
+        eq_(generated, script.generated)
+
+        c1, c2, c3, c4 = script.generated
+        eq_((lane, facets1, page1), c1)
+        eq_((lane, facets1, page2), c2)
+        eq_((lane, facets2, page1), c3)
+        eq_((lane, facets2, page2), c4)
+
+    def test_default_facets(self):
+        # By default, do_generate will only be called once, with facets=None.
+        script = CacheRepresentationPerLane(
+            self._db, manager=object(), cmd_args=[]
+        )
+        eq_([None], list(script.facets(object())))
+
+    def test_default_pagination(self):
+        # By default, do_generate will only be called once, with pagination=None.
+        script = CacheRepresentationPerLane(
+            self._db, manager=object(), cmd_args=[]
+        )
+        eq_([None], list(script.pagination(object())))
+
+
 class TestCacheFacetListsPerLane(TestLaneScript):
 
     def test_arguments(self):
+        # Verify that command-line arguments become attributes of
+        # the CacheFacetListsPerLane object.
         script = CacheFacetListsPerLane(
             self._db, ["--order=title", "--order=added"],
-            testing=True
+            manager=object()
         )
         eq_(['title', 'added'], script.orders)
         script = CacheFacetListsPerLane(
             self._db, ["--availability=all", "--availability=always"],
-            testing=True
+            manager=object()
         )
         eq_(['all', 'always'], script.availabilities)
 
         script = CacheFacetListsPerLane(
             self._db, ["--collection=main", "--collection=full"],
-            testing=True
+            manager=object()
         )
         eq_(['main', 'full'], script.collections)
 
         script = CacheFacetListsPerLane(
-            self._db, ['--pages=1'], testing=True
+            self._db, ["--entrypoint=Audio", "--entrypoint=Book"],
+            manager=object()
+        )
+        eq_(['Audio', 'Book'], script.entrypoints)
+
+        script = CacheFacetListsPerLane(
+            self._db, ['--pages=1'], manager=object()
         )
         eq_(1, script.pages)
 
-    def test_process_lane(self):
-        script = CacheFacetListsPerLane(
-            self._db, ["--availability=all", "--availability=always",
-                       "--collection=main", "--collection=full",
-                       "--order=title", "--pages=1"],
-            testing=True
-        )
+    def test_facets(self):
+        # Verify that CacheFacetListsPerLane.facets combines the items
+        # found in the attributes created by command-line parsing.
+        script = CacheFacetListsPerLane(self._db, manager=object(), cmd_args=[])
+        script.orders = [Facets.ORDER_TITLE, Facets.ORDER_AUTHOR, "nonsense"]
+        script.entrypoints = [
+            AudiobooksEntryPoint.INTERNAL_NAME, "nonsense",
+            EbooksEntryPoint.INTERNAL_NAME
+        ]
+        script.availabilities = [Facets.AVAILABLE_NOW, "nonsense"]
+        script.collections = [Facets.COLLECTION_FULL, "nonsense"]
+
+        # EbooksEntryPoint is normally a valid entry point, but we're
+        # going to disable it for this library.
+        setting = self._default_library.setting(EntryPoint.ENABLED_SETTING)
+        setting.value = json.dumps([AudiobooksEntryPoint.INTERNAL_NAME])
+
+        lane = self._lane()
+
+        # We get one Facets object for every valid combination
+        # of parameters. Here there are 2*1*1*1 combinations.
+        f1, f2 = script.facets(lane)
+
+        # The facets differ only in their .order.
+        eq_(Facets.ORDER_TITLE, f1.order)
+        eq_(Facets.ORDER_AUTHOR, f2.order)
+
+        # All other fields are tied to the only acceptable values
+        # given in the script attributes. The first (and only)
+        # enabled entry point is treated as the default.
+        for f in f1, f2:
+            eq_(AudiobooksEntryPoint, f.entrypoint)
+            eq_(True, f.entrypoint_is_default)
+            eq_(Facets.AVAILABLE_NOW, f.availability)
+            eq_(Facets.COLLECTION_FULL, f.collection)
+
+        # The first entry point is treated as the default only for WorkLists
+        # that have no parent. When the WorkList has a parent, the selected
+        # entry point is treated as an explicit choice -- navigating downward
+        # in the lane hierarchy ratifies the default value.
+        sublane = self._lane(parent=lane)
+        f1, f2 = script.facets(sublane)
+        for f in f1, f2:
+            eq_(False, f.entrypoint_is_default)
+
+    def test_pagination(self):
+        script = CacheFacetListsPerLane(self._db, manager=object(), cmd_args=[])
+        script.pages = 3
+        lane = self._lane()
+        p1, p2, p3 = script.pagination(lane)
+        pagination = Pagination.default()
+        eq_(pagination.query_string, p1.query_string)
+        eq_(pagination.next_page.query_string, p2.query_string)
+        eq_(pagination.next_page.next_page.query_string, p3.query_string)
+
+    def test_do_generate(self):
+        # When it's time to generate a feed, AcquisitionFeed.page
+        # is called with the right arguments.
+        class MockAcquisitionFeed(object):
+            called_with = None
+            @classmethod
+            def page(cls, **kwargs):
+                cls.called_with = kwargs
+                return "here's your feed"
+
+        # Test our ability to generate a single feed.
+        script = CacheFacetListsPerLane(self._db, testing=True, cmd_args=[])
+        facets = Facets.default(self._default_library)
+        pagination = Pagination.default()
+
         with script.app.test_request_context("/"):
-            flask.request.library = self._default_library
             lane = self._lane()
-            cached_feeds = script.process_lane(lane)
-            # 2 availabilities * 2 collections * 1 order * 1 page = 4 feeds
-            eq_(4, len(cached_feeds))
+            result = script.do_generate(
+                lane, facets, pagination, feed_class=MockAcquisitionFeed
+            )
+            eq_("here's your feed", result)
+
+            args = MockAcquisitionFeed.called_with
+            eq_(self._db, args['_db'])
+            eq_(lane, args['lane'])
+            eq_(lane.display_name, args['title'])
+            eq_(True, args['force_refresh'])
+
+            # The Pagination object was passed into
+            # MockAcquisitionFeed.page, and it was also used to make the
+            # feed URL (see below).
+            eq_(pagination, args['pagination'])
+
+            # The Facets object was passed into
+            # MockAcquisitionFeed.page, and it was also used to make
+            # the feed URL and to create the feed annotator.
+            eq_(facets, args['facets'])
+            annotator = args['annotator']
+            eq_(facets, annotator.facets)
+            eq_(
+                args['url'],
+                annotator.feed_url(lane, facets=facets, pagination=pagination)
+            )
+
+            # Try again without mocking AcquisitionFeed to verify that
+            # we get something that looks like an OPDS feed.
+            result = script.do_generate(lane, facets, pagination)
+            assert result.startswith('<feed')
 
 
 class TestCacheOPDSGroupFeedPerLane(TestLaneScript):
-    
+
+    def test_should_process_lane(self):
+        parent = self._lane()
+        child = self._lane(parent=parent)
+        grandchild = self._lane(parent=child)
+
+        # Only WorkLists which have children are processed.
+        script = CacheOPDSGroupFeedPerLane(
+            self._db, manager=object(), cmd_args=[]
+        )
+        script.max_depth = 10
+        eq_(True, script.should_process_lane(parent))
+        eq_(True, script.should_process_lane(child))
+        eq_(False, script.should_process_lane(grandchild))
+
+        # If a WorkList is deeper in the hierarchy than max_depth,
+        # it's not processed, even if it has children.
+        script.max_depth = 0
+        eq_(True, script.should_process_lane(parent))
+        eq_(False, script.should_process_lane(child))
+
+    def test_do_generate(self):
+        # When it's time to generate a feed, AcquisitionFeed.groups
+        # is called with the right arguments.
+
+        class MockAcquisitionFeed(object):
+            called_with = None
+            @classmethod
+            def groups(cls, **kwargs):
+                cls.called_with = kwargs
+                return "here's your feed"
+
+        # Test our ability to generate a single feed.
+        script = CacheOPDSGroupFeedPerLane(self._db, testing=True, cmd_args=[])
+        facets = FeaturedFacets(0.1, entrypoint=AudiobooksEntryPoint)
+        pagination = None
+
+        with script.app.test_request_context("/"):
+            lane = self._lane()
+            result = script.do_generate(
+                lane, facets, pagination, feed_class=MockAcquisitionFeed
+            )
+            eq_("here's your feed", result)
+
+            args = MockAcquisitionFeed.called_with
+            eq_(self._db, args['_db'])
+            eq_(lane, args['lane'])
+            eq_(lane.display_name, args['title'])
+            eq_(True, args['force_refresh'])
+            eq_(pagination, None)
+
+            # The Facets object was passed into
+            # MockAcquisitionFeed.page, and it was also used to make
+            # the feed URL and to create the feed annotator.
+            eq_(facets, args['facets'])
+            annotator = args['annotator']
+            eq_(facets, annotator.facets)
+            eq_(args['url'], annotator.groups_url(lane, facets))
+
+            # Try again without mocking AcquisitionFeed to verify that
+            # we get something that looks like an OPDS feed.
+            result = script.do_generate(lane, facets, pagination)
+            assert result.startswith('<feed')
+
+    def test_facets(self):
+        # Normally we yield one FeaturedFacets object for each of the
+        # library's enabled entry points.
+        library = self._default_library
+        script = CacheOPDSGroupFeedPerLane(
+            self._db, manager=object(), cmd_args=[]
+        )
+        setting = library.setting(EntryPoint.ENABLED_SETTING)
+        setting.value = json.dumps(
+            [AudiobooksEntryPoint.INTERNAL_NAME,
+             EbooksEntryPoint.INTERNAL_NAME]
+        )
+
+        lane = self._lane()
+        audio_facets, ebook_facets = script.facets(lane)
+        eq_(AudiobooksEntryPoint, audio_facets.entrypoint)
+        eq_(EbooksEntryPoint, ebook_facets.entrypoint)
+
+        # The first entry point in the library's list of enabled entry
+        # points is treated as the default.
+        eq_(True, audio_facets.entrypoint_is_default)
+        eq_(audio_facets.entrypoint, list(library.entrypoints)[0])
+        eq_(False, ebook_facets.entrypoint_is_default)
+
+        for facets in (audio_facets, ebook_facets):
+            # The FeaturedFacets objects knows to feature works at the
+            # library's minimum quality level.
+            eq_(library.minimum_featured_quality,
+                facets.minimum_featured_quality)
+            # The FeaturedFacets object knows that custom lists are
+            # not in play.
+            eq_(False, facets.uses_customlists)
+
+        # The first entry point is treated as the default only for WorkLists
+        # that have no parent. When the WorkList has a parent, the selected
+        # entry point is treated as an explicit choice  -- navigating downward
+        # in the lane hierarchy ratifies the default value.
+        sublane = self._lane(parent=lane)
+        f1, f2 = script.facets(sublane)
+        for f in f1, f2:
+            eq_(False, f.entrypoint_is_default)
+
+        # Make it look like the lane uses custom lists.
+        lane.list_datasource = DataSource.lookup(self._db, DataSource.OVERDRIVE)
+
+        # If the library has no enabled entry points, we yield one
+        # FeaturedFacets object with no particular entry point.
+        setting.value = json.dumps([])
+        no_entry_point, = script.facets(lane)
+        eq_(None, no_entry_point.entrypoint)
+
+        # The FeaturedFacets object knows that custom lists are in
+        # play.
+        eq_(True, no_entry_point.uses_customlists)
+
     def test_do_run(self):
 
-        work = self._work(fiction=True, with_license_pool=True, 
+        work = self._work(fiction=True, with_license_pool=True,
                           genre="Science Fiction")
         work.quality = 1
         lane = self._lane(display_name="Fantastic Fiction", fiction=True)
@@ -236,6 +533,57 @@ class TestCacheOPDSGroupFeedPerLane(TestLaneScript):
         assert "Fantastic Fiction" in feed.content
         assert "Science Fiction" in feed.content
         assert work.title in feed.content
+
+class TestCacheMARCFiles(TestLaneScript):
+
+    def test_should_process_library(self):
+        script = CacheMARCFiles(self._db, cmd_args=[])
+        eq_(False, script.should_process_library(self._default_library))
+        integration = self._external_integration(
+            ExternalIntegration.MARC_EXPORT, ExternalIntegration.CATALOG_GOAL,
+            libraries=[self._default_library])
+        eq_(True, script.should_process_library(self._default_library))
+
+    def test_should_process_lane(self):
+        parent = self._lane()
+        parent.size = 100
+        child = self._lane(parent=parent)
+        child.size = 10
+        grandchild = self._lane(parent=child)
+        grandchild.size = 1
+        wl = WorkList()
+        empty = self._lane(fiction=False)
+        empty.size = 0
+
+        script = CacheMARCFiles(self._db, cmd_args=[])
+        script.max_depth = 1
+        eq_(True, script.should_process_lane(parent))
+        eq_(True, script.should_process_lane(child))
+        eq_(False, script.should_process_lane(grandchild))
+        eq_(True, script.should_process_lane(wl))
+        eq_(False, script.should_process_lane(empty))
+
+        script.max_depth = 0
+        eq_(True, script.should_process_lane(parent))
+        eq_(False, script.should_process_lane(child))
+        eq_(False, script.should_process_lane(grandchild))
+        eq_(True, script.should_process_lane(wl))
+        eq_(False, script.should_process_lane(empty))
+
+    def test_process_lane(self):
+        lane = self._lane(genres=["Science Fiction"])
+        
+        class MockMARCExporter(MARCExporter):
+            called_with = None
+
+            def records(self, lane, annotator):
+                self.called_with = [lane, annotator]
+
+        exporter = MockMARCExporter(None, None, None)
+        script = CacheMARCFiles(self._db, cmd_args=[])
+        script.process_lane(lane, exporter)
+        eq_(lane, exporter.called_with[0])
+        assert isinstance(exporter.called_with[1], MARCLibraryAnnotator)
 
 class TestInstanceInitializationScript(DatabaseTest):
 
@@ -262,105 +610,6 @@ class TestInstanceInitializationScript(DatabaseTest):
             secret_keys.one().value,
             ConfigurationSetting.sitewide_secret(self._db, Configuration.SECRET_KEY)
         )
-
-
-class TestLoanReaperScript(DatabaseTest):
-
-    def test_reaping(self):
-
-        # This patron stopped using the circulation manager a long time
-        # ago.
-        inactive_patron = self._patron()
-
-        # This patron is still using the circulation manager.
-        current_patron = self._patron()
-        
-        # We're going to give these patrons some loans and holds.
-        edition, open_access = self._edition(
-            with_license_pool=True, with_open_access_download=True)
-
-        not_open_access_1 = self._licensepool(edition,
-            open_access=False, data_source_name=DataSource.OVERDRIVE)
-        not_open_access_2 = self._licensepool(edition,
-            open_access=False, data_source_name=DataSource.BIBLIOTHECA)
-        not_open_access_3 = self._licensepool(edition,
-            open_access=False, data_source_name=DataSource.AXIS_360)
-        not_open_access_4 = self._licensepool(edition,
-            open_access=False, data_source_name=DataSource.ONECLICK)
-
-        now = datetime.datetime.utcnow()
-        a_long_time_ago = now - datetime.timedelta(days=1000)
-        not_very_long_ago = now - datetime.timedelta(days=60)
-        even_longer = now - datetime.timedelta(days=2000)
-        the_future = now + datetime.timedelta(days=1)
-        
-        # This loan has expired.
-        not_open_access_1.loan_to(
-            inactive_patron, start=even_longer, end=a_long_time_ago
-        )
-        
-        # This hold expired without ever becoming a loan (that we saw).
-        not_open_access_2.on_hold_to(
-            inactive_patron,
-            start=even_longer,
-            end=a_long_time_ago
-        )
-        
-        # This hold has no end date and is older than a year.
-        not_open_access_3.on_hold_to(
-            inactive_patron, start=a_long_time_ago, end=None,
-        )
-        
-        # This loan has no end date and is older than 90 days.
-        not_open_access_4.loan_to(
-            inactive_patron, start=a_long_time_ago, end=None,
-        )
-        
-        # This loan has no end date, but it's for an open-access work.
-        open_access_loan, ignore = open_access.loan_to(
-            inactive_patron, start=a_long_time_ago, end=None,
-        )
-
-        # This loan has not expired yet.
-        not_open_access_1.loan_to(
-            current_patron, start=now, end=the_future
-        )
-        
-        # This hold has not expired yet.
-        not_open_access_2.on_hold_to(
-            current_patron, start=now, end=the_future
-        )
-
-        # This loan has no end date but is pretty recent.
-        not_open_access_3.loan_to(
-            current_patron, start=not_very_long_ago, end=None
-        )
-
-        # This hold has no end date but is pretty recent.
-        not_open_access_4.on_hold_to(
-            current_patron, start=not_very_long_ago, end=None
-        )
-        
-        eq_(3, len(inactive_patron.loans))
-        eq_(2, len(inactive_patron.holds))
-
-        eq_(2, len(current_patron.loans))
-        eq_(2, len(current_patron.holds))
-
-        # Now we fire up the loan reaper.
-        script = LoanReaperScript(self._db)
-        script.do_run()
-
-        # All of the inactive patron's loans and holds have been reaped,
-        # except for the open-access loan, which will never be reaped.
-        eq_([open_access_loan], inactive_patron.loans)
-        eq_([], inactive_patron.holds)
-
-        # The active patron's loans and holds are unaffected, either
-        # because they have not expired or because they have no known
-        # expiration date and were created relatively recently.
-        eq_(2, len(current_patron.loans))
-        eq_(2, len(current_patron.holds))
 
 
 class TestLanguageListScript(DatabaseTest):
@@ -401,7 +650,7 @@ class TestShortClientTokenLibraryConfigurationScript(DatabaseTest):
 
         output = StringIO()
         self.script.set_secret(
-            self._db, "http://foo/", "vendorid", "libraryname", "secret", 
+            self._db, "http://foo/", "vendorid", "libraryname", "secret",
             output
         )
         eq_(
@@ -418,7 +667,7 @@ class TestShortClientTokenLibraryConfigurationScript(DatabaseTest):
         # We can modify an existing configuration.
         output = StringIO()
         self.script.set_secret(
-            self._db, "http://foo/", "newid", "newname", "newsecret", 
+            self._db, "http://foo/", "newid", "newname", "newsecret",
             output
         )
         expect = u'Current Short Client Token configuration for http://foo/:\n Vendor ID: newid\n Library name: newname\n Shared secret: newsecret\n'
@@ -467,20 +716,21 @@ class TestDirectoryImportScript(DatabaseTest):
         class Mock(DirectoryImportScript):
             def run_with_arguments(self, *args):
                 self.ran_with = args
-                
+
         script = Mock(self._db)
         script.do_run(
             cmd_args=[
                 "--collection-name=coll1",
                 "--data-source-name=ds1",
                 "--metadata-file=metadata",
+                "--metadata-format=marc",
                 "--cover-directory=covers",
                 "--ebook-directory=ebooks",
                 "--rights-uri=rights",
                 "--dry-run"
             ]
         )
-        eq_(('coll1', 'ds1', 'metadata', 'covers', 'ebooks', 'rights', True),
+        eq_(('coll1', 'ds1', 'metadata', 'marc', 'covers', 'ebooks', 'rights', True),
             script.ran_with)
 
     def test_run_with_arguments(self):
@@ -516,16 +766,16 @@ class TestDirectoryImportScript(DatabaseTest):
         self._default_collection.name = 'changed'
 
         script = Mock(self._db)
-        basic_args = ["collection name", "data source name", "metadata file",
+        basic_args = ["collection name", "data source name", "metadata file", "marc",
                       "cover directory", "ebook directory", "rights URI"]
         script.run_with_arguments(*(basic_args + [True]))
 
         # load_collection was called with the collection and data source names.
-        eq_([('collection name', 'data source name')], 
+        eq_([('collection name', 'data source name')],
             script.load_collection_calls)
 
-        # load_metadata was called with the metadata file.
-        eq_([('metadata file',)], script.load_metadata_calls)
+        # load_metadata was called with the metadata file and data source name.
+        eq_([('metadata file', 'marc', 'data source name')], script.load_metadata_calls)
 
         # work_from_metadata was called twice, once on each metadata
         # object.
@@ -580,14 +830,14 @@ class TestDirectoryImportScript(DatabaseTest):
 
         integration = collection.external_integration
         eq_(ExternalIntegration.LICENSE_GOAL, integration.goal)
-        eq_(ExternalIntegration.MANUAL, 
+        eq_(ExternalIntegration.MANUAL,
             integration.protocol)
 
         # The Collection has no mirror integration because there is no
         # sitewide storage integration to use.
         eq_(None, collection.mirror_integration)
         eq_(None, mirror)
-        
+
     def test_load_collection_installs_site_wide_mirror(self):
         # We have a sitewide storage integration.
         integration = self._external_integration("my uploader")
@@ -640,12 +890,12 @@ class TestDirectoryImportScript(DatabaseTest):
         # not actually import anything because there are no files 'on
         # disk' and thus no way to actually get the book.
         collection = self._default_collection
-        args = (collection, metadata, policy, "cover directory", 
+        args = (collection, metadata, policy, "cover directory",
                 "ebook directory", RightsStatus.CC0)
         script = Mock(self._db)
         eq_(None, script.work_from_metadata(*args))
         eq_(True, metadata.annotated)
-         
+
         # Now let's try it with some files 'on disk'.
         with open(self.sample_cover_path('test-book-cover.png')) as fh:
             image = fh.read()
@@ -666,17 +916,17 @@ class TestDirectoryImportScript(DatabaseTest):
         # thumbnail.
         eq_("A book", work.title)
         assert work.cover_full_url.endswith(
-            '/test.cover.bucket/Gutenberg/Gutenberg%20ID/1003/1003.jpg'
+            '/test.cover.bucket/Gutenberg/Gutenberg+ID/1003/1003.jpg'
         )
         assert work.cover_thumbnail_url.endswith(
-            '/test.cover.bucket/scaled/300/Gutenberg/Gutenberg%20ID/1003/1003.png'
+            '/test.cover.bucket/scaled/300/Gutenberg/Gutenberg+ID/1003/1003.png'
         )
         [pool] = work.license_pools
         assert pool.open_access_download_url.endswith(
-            '/test.content.bucket/Gutenberg/Gutenberg%20ID/1003/A%20book.epub'
+            '/test.content.bucket/Gutenberg/Gutenberg+ID/1003/A+book.epub'
         )
 
-        eq_(RightsStatus.CC0, 
+        eq_(RightsStatus.CC0,
             pool.delivery_mechanisms[0].rights_status.uri)
 
         # The mock S3Uploader has a record of 'uploading' all these files
@@ -713,7 +963,7 @@ class TestDirectoryImportScript(DatabaseTest):
         identifier_obj, ignore = identifier.load(self._db)
         metadata = Metadata(
             title=self._str,
-            data_source=gutenberg, 
+            data_source=gutenberg,
             primary_identifier=identifier
         )
         mirror = object()
@@ -728,7 +978,7 @@ class TestDirectoryImportScript(DatabaseTest):
 
         # load_circulation_data was called.
         eq_(
-            (identifier_obj, gutenberg, ebook_directory, mirror, 
+            (identifier_obj, gutenberg, ebook_directory, mirror,
              metadata.title, rights_uri),
             script.load_circulation_data_args
         )
@@ -826,7 +1076,7 @@ class TestDirectoryImportScript(DatabaseTest):
         [link] = circulation.links
         eq_(Hyperlink.OPEN_ACCESS_DOWNLOAD, link.rel)
         assert link.href.endswith(
-            '/test.content.bucket/Gutenberg/Gutenberg%20ID/2345/Name%20of%20book.epub'
+            '/test.content.bucket/Gutenberg/Gutenberg+ID/2345/Name+of+book.epub'
         )
         eq_(Representation.EPUB_MEDIA_TYPE, link.media_type)
         eq_("I'm an EPUB.", link.content)
@@ -868,7 +1118,7 @@ class TestDirectoryImportScript(DatabaseTest):
         link = script.load_cover_link(*args)
         eq_(Hyperlink.IMAGE, link.rel)
         assert link.href.endswith(
-            '/test.cover.bucket/Gutenberg/Gutenberg%20ID/2345/2345.jpg'
+            '/test.cover.bucket/Gutenberg/Gutenberg+ID/2345/2345.jpg'
         )
         eq_(Representation.JPEG_MEDIA_TYPE, link.media_type)
         eq_("I'm an image.", link.content)
@@ -926,3 +1176,29 @@ class TestDirectoryImportScript(DatabaseTest):
         assert_not_found('thefile', 'another_directory', ['.jpeg'])
         assert_not_found('thefile', 'directory', ['.another-extension'])
         assert_not_found('thefile', 'directory', [])
+
+class TestNovelistSnapshotScript(DatabaseTest):
+
+    def mockNoveListAPI(self, *args, **kwargs):
+        self.called_with = (args, kwargs)
+
+    def test_do_run(self):
+        """Test that NovelistSnapshotScript.do_run() calls the NoveList api.
+        """
+
+        class MockNovelistSnapshotScript(NovelistSnapshotScript):
+            pass
+
+        oldNovelistConfig = NoveListAPI.from_config
+        NoveListAPI.from_config = self.mockNoveListAPI
+
+        l1 = self._library()
+        cmd_args = [l1.name]
+        script = MockNovelistSnapshotScript(self._db)
+        script.do_run(cmd_args=cmd_args)
+
+        (params, args) = self.called_with
+
+        eq_(params[0], l1)
+
+        NoveListAPI.from_config = oldNovelistConfig

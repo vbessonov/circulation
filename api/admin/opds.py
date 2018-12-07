@@ -1,5 +1,6 @@
 from nose.tools import set_trace
 
+from sqlalchemy import and_
 from api.opds import LibraryAnnotator
 from core.opds import VerboseAnnotator
 from core.lane import Facets, Pagination
@@ -12,6 +13,7 @@ from core.model import (
 )
 from core.opds import AcquisitionFeed
 from core.util.opds_writer import AtomFeed
+from core.mirror import MirrorUploader
 
 class AdminAnnotator(LibraryAnnotator):
 
@@ -22,7 +24,7 @@ class AdminAnnotator(LibraryAnnotator):
     def annotate_work_entry(self, work, active_license_pool, edition, identifier, feed, entry):
 
         super(AdminAnnotator, self).annotate_work_entry(work, active_license_pool, edition, identifier, feed, entry)
-        VerboseAnnotator.annotate_work_entry(work, active_license_pool, edition, identifier, feed, entry)
+        VerboseAnnotator.add_ratings(work, entry)
 
         # Find staff rating and add a tag for it.
         for measurement in identifier.measurements:
@@ -38,7 +40,7 @@ class AdminAnnotator(LibraryAnnotator):
                 identifier=identifier.identifier, _external=True)
         )
 
-        if active_license_pool.suppressed:
+        if active_license_pool and active_license_pool.suppressed:
             feed.add_link_to_entry(
                 entry,
                 rel="http://librarysimplified.org/terms/rel/restore",
@@ -65,7 +67,19 @@ class AdminAnnotator(LibraryAnnotator):
                 identifier_type=identifier.type,
                 identifier=identifier.identifier, _external=True)
         )
-            
+
+        # If there is a storage integration for the collection, changing the cover is allowed.
+        mirror = MirrorUploader.for_collection(active_license_pool.collection, use_sitewide=True)
+        if mirror:
+            feed.add_link_to_entry(
+                entry,
+                rel="http://librarysimplified.org/terms/rel/change_cover",
+                href=self.url_for(
+                    "work_change_book_cover",
+                    identifier_type=identifier.type,
+                    identifier=identifier.identifier, _external=True)
+            )
+
     def complaints_url(self, facets, pagination):
         kwargs = dict(facets.items())
         kwargs.update(dict(pagination.items()))
@@ -135,9 +149,13 @@ class AdminFeed(AcquisitionFeed):
         pagination = pagination or Pagination.default()
 
         q = _db.query(LicensePool).filter(
-            LicensePool.suppressed == True).order_by(
-                LicensePool.id
+            and_(
+                LicensePool.suppressed == True,
+                LicensePool.superceded == False,
             )
+        ).order_by(
+            LicensePool.id
+        )
         pools = pagination.apply(q).all()
 
         works = [pool.work for pool in pools]
@@ -164,4 +182,4 @@ class AdminFeed(AcquisitionFeed):
 
         annotator.annotate_feed(feed)
         return unicode(feed)
-            
+

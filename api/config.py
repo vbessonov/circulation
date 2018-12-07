@@ -3,10 +3,16 @@ import re
 from nose.tools import set_trace
 import contextlib
 from copy import deepcopy
+
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP
+
 from flask_babel import lazy_gettext as _
+
 from core.config import (
     Configuration as CoreConfiguration,
     CannotLoadConfiguration,
+    IntegrationException,
     empty_config as core_empty_config,
     temp_config as core_temp_config,
 )
@@ -32,7 +38,7 @@ class Configuration(CoreConfiguration):
     # A short description of the library, used in its Authentication
     # for OPDS document.
     LIBRARY_DESCRIPTION = 'library_description'
-    
+
     # The name of the per-library setting that sets the maximum amount
     # of fines a patron can have before losing lending privileges.
     MAX_OUTSTANDING_FINES = u"max_outstanding_fines"
@@ -50,6 +56,17 @@ class Configuration(CoreConfiguration):
     # address to use when notifying patrons of changes.
     DEFAULT_NOTIFICATION_EMAIL_ADDRESS = u"default_notification_email_address"
 
+    # The name of the per-library setting that sets the email address
+    # of the Designated Agent for copyright complaints
+    COPYRIGHT_DESIGNATED_AGENT_EMAIL = u"copyright_designated_agent_email_address"
+
+    # This is the link relation used to indicate
+    COPYRIGHT_DESIGNATED_AGENT_REL = "http://librarysimplified.org/rel/designated-agent/copyright"
+
+    # The name of the per-library setting that sets the contact address
+    # for problems with the library configuration itself.
+    CONFIGURATION_CONTACT_EMAIL = u"configuration_contact_email_address"
+
     # Name of the site-wide ConfigurationSetting containing the secret
     # used to sign bearer tokens.
     BEARER_TOKEN_SIGNING_SECRET = "bearer_token_signing_secret"
@@ -60,13 +77,31 @@ class Configuration(CoreConfiguration):
     SMALL_COLLECTION_LANGUAGES = "small_collections"
     TINY_COLLECTION_LANGUAGES = "tiny_collections"
 
-    # The client-side color scheme to use for this library.
+    LANGUAGE_DESCRIPTION = _('Each value must be an <a href="https://www.loc.gov/standards/iso639-2/php/code_list.php" target="_blank">ISO-639-2</a> language code.')
+
+    # The color scheme for native mobile applications to use for this library.
     COLOR_SCHEME = "color_scheme"
     DEFAULT_COLOR_SCHEME = "blue"
 
+    # The color options for web applications to use for this library.
+    WEB_BACKGROUND_COLOR = "web-background-color"
+    WEB_FOREGROUND_COLOR = "web-foreground-color"
+    DEFAULT_WEB_BACKGROUND_COLOR = "#000000"
+    DEFAULT_WEB_FOREGROUND_COLOR = "#ffffff"
+
+    # Header links and labels for web applications to display for this library.
+    # TODO: It's very awkward to have these as separate settings, and separate
+    # lists of inputs in the UI.
+    WEB_HEADER_LINKS = "web-header-links"
+    WEB_HEADER_LABELS = "web-header-labels"
+
     # The library-wide logo setting.
     LOGO = "logo"
-   
+
+    # Settings for geographic areas associated with the library.
+    LIBRARY_FOCUS_AREA = "focus_area"
+    LIBRARY_SERVICE_AREA = "service_area"
+
     # Names of the library-wide link settings.
     TERMS_OF_SERVICE = 'terms-of-service'
     PRIVACY_POLICY = 'privacy-policy'
@@ -87,7 +122,7 @@ class Configuration(CoreConfiguration):
     # These are link relations that are valid in Authentication for
     # OPDS documents but are not registered with IANA.
     AUTHENTICATION_FOR_OPDS_LINKS = ['register']
-    
+
     # We support three different ways of integrating help processes.
     # All three of these will be sent out as links with rel='help'
     HELP_EMAIL = 'help-email'
@@ -99,149 +134,249 @@ class Configuration(CoreConfiguration):
     # disable.
     RESERVATIONS_FEATURE = "https://librarysimplified.org/rel/policy/reservations"
 
-    # Name of the library-wide public key configuration setting for negotiating
-    # a shared secret with a library registry. The setting is automatically generated
-    # and not editable by admins.
-    PUBLIC_KEY = "public-key"
-    
+    # Name of the library-wide public key configuration setting for
+    # negotiating a shared secret with a library registry. The setting
+    # is automatically generated and not editable by admins.
+    #
+    KEY_PAIR = "key-pair"
+
     SITEWIDE_SETTINGS = CoreConfiguration.SITEWIDE_SETTINGS + [
         {
             "key": BEARER_TOKEN_SIGNING_SECRET,
             "label": _("Internal signing secret for OAuth bearer tokens"),
+            "required": True,
         },
         {
             "key": SECRET_KEY,
             "label": _("Internal secret key for admin interface cookies"),
+            "required": True,
         },
         {
             "key": PATRON_WEB_CLIENT_URL,
             "label": _("URL of the web catalog for patrons"),
+            "required": True,
+            "format": "url",
         },
         {
             "key": STATIC_FILE_CACHE_TIME,
-            "label": _("Cache time for static JS and CSS files for the admin interface"),
+            "label": _("Cache time for static images and JS and CSS files"),
+            "required": True,
+            "type": "number",
         },
     ]
 
     LIBRARY_SETTINGS = CoreConfiguration.LIBRARY_SETTINGS + [
         {
             "key": LIBRARY_DESCRIPTION,
-            "label": _("A short description of this library, shown to people who aren't sure they've chosen the right library."),
-            "optional": True,
-        },
-        {
-            "key": DEFAULT_NOTIFICATION_EMAIL_ADDRESS,
-            "label": _("Default email address to use when notifying patrons of changes."),
-            "description": _("This should be an address that the library controls, but no emails will (currently) be sent to this address. If this address is not specified, no holds can be placed on Overdrive, Bibliotheca, or Axis 360 titles, and no RBdigital titles can be put on loan.")
-        },
-        {
-            "key": COLOR_SCHEME,
-            "label": _("Color scheme"),
-            "description": _("This tells clients what colors to use when rendering this library's OPDS feed."),
-            "options": [
-                { "key": "blue", "label": _("Blue") },
-                { "key": "red", "label": _("Red") },
-                { "key": "gray", "label": _("Gray") },
-                { "key": "gold", "label": _("Gold") },
-                { "key": "green", "label": _("Green") },
-                { "key": "teal", "label": _("Teal") },
-                { "key": "purple", "label": _("Purple") },
-            ],
-            "type": "select",
-            "default": DEFAULT_COLOR_SCHEME,
-        },
-        {
-            "key": LOGO,
-            "label": _("Logo image"),
-            "type": "image",
-            "optional": True,
-            "description": _("The image must be in GIF, PNG, or JPG format, approximately square, no larger than 135x135 pixels, and look good on a white background."),
-        },
-        {
-            "key": MAX_OUTSTANDING_FINES,
-            "label": _("Maximum amount of fines a patron can have before losing lending privileges"),
-            "optional": True,
-        },
-        {
-            "key": LOAN_LIMIT,
-            "label": _("Maximum number of books a patron can have on loan at once."),
-            "description": _("(Note: depending on distributor settings, a patron may be able to exceed the limit by checking out books directly from a distributor's app. They may also get a limit exceeded error before they reach these limits if a distributor has a smaller limit.)"),
-            "type": "number",
-            "optional": True,
-        },
-        {
-            "key": HOLD_LIMIT,
-            "label": _("Maximum number of books a patron can have on hold at once."),
-            "description": _("(Note: depending on distributor settings, a patron may be able to exceed the limit by checking out books directly from a distributor's app. They may also get a limit exceeded error before they reach these limits if a distributor has a smaller limit.)"),
-            "type": "number",
-            "optional": True,
-        },
-        {
-            "key": TERMS_OF_SERVICE,
-            "label": _("Terms of Service URL"),
-            "optional": True,
-        },
-        {
-            "key": PRIVACY_POLICY,
-            "label": _("Privacy Policy URL"),
-            "optional": True,
-        },
-        {
-            "key": COPYRIGHT,
-            "label": _("Copyright URL"),
-            "optional": True,
-        },
-        {
-            "key": ABOUT,
-            "label": _("About URL"),
-            "optional": True,
-        },
-        {
-            "key": LICENSE,
-            "label": _("License URL"),
-            "optional": True,
-        },
-        {
-            "key": REGISTER,
-            "label": _("Patron registration URL"),
-            "description": _("A URL where someone who doesn't have a library card yet can sign up for one."),
-            "optional": True,
+            "label": _("A short description of this library."),
+            "description": _("This will be shown to people who aren't sure they've chosen the right library."),
+            "category": "Additional Information",
         },
         {
             "key": HELP_EMAIL,
             "label": _("Patron support email address"),
-            "description": _("An email address a patron can use if they need help, e.g. 'simplyehelp@nypl.org'."),
-            "optional": True,
+            "description": _("An email address a patron can use if they need help, e.g. 'simplyehelp@yourlibrary.org'."),
+            "required": True,
+            "format": "email"
         },
         {
             "key": HELP_WEB,
             "label": _("Patron support web site"),
             "description": _("A URL for patrons to get help."),
-            "optional": True,
+            "format": "url",
+            "category": "Patron Support",
         },
         {
             "key": HELP_URI,
             "label": _("Patron support custom integration URI"),
             "description": _("A custom help integration like Helpstack, e.g. 'helpstack:nypl.desk.com'."),
-            "optional": True,
+            "category": "Patron Support",
+        },
+        {
+            "key": COPYRIGHT_DESIGNATED_AGENT_EMAIL,
+            "label": _("Copyright designated agent email"),
+            "description": _("Patrons of this library should use this email address to send a DMCA notification (or other copyright complaint) to the library.<br/>If no value is specified here, the general patron support address will be used."),
+            "format": "email",
+            "category": "Patron Support"
+        },
+        {
+            "key": CONFIGURATION_CONTACT_EMAIL,
+            "label": _("A point of contact for the organization reponsible for configuring this library."),
+            "description": _("This email address will be shared as part of integrations that you set up through this interface. It will not be shared with the general public. This gives the administrator of the remote integration a way to contact you about problems with this library's use of that integration.<br/>If no value is specified here, the general patron support address will be used."),
+            "format": "email",
+            "category": "Patron Support",
+        },
+        {
+            "key": DEFAULT_NOTIFICATION_EMAIL_ADDRESS,
+            "label": _("Default email address to use when sending vendor hold notifications"),
+            "description": _('This should be an address controlled by the library which rejects or trashes all email sent to it. Vendor hold notifications contain sensitive patron information, but <a href="https://confluence.nypl.org/display/SIM/About+Hold+Notifications" target="_blank">cannot be forwarded to patrons</a> because they contain vendor-specific instructions.'),
+            "required": True,
+            "format": "email",
+        },
+        {
+            "key": COLOR_SCHEME,
+            "label": _("Mobile color scheme"),
+            "description": _("This tells mobile applications what color scheme to use when rendering this library's OPDS feed."),
+            "options": [
+                dict(key="amber", label=_("Amber")),
+                dict(key="black", label=_("Black")),
+                dict(key="blue", label=_("Blue")),
+                dict(key="bluegray", label=_("Blue Gray")),
+                dict(key="brown", label=_("Brown")),
+                dict(key="cyan", label=_("Cyan")),
+                dict(key="darkorange", label=_("Dark Orange")),
+                dict(key="darkpurple", label=_("Dark Purple")),
+                dict(key="green", label=_("Green")),
+                dict(key="gray", label=_("Gray")),
+                dict(key="indigo", label=_("Indigo")),
+                dict(key="lightblue", label=_("Light Blue")),
+                dict(key="orange", label=_("Orange")),
+                dict(key="pink", label=_("Pink")),
+                dict(key="purple", label=_("Purple")),
+                dict(key="red", label=_("Red")),
+                dict(key="teal", label=_("Teal")),
+            ],
+            "type": "select",
+            "default": DEFAULT_COLOR_SCHEME,
+            "category": "Client Interface Customization",
+        },
+        {
+            "key": WEB_BACKGROUND_COLOR,
+            "label": _("Web background color"),
+            "description": _("This tells web applications what background color to use. Must have sufficient contrast with the foreground color."),
+            "type": "color-picker",
+            "default": DEFAULT_WEB_BACKGROUND_COLOR,
+            "category": "Client Interface Customization",
+        },
+        {
+            "key": WEB_FOREGROUND_COLOR,
+            "label": _("Web foreground color"),
+            "description": _("This tells web applications what foreground color to use. Must have sufficient contrast with the background color."),
+            "type": "color-picker",
+            "default": DEFAULT_WEB_FOREGROUND_COLOR,
+            "category": "Client Interface Customization",
+        },
+        {
+            "key": WEB_HEADER_LINKS,
+            "label": _("Web header links"),
+            "description": _("This gives web applications a list of links to display in the header. Specify labels for each link in the same order under 'Web header labels'."),
+            "type": "list",
+            "category": "Client Interface Customization",
+        },
+        {
+            "key": WEB_HEADER_LABELS,
+            "label": _("Web header labels"),
+            "description": _("Labels for each link under 'Web header links'."),
+            "type": "list",
+            "category": "Client Interface Customization",
+        },
+        {
+            "key": LOGO,
+            "label": _("Logo image"),
+            "type": "image",
+            "description": _("The image must be in GIF, PNG, or JPG format, approximately square, no larger than 135x135 pixels, and look good on a white background."),
+            "category": "Client Interface Customization",
+        },
+        {
+            "key": LIBRARY_FOCUS_AREA,
+            "label": _("Focus area"),
+            "type": "text",
+            "description": _("The library focuses on serving patrons in this geographic area. In most cases this will be a city name like <code>Springfield, OR</code>."),
+            "category": "Additional Information",
+        },
+        {
+            "key": LIBRARY_SERVICE_AREA,
+            "label": _("Service area"),
+            "type": "text",
+            "description": _("The full geographic area served by this library. In most cases this is the same as the focus area and can be left blank, but it may be a larger area such as a US state (which should be indicated by its abbreviation, like <code>OR</code>)."),
+            "category": "Additional Information",
+        },
+        {
+            "key": MAX_OUTSTANDING_FINES,
+            "label": _("Maximum amount of fines a patron can have before losing lending privileges"),
+            "format": "number",
+            "category": "Loans, Holds, & Fines",
+        },
+        {
+            "key": LOAN_LIMIT,
+            "label": _("Maximum number of books a patron can have on loan at once"),
+            "description": _("(Note: depending on distributor settings, a patron may be able to exceed the limit by checking out books directly from a distributor's app. They may also get a limit exceeded error before they reach these limits if a distributor has a smaller limit.)"),
+            "format": "number",
+            "category": "Loans, Holds, & Fines",
+        },
+        {
+            "key": HOLD_LIMIT,
+            "label": _("Maximum number of books a patron can have on hold at once"),
+            "description": _("(Note: depending on distributor settings, a patron may be able to exceed the limit by checking out books directly from a distributor's app. They may also get a limit exceeded error before they reach these limits if a distributor has a smaller limit.)"),
+            "format": "number",
+            "category": "Loans, Holds, & Fines",
+        },
+        {
+            "key": TERMS_OF_SERVICE,
+            "label": _("Terms of Service URL"),
+            "format": "url",
+            "category": "Links",
+        },
+        {
+            "key": PRIVACY_POLICY,
+            "label": _("Privacy Policy URL"),
+            "format": "url",
+            "category": "Links",
+        },
+        {
+            "key": COPYRIGHT,
+            "label": _("Copyright URL"),
+            "format": "url",
+            "category": "Links",
+        },
+        {
+            "key": ABOUT,
+            "label": _("About URL"),
+            "format": "url",
+            "category": "Links",
+        },
+        {
+            "key": LICENSE,
+            "label": _("License URL"),
+            "format": "url",
+            "category": "Links",
+        },
+        {
+            "key": REGISTER,
+            "label": _("Patron registration URL"),
+            "description": _("A URL where someone who doesn't have a library card yet can sign up for one."),
+            "format": "url",
+            "category": "Patron Support",
         },
         {
             "key": LARGE_COLLECTION_LANGUAGES,
             "label": _("The primary languages represented in this library's collection"),
             "type": "list",
+            "format": "language-code",
+            "description": LANGUAGE_DESCRIPTION,
+            "optional": True,
+            "category": "Languages",
         },
         {
             "key": SMALL_COLLECTION_LANGUAGES,
             "label": _("Other major languages represented in this library's collection"),
             "type": "list",
-        },        
+            "format": "language-code",
+            "description": LANGUAGE_DESCRIPTION,
+            "optional": True,
+            "category": "Languages",
+        },
         {
             "key": TINY_COLLECTION_LANGUAGES,
             "label": _("Other languages in this library's collection"),
             "type": "list",
-        },        
+            "format": "language-code",
+            "description": LANGUAGE_DESCRIPTION,
+            "optional": True,
+            "category": "Languages",
+        },
     ]
-    
+
     @classmethod
     def lending_policy(cls):
         return cls.policy(cls.LENDING_POLICY)
@@ -267,7 +402,7 @@ class Configuration(CoreConfiguration):
             cls.estimate_language_collections_for_library(library)
             value = setting.json_value
         return value
-    
+
     @classmethod
     def large_collection_languages(cls, library):
         return cls._collection_languages(
@@ -290,15 +425,17 @@ class Configuration(CoreConfiguration):
     def max_outstanding_fines(cls, library):
         max_fines = ConfigurationSetting.for_library(
             cls.MAX_OUTSTANDING_FINES, library
-        ).value
-        return MoneyUtility.parse(max_fines)
-    
+        )
+        if max_fines.value is None:
+            return None
+        return MoneyUtility.parse(max_fines.value)
+
     @classmethod
     def load(cls, _db=None):
         CoreConfiguration.load(_db)
         cls.instance = CoreConfiguration.instance
         return cls.instance
-        
+
     @classmethod
     def estimate_language_collections_for_library(cls, library):
         """Guess at appropriate values for the given library for
@@ -338,7 +475,7 @@ class Configuration(CoreConfiguration):
             # English collection and nothing else.
             large.append('eng')
             return result
-        
+
         # The single most common language always gets a large
         # collection.
         #
@@ -354,9 +491,18 @@ class Configuration(CoreConfiguration):
             else:
                 bucket = tiny
             bucket.append(language)
-            
-        return result        
-        
+
+        return result
+
+    @classmethod
+    def _as_mailto(cls, value):
+        """Turn an email address into a mailto: URI."""
+        if not value:
+            return value
+        if value.startswith("mailto:"):
+            return value
+        return "mailto:%s" % value
+
     @classmethod
     def help_uris(cls, library):
         """Find all the URIs that might help patrons get help from
@@ -371,12 +517,81 @@ class Configuration(CoreConfiguration):
                 continue
             type = None
             if name == cls.HELP_EMAIL:
-                value = 'mailto:' + value
+                value = cls._as_mailto(value)
             if name == cls.HELP_WEB:
                 type = 'text/html'
             yield type, value
-            
-        
+
+    @classmethod
+    def _email_uri_with_fallback(cls, library, key):
+        """Try to find a certain email address configured for the given
+        purpose. If not available, use the general patron support
+        address.
+
+        :param key: The specific email address to look for.
+        """
+        for setting in [key, Configuration.HELP_EMAIL]:
+            value = ConfigurationSetting.for_library(setting, library).value
+            if not value:
+                continue
+            return cls._as_mailto(value)
+
+    @classmethod
+    def copyright_designated_agent_uri(cls, library):
+        return cls._email_uri_with_fallback(
+            library, Configuration.COPYRIGHT_DESIGNATED_AGENT_EMAIL
+        )
+
+    @classmethod
+    def configuration_contact_uri(cls, library):
+        return cls._email_uri_with_fallback(
+            library, Configuration.CONFIGURATION_CONTACT_EMAIL
+        )
+
+    @classmethod
+    def key_pair(cls, setting):
+        """Look up a public-private key pair in a ConfigurationSetting.
+
+        If the value is missing or incorrect, a new key pair is
+        created and stored.
+
+        TODO: This could go into ConfigurationSetting or core Configuration.
+
+        :param public_setting: A ConfigurationSetting for the public key.
+        :param private_setting: A ConfigurationSetting for the private key.
+
+        :return: A 2-tuple (public key, private key)
+        """
+        public = None
+        private = None
+
+        try:
+            public, private = setting.json_value
+        except Exception, e:
+            pass
+
+        if not public or not private:
+            key = RSA.generate(2048)
+            encryptor = PKCS1_OAEP.new(key)
+            public = key.publickey().exportKey()
+            private = key.exportKey()
+            setting.value = json.dumps([public, private])
+        return public, private
+
+    @classmethod
+    def cipher(cls, key):
+        """Create a Cipher for a public or private key.
+
+        This just wraps some hard-to-remember Crypto code.
+
+        :param key: A string containing the key.
+
+        :return: A Cipher object which will support either
+        encrypt() (public key) or decrypt() (private key).
+        """
+        return PKCS1_OAEP.new(RSA.import_key(key))
+
+
 @contextlib.contextmanager
 def empty_config():
     with core_empty_config({}, [CoreConfiguration, Configuration]) as i:

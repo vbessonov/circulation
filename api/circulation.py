@@ -3,6 +3,7 @@ from circulation_exceptions import *
 import datetime
 from collections import defaultdict
 from threading import Thread
+import flask
 import logging
 import re
 import time
@@ -58,7 +59,7 @@ class CirculationInfo(object):
     def collection(self, _db):
         """Find the Collection to which this object belongs."""
         return Collection.by_id(_db, self.collection_id)
-    
+
     def license_pool(self, _db):
         """Find the LicensePool model object corresponding to this object."""
         collection = self.collection(_db)
@@ -67,7 +68,7 @@ class CirculationInfo(object):
             collection=collection
         )
         return pool
-        
+
     def fd(self, d):
         # Stupid method to format a date
         if not d:
@@ -196,7 +197,7 @@ class FulfillmentInfo(CirculationInfo):
         self.content_type = content_type
         self.content = content
         self.content_expires = content_expires
-    
+
     def __repr__(self):
         if self.content:
             blength = len(self.content)
@@ -205,6 +206,78 @@ class FulfillmentInfo(CirculationInfo):
         return "<FulfillmentInfo: content_link: %r, content_type: %r, content: %d bytes, expires: %r>" % (
             self.content_link, self.content_type, blength,
             self.fd(self.content_expires))
+
+
+class APIAwareFulfillmentInfo(FulfillmentInfo):
+    """This that acts like FulfillmentInfo but is prepared to make an API
+    request on demand to get data, rather than having all the data
+    ready right now.
+
+    This class is useful in situations where generating a full
+    FulfillmentInfo object would be costly. We only want to incur that
+    cost when the patron wants to fulfill this title and is not just
+    looking at their loans.
+    """
+    def __init__(self, api, data_source_name, identifier_type, identifier, key):
+        """Constructor.
+
+        :param api: An object that knows how to make API requests.
+        :param data_source_name: The name of the data source that's
+           offering to fulfill a book.
+        :param identifier: The Identifier of the book being fulfilled.
+        :param key: Any special data, such as a license key, which must
+           be used to fulfill the book.
+        """
+        self.api = api
+        self.key = key
+        self.collection_id = api.collection.id
+        self.data_source_name = data_source_name
+        self.identifier_type = identifier_type
+        self.identifier = identifier
+
+        self._fetched = False
+        self._content_link = None
+        self._content_type = None
+        self._content = None
+        self._content_expires = None
+
+    def fetch(self):
+        """It's time to tell the API that we want to fulfill this book."""
+        if self._fetched:
+            # We already sent the API request..
+            return
+        self.do_fetch()
+        self._fetched = True
+
+    def do_fetch(self):
+        """Actually make the API request.
+
+        When implemented, this method must set values for some or all
+        of _content_link, _content_type, _content, and
+        _content_expires.
+        """
+        raise NotImplementedError()
+
+    @property
+    def content_link(self):
+        self.fetch()
+        return self._content_link
+
+    @property
+    def content_type(self):
+        self.fetch()
+        return self._content_type
+
+    @property
+    def content(self):
+        self.fetch()
+        return self._content
+
+    @property
+    def content_expires(self):
+        self.fetch()
+        return self._content_expires
+
 
 
 class LoanInfo(CirculationInfo):
@@ -240,7 +313,7 @@ class LoanInfo(CirculationInfo):
         f = "%Y/%m/%d"
         return "<LoanInfo for %s/%s, start=%s end=%s>%s" % (
             self.identifier_type, self.identifier,
-            self.fd(self.start_date), self.fd(self.end_date), 
+            self.fd(self.start_date), self.fd(self.end_date),
             fulfillment
         )
 
@@ -249,12 +322,12 @@ class HoldInfo(CirculationInfo):
 
     """A record of a hold.
 
-    :param identifier_type Ex.: Identifier.ONECLICK_ID.
+    :param identifier_type Ex.: Identifier.RBDIGITAL_ID.
     :param identifier Expected to be the unicode string of the isbn, etc..
     :param start_date When the patron made the reservation.
-    :param end_date When reserved book is expected to become available.  Expected to be passed in 
+    :param end_date When reserved book is expected to become available.  Expected to be passed in
         date, not unicode format.
-    :param hold_position  Patron's place in the hold line.  
+    :param hold_position  Patron's place in the hold line.
         When not available, default to be passed is None, which is equivalent to "first in line".
     """
 
@@ -272,7 +345,7 @@ class HoldInfo(CirculationInfo):
     def __repr__(self):
         return "<HoldInfo for %s/%s, start=%s end=%s, position=%s>" % (
             self.identifier_type, self.identifier,
-            self.fd(self.start_date), self.fd(self.end_date), 
+            self.fd(self.start_date), self.fd(self.end_date),
             self.hold_position
         )
 
@@ -292,7 +365,7 @@ class CirculationAPI(object):
         :param library: A Library object representing the library
           whose circulation we're concerned with.
 
-        :param analytics: An Analytics object for tracking 
+        :param analytics: An Analytics object for tracking
           circulation events.
 
         :param api_map: A dictionary mapping Collection protocols to
@@ -339,7 +412,7 @@ class CirculationAPI(object):
     @property
     def library(self):
         return Library.by_id(self._db, self.library_id)
-                    
+
     @property
     def default_api_map(self):
         """When you see a Collection that implements protocol X, instantiate
@@ -349,7 +422,7 @@ class CirculationAPI(object):
         from odilo import OdiloAPI
         from bibliotheca import BibliothecaAPI
         from axis import Axis360API
-        from oneclick import OneClickAPI
+        from rbdigital import RBDigitalAPI
         from enki import EnkiAPI
         from opds_for_distributors import OPDSForDistributorsAPI
         from odl import ODLWithConsolidatedCopiesAPI, SharedODLAPI
@@ -358,7 +431,7 @@ class CirculationAPI(object):
             ExternalIntegration.ODILO : OdiloAPI,
             ExternalIntegration.BIBLIOTHECA : BibliothecaAPI,
             ExternalIntegration.AXIS_360 : Axis360API,
-            ExternalIntegration.ONE_CLICK : OneClickAPI,
+            ExternalIntegration.ONE_CLICK : RBDigitalAPI,
             EnkiAPI.ENKI_EXTERNAL : EnkiAPI,
             OPDSForDistributorsAPI.NAME: OPDSForDistributorsAPI,
             ODLWithConsolidatedCopiesAPI.NAME: ODLWithConsolidatedCopiesAPI,
@@ -385,14 +458,14 @@ class CirculationAPI(object):
                hold_notification_email=None):
         """Either borrow a book or put it on hold. Don't worry about fulfilling
         the loan yet.
-        
+
         :return: A 3-tuple (`Loan`, `Hold`, `is_new`). Either `Loan`
         or `Hold` must be None, but not both.
         """
         # Short-circuit the request if the patron lacks borrowing
         # privileges.
-        PatronUtility.assert_borrowing_privileges(patron)        
-        
+        PatronUtility.assert_borrowing_privileges(patron)
+
         now = datetime.datetime.utcnow()
         if licensepool.open_access:
             # We can 'loan' open-access content ourselves just by
@@ -405,7 +478,7 @@ class CirculationAPI(object):
             return loan, None, is_new
 
         # Okay, it's not an open-access book. This means we need to go
-        # to an external service to get the book. 
+        # to an external service to get the book.
         #
         # This also means that our internal model of whether this book
         # is currently on loan or on hold might be wrong.
@@ -420,14 +493,14 @@ class CirculationAPI(object):
 
         if must_set_delivery_mechanism and not delivery_mechanism:
             raise DeliveryMechanismMissing()
-    
+
         content_link = content_expires = None
 
         internal_format = api.internal_format(delivery_mechanism)
 
         if patron.fines:
             max_fines = Configuration.max_outstanding_fines(patron.library)
-            if patron.fines >= max_fines.amount:
+            if max_fines is not None and patron.fines > max_fines.amount:
                 raise OutstandingFines()
 
         # Do we (think we) already have this book out on loan?
@@ -435,7 +508,7 @@ class CirculationAPI(object):
              self._db, Loan, patron=patron, license_pool=licensepool,
              on_multiple='interchangeable'
         )
-        
+
         loan_info = None
         hold_info = None
         if existing_loan:
@@ -487,7 +560,7 @@ class CirculationAPI(object):
             except AlreadyCheckedOut:
                 # This is good, but we didn't get the real loan info.
                 # Just fake it.
-                identifier = licensepool.identifier            
+                identifier = licensepool.identifier
                 loan_info = LoanInfo(
                     licensepool.collection,
                     licensepool.data_source,
@@ -588,7 +661,7 @@ class CirculationAPI(object):
         hold, is_new = licensepool.on_hold_to(
             patron,
             hold_info.start_date or now,
-            hold_info.end_date, 
+            hold_info.end_date,
             hold_info.hold_position,
             hold_info.external_identifier,
         )
@@ -616,7 +689,31 @@ class CirculationAPI(object):
                 patron.library, licensepool,
                 CirculationEvent.CM_CHECKOUT,
             )
-    
+
+    def can_fulfill_without_loan(self, patron, pool, lpdm):
+        """Can we deliver the given book in the given format to the given
+        patron, even though the patron has no active loan for that
+        book?
+
+        In general this is not possible, but there are some
+        exceptions, managed in subclasses of BaseCirculationAPI.
+
+        :param patron: A Patron. This is probably None, indicating
+        that someone is trying to fulfill a book without identifying
+        themselves.
+
+        :param delivery_mechanism: The LicensePoolDeliveryMechanism
+        representing a format for a specific title.
+        """
+        if not lpdm or not pool:
+            return False
+        if pool.open_access:
+            return True
+        api = self.api_for_license_pool(pool)
+        if not api:
+            return False
+        return api.can_fulfill_without_loan(patron, pool, lpdm)
+
     def fulfill(self, patron, pin, licensepool, delivery_mechanism, sync_on_failure=True):
         """Fulfil a book that a patron has previously checked out.
 
@@ -633,7 +730,9 @@ class CirculationAPI(object):
             self._db, Loan, patron=patron, license_pool=licensepool,
             on_multiple='interchangeable'
         )
-        if not loan:
+        if not loan and not self.can_fulfill_without_loan(
+            patron, licensepool, delivery_mechanism
+        ):
             if sync_on_failure:
                 # Sync and try again.
                 # TODO: Pass in only the single collection or LicensePool
@@ -646,10 +745,10 @@ class CirculationAPI(object):
                 )
             else:
                 raise NoActiveLoan(_("Cannot find your active loan for this work."))
-        if loan.fulfillment is not None and not loan.fulfillment.compatible_with(delivery_mechanism):
+        if loan and loan.fulfillment is not None and not loan.fulfillment.compatible_with(delivery_mechanism):
             raise DeliveryMechanismConflict(
                 _("You already fulfilled this loan as %(loan_delivery_mechanism)s, you can't also do it as %(requested_delivery_mechanism)s",
-                  loan_delivery_mechanism=loan.fulfillment.delivery_mechanism.name, 
+                  loan_delivery_mechanism=loan.fulfillment.delivery_mechanism.name,
                   requested_delivery_mechanism=delivery_mechanism.delivery_mechanism.name)
             )
 
@@ -672,14 +771,19 @@ class CirculationAPI(object):
         # a fulfillment was initiated through the circulation
         # manager.
         if self.analytics:
+            if patron:
+                library = patron.library
+            elif flask.request:
+                library = flask.request.library
+            else:
+                library = None
             self.analytics.collect_event(
-                patron.library, licensepool,
-                CirculationEvent.CM_FULFILL,
+                library, licensepool, CirculationEvent.CM_FULFILL,
             )
 
         # Make sure the delivery mechanism we just used is associated
-        # with the loan.
-        if loan.fulfillment is None and not delivery_mechanism.delivery_mechanism.is_streaming:
+        # with the loan, if any.
+        if loan and loan.fulfillment is None and not delivery_mechanism.delivery_mechanism.is_streaming:
             __transaction = self._db.begin_nested()
             loan.fulfillment = delivery_mechanism
             __transaction.commit()
@@ -714,14 +818,17 @@ class CirculationAPI(object):
             raise FormatNotAvailable()
 
         rep = fulfillment.resource.representation
-        content_link = cdnify(rep.url)
+        if rep:
+            content_link = cdnify(rep.public_url)
+        else:
+            content_link = cdnify(fulfillment.resource.url)
         media_type = rep.media_type
         return FulfillmentInfo(
             licensepool.collection, licensepool.data_source,
             identifier_type=licensepool.identifier.type,
             identifier=licensepool.identifier.identifier,
-            content_link=content_link, content_type=media_type, content=None, 
-            content_expires=None
+            content_link=content_link, content_type=media_type, content=None,
+            content_expires=None,
         )
 
     def revoke_loan(self, patron, pin, licensepool):
@@ -853,7 +960,7 @@ class CirculationAPI(object):
                         l = holds
                     else:
                         self.log.warn(
-                            "value %r from patron_activity is neither a loan nor a hold.", 
+                            "value %r from patron_activity is neither a loan nor a hold.",
                             i
                         )
                     if l is not None:
@@ -1017,19 +1124,21 @@ class BaseCirculationAPI(object):
     # distributor which includes ebooks and allows clients to specify
     # their own loan lengths.
     EBOOK_LOAN_DURATION_SETTING = {
-        "key" : Collection.EBOOK_LOAN_DURATION_KEY, 
+        "key" : Collection.EBOOK_LOAN_DURATION_KEY,
         "label": _("Ebook Loan Duration (in Days)"),
         "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
+        "format": "number",
         "description": _("When a patron uses SimplyE to borrow an ebook from this collection, SimplyE will ask for a loan that lasts this number of days. This must be equal to or less than the maximum loan duration negotiated with the distributor.")
     }
 
     # Add to LIBRARY_SETTINGS if your circulation API is for a
     # distributor which includes audiobooks and allows clients to
     # specify their own loan lengths.
-    AUDIOBOOK_LOAN_DURATION_SETTING = { 
+    AUDIOBOOK_LOAN_DURATION_SETTING = {
         "key" : Collection.AUDIOBOOK_LOAN_DURATION_KEY,
         "label": _("Audiobook Loan Duration (in Days)"),
         "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
+        "format": "number",
         "description": _("When a patron uses SimplyE to borrow an audiobook from this collection, SimplyE will ask for a loan that lasts this number of days. This must be equal to or less than the maximum loan duration negotiated with the distributor.")
     }
 
@@ -1037,12 +1146,11 @@ class BaseCirculationAPI(object):
     # distributor with a default loan period negotiated out-of-band,
     # such that the circulation manager cannot _specify_ the length of
     # a loan.
-    DEFAULT_LOAN_DURATION_SETTING = { 
-        "key": Collection.EBOOK_LOAN_DURATION_KEY, 
+    DEFAULT_LOAN_DURATION_SETTING = {
+        "key": Collection.EBOOK_LOAN_DURATION_KEY,
         "label": _("Default Loan Period (in Days)"),
-        "optional": True, 
-        "type": "number",
         "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
+        "format": "number",
         "description": _("Until it hears otherwise from the distributor, this server will assume that any given loan for this library from this collection will last this number of days. This number is usually a negotiated value between the library and the distributor. This only affects estimates&mdash;it cannot affect the actual length of loans.")
     }
 
@@ -1101,7 +1209,7 @@ class BaseCirculationAPI(object):
         ).value
 
     def checkin(self, patron, pin, licensepool):
-        """  Return a book early.  
+        """  Return a book early.
 
         :param patron: a Patron object for the patron who wants
         to check out the book.
@@ -1124,6 +1232,9 @@ class BaseCirculationAPI(object):
         """
         raise NotImplementedError()
 
+    def can_fulfill_without_loan(self, patron, pool, lpdm):
+        """In general, you can't fulfill a book without a loan."""
+        return False
 
     def fulfill(self, patron, pin, licensepool, internal_format):
         """ Get the actual resource file to the patron.

@@ -10,6 +10,7 @@ from api.opds import AcquisitionFeed
 from core.model import (
     Complaint,
     DataSource,
+    ExternalIntegration,
     Library,
     Measurement,
 )
@@ -69,11 +70,31 @@ class TestOPDS(DatabaseTest):
     def test_feed_includes_edit_link(self):
         work = self._work(with_open_access_download=True)
         lp = work.license_pools[0]
- 
+
         feed = AcquisitionFeed(self._db, "test", "url", [work], AdminAnnotator(None, self._default_library, test_mode=True))
         [entry] = feedparser.parse(unicode(feed))['entries']
         [edit_link] = [x for x in entry['links'] if x['rel'] == "edit"]
         assert lp.identifier.identifier in edit_link["href"]
+
+    def test_feed_includes_change_cover_link(self):
+        work = self._work(with_open_access_download=True)
+        lp = work.license_pools[0]
+
+        feed = AcquisitionFeed(self._db, "test", "url", [work], AdminAnnotator(None, self._default_library, test_mode=True))
+        [entry] = feedparser.parse(unicode(feed))['entries']
+
+        # Since there's no storage integration, the change cover link isn't included.
+        eq_([], [x for x in entry['links'] if x['rel'] == "http://librarysimplified.org/terms/rel/change_cover"])
+
+        storage = self._external_integration(ExternalIntegration.S3, ExternalIntegration.STORAGE_GOAL)
+        storage.username = "user"
+        storage.password = "pass"
+
+        feed = AcquisitionFeed(self._db, "test", "url", [work], AdminAnnotator(None, self._default_library, test_mode=True))
+        [entry] = feedparser.parse(unicode(feed))['entries']
+
+        [change_cover_link] = [x for x in entry['links'] if x['rel'] == "http://librarysimplified.org/terms/rel/change_cover"]
+        assert lp.identifier.identifier in change_cover_link["href"]
 
     def test_complaints_feed(self):
         """Test the ability to show a paginated feed of works with complaints.
@@ -177,6 +198,12 @@ class TestOPDS(DatabaseTest):
         work2 = self._work(with_open_access_download=True)
         work2.license_pools[0].suppressed = True
 
+        # This work won't be included in the feed since its
+        # suppressed pool is superceded.
+        work3 = self._work(with_open_access_download=True)
+        work3.license_pools[0].suppressed = True
+        work3.license_pools[0].superceded = True
+
         pagination = Pagination(size=1)
         annotator = MockAnnotator(self._default_library)
         titles = [work1.title, work2.title]
@@ -217,6 +244,14 @@ class TestOPDS(DatabaseTest):
         eq_(annotator.suppressed_url(pagination), previous['href'])
         eq_(1, len(parsed['entries']))
         eq_(remaining_title, parsed['entries'][0]['title'])
+
+        # The third page is empty.
+        third_page = make_page(pagination.next_page.next_page)
+        parsed = feedparser.parse(unicode(third_page))
+        [previous] = self.links(parsed, 'previous')
+        eq_(annotator.suppressed_url(pagination.next_page), previous['href'])
+        eq_(0, len(parsed['entries']))
+
 
 class MockAnnotator(AdminAnnotator):
 

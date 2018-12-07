@@ -3,72 +3,126 @@ from lxml import etree
 
 from cStringIO import StringIO
 import itertools
-import datetime
+from datetime import datetime, timedelta
 import os
 import re
 import logging
+import base64
+import urlparse
+import time
+import hmac
+import hashlib
+
 from flask_babel import lazy_gettext as _
 
 from nose.tools import set_trace
 
 from sqlalchemy import or_
+from sqlalchemy.orm.session import Session
 
+from web_publication_manifest import (
+    FindawayManifest,
+    SpineItem,
+)
 from circulation import (
     FulfillmentInfo,
     HoldInfo,
     LoanInfo,
     BaseCirculationAPI,
 )
+from selftest import (
+    HasSelfTests,
+    SelfTestResult,
+)
+
 from core.model import (
     CirculationEvent,
     Collection,
+    Contributor,
     DataSource,
     DeliveryMechanism,
     Edition,
     ExternalIntegration,
     get_one,
-    Identifier,
-    LicensePool,
-    Representation,
     get_one_or_create,
-    Loan,
     Hold,
+    Hyperlink,
+    Identifier,
+    Library,
+    LicensePool,
+    Loan,
+    Measurement,
+    Representation,
     Session,
+    Subject,
     Timestamp,
+    WorkCoverageRecord,
+)
+
+from core.config import (
+    Configuration,
+    CannotLoadConfiguration,
+    temp_config,
+)
+
+from core.coverage import (
+    BibliographicCoverageProvider
 )
 
 from core.monitor import (
     CollectionMonitor,
     IdentifierSweepMonitor,
 )
-from core.util.web_publication_manifest import AudiobookManifest
 from core.util.xmlparser import XMLParser
 from core.util.http import (
-    BadResponseException
-)
-from core.bibliotheca import (
-    MockBibliothecaAPI as BaseMockBibliothecaAPI,
-    BibliothecaAPI as BaseBibliothecaAPI,
-    BibliothecaBibliographicCoverageProvider
+    BadResponseException,
+    HTTP
 )
 
 from circulation_exceptions import *
 from core.analytics import Analytics
 
-class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
+from core.metadata_layer import (
+    ContributorData,
+    CirculationData,
+    Metadata,
+    LinkData,
+    IdentifierData,
+    FormatData,
+    MeasurementData,
+    ReplacementPolicy,
+    SubjectData,
+)
+
+from core.testing import DatabaseTest
+
+class BibliothecaAPI(BaseCirculationAPI, HasSelfTests):
 
     NAME = ExternalIntegration.BIBLIOTHECA
+    AUTH_TIME_FORMAT = "%a, %d %b %Y %H:%M:%S GMT"
+    ARGUMENT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+    AUTHORIZATION_FORMAT = "3MCLAUTH %s:%s"
+
+    DATETIME_HEADER = "3mcl-Datetime"
+    AUTHORIZATION_HEADER = "3mcl-Authorization"
+    VERSION_HEADER = "3mcl-Version"
+
+    log = logging.getLogger("Bibliotheca API")
+
+    DEFAULT_VERSION = "2.0"
+    DEFAULT_BASE_URL = "https://partner.yourcloudlibrary.com/"
+
     SETTINGS = [
-        { "key": ExternalIntegration.USERNAME, "label": _("Account ID") },
-        { "key": ExternalIntegration.PASSWORD, "label": _("Account Key") },
-        { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID") },
+        { "key": ExternalIntegration.USERNAME, "label": _("Account ID"), "required": True },
+        { "key": ExternalIntegration.PASSWORD, "label": _("Account Key"), "required": True },
+        { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID"), "required": True },
     ] + BaseCirculationAPI.SETTINGS
 
     LIBRARY_SETTINGS = BaseCirculationAPI.LIBRARY_SETTINGS + [
         BaseCirculationAPI.DEFAULT_LOAN_DURATION_SETTING
     ]
 
-    MAX_AGE = datetime.timedelta(days=730).seconds
+    MAX_AGE = timedelta(days=730).seconds
     CAN_REVOKE_HOLD_WHEN_RESERVED = False
     SET_DELIVERY_MECHANISM_AT = None
 
@@ -81,11 +135,193 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
     delivery_mechanism_to_internal_format = {
         (Representation.EPUB_MEDIA_TYPE, adobe_drm): 'ePub',
         (Representation.PDF_MEDIA_TYPE, adobe_drm): 'PDF',
-        (Representation.MP3_MEDIA_TYPE, findaway_drm) : 'MP3'
+        (None, findaway_drm) : 'MP3'
     }
     internal_format_to_delivery_mechanism = dict(
         [v,k] for k, v in delivery_mechanism_to_internal_format.items()
     )
+
+    def __init__(self, _db, collection):
+
+        if collection.protocol != ExternalIntegration.BIBLIOTHECA:
+            raise ValueError(
+                "Collection protocol is %s, but passed into BibliothecaAPI!" %
+                collection.protocol
+            )
+
+        self._db = _db
+        self.version = (
+            collection.external_integration.setting('version').value or self.DEFAULT_VERSION
+        )
+        self.account_id = collection.external_integration.username
+        self.account_key = collection.external_integration.password
+        self.library_id = collection.external_account_id
+        self.base_url = collection.external_integration.url or self.DEFAULT_BASE_URL
+
+        if not self.account_id or not self.account_key or not self.library_id:
+            raise CannotLoadConfiguration(
+                "Bibliotheca configuration is incomplete."
+            )
+
+        # Use utf8 instead of unicode encoding
+        settings = [self.account_id, self.account_key, self.library_id]
+        self.account_id, self.account_key, self.library_id = (
+            setting.encode('utf8') for setting in settings
+        )
+
+        self.item_list_parser = ItemListParser()
+        self.collection_id = collection.id
+
+    @property
+    def collection(self):
+        return Collection.by_id(self._db, id=self.collection_id)
+
+    @property
+    def source(self):
+        return DataSource.lookup(self._db, DataSource.BIBLIOTHECA)
+
+    def now(self):
+        """Return the current GMT time in the format 3M expects."""
+        return time.strftime(self.AUTH_TIME_FORMAT, time.gmtime())
+
+    def sign(self, method, headers, path):
+        """Add appropriate headers to a request."""
+        authorization, now = self.authorization(method, path)
+        headers[self.DATETIME_HEADER] = now
+        headers[self.VERSION_HEADER] = self.version
+        headers[self.AUTHORIZATION_HEADER] = authorization
+
+    def authorization(self, method, path):
+        signature, now = self.signature(method, path)
+        auth = self.AUTHORIZATION_FORMAT % (self.account_id, signature)
+        return auth, now
+
+    def signature(self, method, path):
+        now = self.now()
+        signature_components = [now, method, path]
+        signature_string = "\n".join(signature_components)
+        digest = hmac.new(self.account_key, msg=signature_string,
+                    digestmod=hashlib.sha256).digest()
+        signature = base64.standard_b64encode(digest)
+        return signature, now
+
+    def full_url(self, path):
+        if not path.startswith("/cirrus"):
+            path = self.full_path(path)
+        return urlparse.urljoin(self.base_url, path)
+
+    def full_path(self, path):
+        if not path.startswith("/"):
+            path = "/" + path
+        if not path.startswith("/cirrus"):
+            path = "/cirrus/library/%s%s" % (self.library_id, path)
+        return path
+
+    @classmethod
+    def replacement_policy(cls, _db, analytics=None):
+        policy = ReplacementPolicy.from_license_source(_db)
+        if analytics:
+            policy.analytics = analytics
+        return policy
+
+    def request(self, path, body=None, method="GET", identifier=None,
+                max_age=None):
+        path = self.full_path(path)
+        url = self.full_url(path)
+        if method == 'GET':
+            headers = {"Accept" : "application/xml"}
+        else:
+            headers = {"Content-Type" : "application/xml"}
+        self.sign(method, headers, path)
+        # print headers
+        # self.log.debug("3M request: %s %s", method, url)
+        if max_age and method=='GET':
+            representation, cached = Representation.get(
+                self._db, url, extra_request_headers=headers,
+                do_get=self._simple_http_get, max_age=max_age,
+                exception_handler=Representation.reraise_exception,
+            )
+            content = representation.content
+            return content
+        else:
+            return self._request_with_timeout(
+                method, url, data=body, headers=headers,
+                allow_redirects=False)
+
+    def get_bibliographic_info_for(self, editions, max_age=None):
+        results = dict()
+        for edition in editions:
+            identifier = edition.primary_identifier
+            metadata = self.bibliographic_lookup(identifier, max_age)
+            if metadata:
+                results[identifier] = (edition, metadata)
+        return results
+
+    def bibliographic_lookup_request(self, identifiers):
+        """Make an HTTP request to look up current bibliographic and
+        circulation information for the given `identifiers`.
+
+        :param identifiers: Strings containing Bibliotheca identifiers.
+        :return: A string containing an XML document, or None if there was
+           an error not handled as an exception.
+        """
+        url = "/items/" + ",".join(identifiers)
+        response = self.request(url)
+        return response.content
+
+    def bibliographic_lookup(self, identifiers):
+        """Look up current bibliographic and circulation information for the
+        given `identifiers`.
+
+        :param identifiers: A list containing either Identifier
+            objects or Bibliotheca identifier strings.
+        """
+        if any(isinstance(identifiers, x) for x in (Identifier, basestring)):
+            identifiers = [identifiers]
+        identifier_strings = []
+        for i in identifiers:
+            if isinstance(i, Identifier):
+                i = i.identifier
+            identifier_strings.append(i)
+
+        data = self.bibliographic_lookup_request(identifier_strings)
+        return [metadata for metadata in self.item_list_parser.parse(data)]
+
+    def _request_with_timeout(self, method, url, *args, **kwargs):
+        """This will be overridden in MockBibliothecaAPI."""
+        return HTTP.request_with_timeout(method, url, *args, **kwargs)
+
+    def _simple_http_get(self, url, headers, *args, **kwargs):
+        """This will be overridden in MockBibliothecaAPI."""
+        return Representation.simple_http_get(url, headers, *args, **kwargs)
+
+    def external_integration(self, _db):
+        return self.collection.external_integration
+
+    def _run_self_tests(self, _db):
+        def _count_events():
+            now = datetime.utcnow()
+            five_minutes_ago = now - timedelta(minutes=5)
+            count = len(list(self.get_events_between(five_minutes_ago, now)))
+            return "Found %d event(s)" % count
+
+        yield self.run_test(
+            "Asking for circulation events for the last five minutes",
+            _count_events
+        )
+
+        for result in self.default_patrons(self.collection):
+            if isinstance(result, SelfTestResult):
+                yield result
+                continue
+            library, patron, pin = result
+            def _count_activity():
+                result = self.patron_activity(patron, pin)
+                return "Found %d loans/holds" % len(result)
+            yield self.run_test(
+                "Checking activity for test patron for library %s" % library.name,
+                _count_activity
+            )
 
     def get_events_between(self, start, end, cache_result=False):
         """Return event objects for events between the given times."""
@@ -109,22 +345,6 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
             raise e
         return events
 
-    def circulation_request(self, identifiers):
-        url = "/circulation/items/" + ",".join(identifiers)
-        response = self.request(url)
-        if response.status_code != 200:
-            raise BadResponseException.bad_status_code(
-                self.full_url(url), response
-            )
-        return response
-
-    def get_circulation_for(self, identifiers):
-        """Return circulation objects for the selected identifiers."""
-        response = self.circulation_request(identifiers)
-        for circ in CirculationParser().process_all(response.content):
-            if circ:
-                yield circ
-
     def update_availability(self, licensepool):
         """Update the availability information for a single LicensePool."""
         monitor = BibliothecaCirculationSweep(
@@ -145,7 +365,7 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
     TEMPLATE = "<%(request_type)s><ItemId>%(item_id)s</ItemId><PatronId>%(patron_id)s</PatronId></%(request_type)s>"
 
     def checkout(
-            self, patron_obj, patron_password, licensepool, 
+            self, patron_obj, patron_password, licensepool,
             delivery_mechanism
     ):
 
@@ -166,11 +386,11 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
         patron_identifier = patron_obj.authorization_identifier
         args = dict(request_type='CheckoutRequest',
                     item_id=bibliotheca_id, patron_id=patron_identifier)
-        body = self.TEMPLATE % args 
+        body = self.TEMPLATE % args
         response = self.request('checkout', body, method="PUT")
         if response.status_code == 201:
             # New loan
-            start_date = datetime.datetime.utcnow()
+            start_date = datetime.utcnow()
         elif response.status_code == 200:
             # Old loan -- we don't know the start date
             start_date = None
@@ -232,24 +452,24 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
     def get_fulfillment_file(self, patron_id, bibliotheca_id):
         args = dict(request_type='ACSMRequest',
                    item_id=bibliotheca_id, patron_id=patron_id)
-        body = self.TEMPLATE % args 
+        body = self.TEMPLATE % args
         return self.request('GetItemACSM', body, method="PUT")
 
     def get_audio_fulfillment_file(self, patron_id, bibliotheca_id):
-        args = dict(request_type='AudioFulfillmentRequest', 
+        args = dict(request_type='AudioFulfillmentRequest',
                     item_id=bibliotheca_id, patron_id=patron_id)
-        body = self.TEMPLATE % args 
+        body = self.TEMPLATE % args
         return self.request('GetItemAudioFulfillment', body, method="POST")
-    
+
     def checkin(self, patron, pin, licensepool):
         patron_id = patron.authorization_identifier
         item_id = licensepool.identifier.identifier
         args = dict(request_type='CheckinRequest',
                    item_id=item_id, patron_id=patron_id)
-        body = self.TEMPLATE % args 
+        body = self.TEMPLATE % args
         return self.request('checkin', body, method="PUT")
 
-    def place_hold(self, patron, pin, licensepool, 
+    def place_hold(self, patron, pin, licensepool,
                    hold_notification_email=None):
         """Place a hold.
 
@@ -259,16 +479,16 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
         item_id = licensepool.identifier.identifier
         args = dict(request_type='PlaceHoldRequest',
                    item_id=item_id, patron_id=patron_id)
-        body = self.TEMPLATE % args 
+        body = self.TEMPLATE % args
         response = self.request('placehold', body, method="PUT")
         if response.status_code in (200, 201):
-            start_date = datetime.datetime.utcnow()
+            start_date = datetime.utcnow()
             end_date = HoldResponseParser().process_all(response.content)
             return HoldInfo(
                 licensepool.collection, DataSource.BIBLIOTHECA,
                 licensepool.identifier.type,
                 licensepool.identifier.identifier,
-                start_date=start_date, 
+                start_date=start_date,
                 end_date=end_date,
                 hold_position=None
             )
@@ -283,90 +503,42 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
 
     def release_hold(self, patron, pin, licensepool):
         patron_id = patron.authorization_identifier
-        item_id = licensepool.identifier.identifier        
+        item_id = licensepool.identifier.identifier
         args = dict(request_type='CancelHoldRequest',
                    item_id=item_id, patron_id=patron_id)
-        body = self.TEMPLATE % args 
+        body = self.TEMPLATE % args
         response = self.request('cancelhold', body, method="PUT")
         if response.status_code in (200, 404):
             return True
         else:
             raise CannotReleaseHold()
 
-    def apply_circulation_information_to_licensepool(self, circ, pool, analytics=None):
-        """Apply the output of CirculationParser.process_one() to a
-        LicensePool.
-        
-        TODO: It should be possible to have CirculationParser yield 
-        CirculationData objects instead and to replace this code with
-        CirculationData.apply(pool)
-        """
-        if pool.presentation_edition:
-            e = pool.presentation_edition
-            self.log.info("Updating %s (%s)", e.title, e.author)
-        else:
-            self.log.info(
-                "Updating unknown work %s", pool.identifier
-            )
-        # Update availability and send out notifications.
-        pool.update_availability(
-            circ.get(LicensePool.licenses_owned, 0),
-            circ.get(LicensePool.licenses_available, 0),
-            circ.get(LicensePool.licenses_reserved, 0),
-            circ.get(LicensePool.patrons_in_hold_queue, 0),
-            analytics,
-        )
-
-    # This URI prefix makes it clear when we are using a term coined
-    # by Findaway in a JSON-LD document.
-    FINDAWAY_EXTENSION_CONTEXT = "http://librarysimplified.org/terms/third-parties/findaway.com/"
-
     @classmethod
     def findaway_license_to_webpub_manifest(
             cls, license_pool, findaway_license
     ):
-        """Convert a Findaway license document to a standard Web Publication
-        Manifest (audiobook flavor).
+        """Convert a Bibliotheca license document to a FindawayManifest
+        suitable for serving to a mobile client.
 
         :param license_pool: A LicensePool for the title in question.
         This will be used to fill in basic bibliographic information.
 
         :param findaway_license: A string containing a Findaway
-           license document, or a dictionary representing such a
-           document loaded into JSON form.
+           license document via Bibliotheca, or a dictionary
+           representing such a document loaded into JSON form.
         """
         if isinstance(findaway_license, basestring):
             findaway_license = json.loads(findaway_license)
 
-        context_with_extension = [
-            "http://readium.org/webpub/default.jsonld",
-            {"findaway" : cls.FINDAWAY_EXTENSION_CONTEXT},
-        ]
-
-        manifest = AudiobookManifest(context=context_with_extension)
-
-        # Add basic bibliographic information (identifier, title,
-        # cover link) to the manifest based on our existing knowledge
-        # of the LicensePool and its Work.
-        manifest.update_bibliographic_metadata(license_pool)
-
-        # Add Findaway-specific DRM information as an 'encrypted' object
-        # within the metadata object.
-        encrypted = dict(
-            scheme='http://librarysimplified.org/terms/drm/scheme/FAE'
-        )
-        manifest.metadata['encrypted'] = encrypted
+        kwargs = {}
         for findaway_extension in [
-                'accountId', 'checkoutId', 'fulfillmentId', 'licenseId',
-                'sessionKey'
+            'accountId', 'checkoutId', 'fulfillmentId', 'licenseId',
+            'sessionKey'
         ]:
             value = findaway_license.get(findaway_extension, None)
-            output_key = 'findaway:' + findaway_extension
-            encrypted[output_key] = value
+            kwargs[findaway_extension] = value
 
-        # Add the spine items. All of them are in the same format.
-        # None of them will have working 'href' fields -- it's just to
-        # give the client a picture of the structure of the timeline.
+        # Create the SpineItem objects.
         audio_format = findaway_license.get('format')
         if audio_format == 'MP3':
             part_media_type = Representation.MP3_MEDIA_TYPE
@@ -375,9 +547,7 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
                           audio_format)
             part_media_type = None
 
-        part_key = 'findaway:part'
-        sequence_key = 'findaway:sequence'
-        total_duration = 0
+        spine_items = []
         for part in findaway_license.get('items'):
             title = part.get('title')
 
@@ -388,27 +558,22 @@ class BibliothecaAPI(BaseBibliothecaAPI, BaseCirculationAPI):
             # needs to be explicitly verified.
             duration = part.get('duration', 0) / 1000.0
 
-            kwargs = {}
+            spine_kwargs = {}
 
             part_number = int(part.get('part', 0))
-            kwargs[part_key] = part_number
 
             sequence = int(part.get('sequence', 0))
-            kwargs[sequence_key] = sequence
 
-            manifest.add_spine(
-                href=None, title=title, duration=duration,
-                type=part_media_type, **kwargs
+            spine_items.append(
+                SpineItem(title, duration, part_number, sequence)
             )
-            total_duration += duration
 
-        # Make sure the spine items are sorted by part (~="part" in a
-        # book) and then sequence (~="chapter" in a book).
-        def sort_key(item):
-            return (item[part_key], item[sequence_key])
-        manifest.spine.sort(key=sort_key)
+        # Create a FindawayManifest object and then convert it
+        # to a string.
+        manifest = FindawayManifest(
+            license_pool=license_pool, spine_items=spine_items, **kwargs
+        )
 
-        manifest.metadata['duration'] = total_duration
         return DeliveryMechanism.FINDAWAY_DRM, unicode(manifest)
 
 
@@ -419,9 +584,273 @@ class DummyBibliothecaAPIResponse(object):
         self.headers = headers
         self.content = content
 
-class MockBibliothecaAPI(BaseMockBibliothecaAPI, BibliothecaAPI):
-    pass
+class MockBibliothecaAPI(BibliothecaAPI):
 
+    @classmethod
+    def mock_collection(self, _db):
+        """Create a mock Bibliotheca collection for use in tests."""
+        library = DatabaseTest.make_default_library(_db)
+        collection, ignore = get_one_or_create(
+            _db, Collection,
+            name="Test Bibliotheca Collection", create_method_kwargs=dict(
+                external_account_id=u'c',
+            )
+        )
+        integration = collection.create_external_integration(
+            protocol=ExternalIntegration.BIBLIOTHECA
+        )
+        integration.username = u'a'
+        integration.password = u'b'
+        integration.url = "http://bibliotheca.test"
+        library.collections.append(collection)
+        return collection
+
+    def __init__(self, _db, collection, *args, **kwargs):
+        self.responses = []
+        self.requests = []
+        super(MockBibliothecaAPI, self).__init__(
+            _db, collection, *args, **kwargs
+        )
+
+    def now(self):
+        """Return an unvarying time in the format Bibliotheca expects."""
+        return datetime.strftime(
+            datetime(2016, 1, 1), self.AUTH_TIME_FORMAT
+        )
+
+    def queue_response(self, status_code, headers={}, content=None):
+        from core.testing import MockRequestsResponse
+        self.responses.insert(
+            0, MockRequestsResponse(status_code, headers, content)
+        )
+
+    def _request_with_timeout(self, method, url, *args, **kwargs):
+        """Simulate HTTP.request_with_timeout."""
+        self.requests.append([method, url, args, kwargs])
+        response = self.responses.pop()
+        return HTTP._process_response(
+            url, response, kwargs.get('allowed_response_codes'),
+            kwargs.get('disallowed_response_codes')
+        )
+
+    def _simple_http_get(self, url, headers, *args, **kwargs):
+        """Simulate Representation.simple_http_get."""
+        response = self._request_with_timeout('GET', url, *args, **kwargs)
+        return response.status_code, response.headers, response.content
+
+class ItemListParser(XMLParser):
+
+    DATE_FORMAT = "%Y-%m-%d"
+    YEAR_FORMAT = "%Y"
+
+    NAMESPACES = {}
+
+    def parse(self, xml):
+        for i in self.process_all(xml, "//Item"):
+            yield i
+
+    parenthetical = re.compile(" \([^)]+\)$")
+
+
+    format_data_for_bibliotheca_format = {
+        "EPUB" : (
+            Representation.EPUB_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM
+        ),
+        "EPUB3" : (
+            Representation.EPUB_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM
+        ),
+        "PDF" : (
+            Representation.PDF_MEDIA_TYPE, DeliveryMechanism.ADOBE_DRM
+        ),
+        "MP3" : (
+            None, DeliveryMechanism.FINDAWAY_DRM
+        ),
+    }
+
+    @classmethod
+    def contributors_from_string(cls, string, role=Contributor.AUTHOR_ROLE):
+        contributors = []
+        if not string:
+            return contributors
+
+        for sort_name in string.split(';'):
+            sort_name = cls.parenthetical.sub("", sort_name.strip())
+            contributors.append(
+                ContributorData(
+                    sort_name=sort_name.strip(),
+                    roles=[role]
+                )
+            )
+        return contributors
+
+    @classmethod
+    def parse_genre_string(self, s):
+        genres = []
+        if not s:
+            return genres
+        for i in s.split(","):
+            i = i.strip()
+            if not i:
+                continue
+            i = i.replace("&amp;amp;", "&amp;").replace("&amp;", "&").replace("&#39;", "'")
+            genres.append(SubjectData(Subject.BISAC, None, i, weight=15))
+        return genres
+
+
+    def process_one(self, tag, namespaces):
+        """Turn an <item> tag into a Metadata and an encompassed CirculationData
+        objects, and return the Metadata."""
+
+        def value(bibliotheca_key):
+            return self.text_of_optional_subtag(tag, bibliotheca_key)
+
+        links = dict()
+        identifiers = dict()
+        subjects = []
+
+        primary_identifier = IdentifierData(
+            Identifier.BIBLIOTHECA_ID, value("ItemId")
+        )
+
+        identifiers = []
+        for key in ('ISBN13', 'PhysicalISBN'):
+            v = value(key)
+            if v:
+                identifiers.append(
+                    IdentifierData(Identifier.ISBN, v)
+                )
+
+        subjects = self.parse_genre_string(value("Genre"))
+
+        title = value("Title")
+        subtitle = value("SubTitle")
+        publisher = value("Publisher")
+        language = value("Language")
+
+        authors = list(self.contributors_from_string(value('Authors')))
+        narrators = list(
+            self.contributors_from_string(
+                value('Narrator'), Contributor.NARRATOR_ROLE
+            )
+        )
+
+        published_date = None
+        published = value("PubDate")
+        if published:
+            formats = [self.DATE_FORMAT, self.YEAR_FORMAT]
+        else:
+            published = value("PubYear")
+            formats = [self.YEAR_FORMAT]
+
+        for format in formats:
+            try:
+                published_date = datetime.strptime(published, format)
+            except ValueError, e:
+                pass
+
+        links = []
+        description = value("Description")
+        if description:
+            links.append(
+                LinkData(rel=Hyperlink.DESCRIPTION, content=description)
+            )
+
+        cover_url = value("CoverLinkURL").replace("&amp;", "&")
+        links.append(LinkData(rel=Hyperlink.IMAGE, href=cover_url))
+
+        alternate_url = value("BookLinkURL").replace("&amp;", "&")
+        links.append(LinkData(rel='alternate', href=alternate_url))
+
+        measurements = []
+        pages = value("NumberOfPages")
+        if pages:
+            pages = int(pages)
+            measurements.append(
+                MeasurementData(quantity_measured=Measurement.PAGE_COUNT,
+                                value=pages)
+            )
+
+        circulation, medium = self._make_circulation_data(
+            tag, namespaces, primary_identifier
+        )
+
+        metadata = Metadata(
+            data_source=DataSource.BIBLIOTHECA,
+            title=title,
+            subtitle=subtitle,
+            language=language,
+            medium=medium,
+            publisher=publisher,
+            published=published_date,
+            primary_identifier=primary_identifier,
+            identifiers=identifiers,
+            subjects=subjects,
+            contributors=authors+narrators,
+            measurements=measurements,
+            links=links,
+            circulation=circulation,
+        )
+        return metadata
+
+    def _make_circulation_data(self, tag, namespaces, primary_identifier):
+        """Parse out a CirculationData containing current circulation
+        and formatting information.
+        """
+
+        def value(bibliotheca_key):
+            return self.text_of_subtag(tag, bibliotheca_key)
+
+        def intvalue(key):
+            return self.int_of_subtag(tag, key)
+
+        book_format = value("BookFormat")
+        medium, formats = self.internal_formats(book_format)
+
+        licenses_owned = intvalue("TotalCopies")
+        try:
+            licenses_available = intvalue("AvailableCopies")
+        except IndexError:
+            logging.warn(
+                "No information on available copies for %s",
+                primary_identifier.identifier
+            )
+            licenses_available = 0
+
+        patrons_in_hold_queue = intvalue("OnHoldCount")
+        licenses_reserved = 0
+
+        circulation = CirculationData(
+            data_source=DataSource.BIBLIOTHECA,
+            primary_identifier=primary_identifier,
+            licenses_owned=licenses_owned,
+            licenses_available=licenses_available,
+            licenses_reserved=licenses_reserved,
+            patrons_in_hold_queue=patrons_in_hold_queue,
+            formats=formats,
+        )
+        return circulation, medium
+
+    @classmethod
+    def internal_formats(cls, book_format):
+        """Convert the term Bibliotheca uses to refer to a book
+        format into a (medium [formats]) 2-tuple.
+        """
+        medium = Edition.BOOK_MEDIUM
+        format = None
+        if book_format not in cls.format_data_for_bibliotheca_format:
+            logging.error("Unrecognized BookFormat: %s", book_format)
+            return medium, []
+
+        content_type, drm_scheme = cls.format_data_for_bibliotheca_format[
+            book_format
+        ]
+
+        format = FormatData(content_type=content_type, drm_scheme=drm_scheme)
+        if book_format == 'MP3':
+            medium = Edition.AUDIO_MEDIUM
+        else:
+            medium = Edition.BOOK_MEDIUM
+        return medium, [format]
 
 class BibliothecaParser(XMLParser):
 
@@ -436,7 +865,7 @@ class BibliothecaParser(XMLParser):
             value = None
         else:
             try:
-                value = datetime.datetime.strptime(
+                value = datetime.strptime(
                     value, self.INPUT_TIME_FORMAT
                 )
             except ValueError, e:
@@ -455,59 +884,9 @@ class BibliothecaParser(XMLParser):
         return self.parse_date(value)
 
 
-class CirculationParser(BibliothecaParser):
-
-    """Parse Bibliotheca's circulation XML dialect into something we can apply to a LicensePool."""
-
-    def process_all(self, string):
-        for i in super(CirculationParser, self).process_all(
-                string, "//ItemCirculation"):
-            yield i
-
-    def process_one(self, tag, namespaces):
-        if not tag.xpath("ItemId"):
-            # This happens for events associated with books
-            # no longer in our collection.
-            return None
-
-        def value(key):
-            return self.text_of_subtag(tag, key)
-
-        def intvalue(key):
-            return self.int_of_subtag(tag, key)
-
-        identifiers = {}
-        item = { Identifier : identifiers }
-
-        identifiers[Identifier.BIBLIOTHECA_ID] = value("ItemId")
-        identifiers[Identifier.ISBN] = value("ISBN13")
-        
-        item[LicensePool.licenses_owned] = intvalue("TotalCopies")
-        try:
-            item[LicensePool.licenses_available] = intvalue("AvailableCopies")
-        except IndexError:
-            logging.warn("No information on available copies for %s",
-                         identifiers[Identifier.BIBLIOTHECA_ID]
-                     )
-
-        # Counts of patrons who have the book in a certain state.
-        for bibliotheca_key, simplified_key in [
-                ("Holds", LicensePool.patrons_in_hold_queue),
-                ("Reserves", LicensePool.licenses_reserved)
-        ]:
-            t = tag.xpath(bibliotheca_key)
-            if t:
-                t = t[0]
-                value = int(t.xpath("count(Patron)"))
-                item[simplified_key] = value
-            else:
-                logging.warn("No circulation information provided for %s %s",
-                             identifiers[Identifier.BIBLIOTHECA_ID], bibliotheca_key)
-        return item
-
-
 class BibliothecaException(Exception):
     pass
+
 
 class WorkflowException(BibliothecaException):
     def __init__(self, actual_status, statuses_that_would_work):
@@ -527,7 +906,7 @@ class ErrorParser(BibliothecaParser):
     loan_limit_reached = re.compile(
         "Patron cannot loan more than [0-9]+ document"
     )
-    
+
     hold_limit_reached = re.compile(
         "Patron cannot have more than [0-9]+ hold"
     )
@@ -629,7 +1008,7 @@ class PatronCirculationParser(BibliothecaParser):
     def __init__(self, collection, *args, **kwargs):
         super(PatronCirculationParser, self).__init__(*args, **kwargs)
         self.collection = collection
-    
+
     def process_all(self, string):
         parser = etree.XMLParser()
         root = etree.parse(StringIO(string), parser)
@@ -663,7 +1042,7 @@ class PatronCirculationParser(BibliothecaParser):
 
         def datevalue(key):
             value = self.text_of_subtag(tag, key)
-            return datetime.datetime.strptime(
+            return datetime.strptime(
                 value, BibliothecaAPI.ARGUMENT_TIME_FORMAT)
 
         identifier = self.text_of_subtag(tag, "ItemId")
@@ -693,7 +1072,7 @@ class DateResponseParser(BibliothecaParser):
         due_date = m[0].text
         if not due_date:
             return None
-        return datetime.datetime.strptime(
+        return datetime.strptime(
                 due_date, EventParser.INPUT_TIME_FORMAT)
 
 
@@ -750,6 +1129,7 @@ class EventParser(BibliothecaParser):
         return (bibliotheca_id, isbn, patron_id, start_time, end_time,
                 internal_event_type)
 
+
 class BibliothecaCirculationSweep(IdentifierSweepMonitor):
     """Check on the current circulation status of each Bibliotheca book in our
     collection.
@@ -758,6 +1138,13 @@ class BibliothecaCirculationSweep(IdentifierSweepMonitor):
     because this monitor and the main Bibliotheca circulation monitor will
     count the same event.  However it will greatly improve our current
     view of our Bibliotheca circulation, which is more important.
+
+    If Bibliotheca has updated its metadata for a book, that update will
+    also take effect during the circulation sweep.
+
+    If a Bibliotheca license has expired, and we didn't hear about it for
+    whatever reason, we'll find out about it here, because Bibliotheca
+    will act like they never heard of it.
     """
     SERVICE_NAME = "Bibliotheca Circulation Sweep"
     DEFAULT_BATCH_SIZE = 25
@@ -772,8 +1159,9 @@ class BibliothecaCirculationSweep(IdentifierSweepMonitor):
             self.api = api_class
         else:
             self.api = api_class(_db, collection)
-        self.analytics = Analytics(_db)
-    
+        self.replacement_policy = BibliothecaAPI.replacement_policy(_db)
+        self.analytics = self.replacement_policy.analytics
+
     def process_items(self, identifiers):
         identifiers_by_bibliotheca_id = dict()
         bibliotheca_ids = set()
@@ -782,13 +1170,10 @@ class BibliothecaCirculationSweep(IdentifierSweepMonitor):
             identifiers_by_bibliotheca_id[identifier.identifier] = identifier
 
         identifiers_not_mentioned_by_bibliotheca = set(identifiers)
-        now = datetime.datetime.utcnow()
-
-        for circ in self.api.get_circulation_for(bibliotheca_ids):
-            if not circ:
-                continue
-            self._process_circulation_data(
-                circ, identifiers_by_bibliotheca_id,
+        now = datetime.utcnow()
+        for metadata in self.api.bibliographic_lookup(bibliotheca_ids):
+            self._process_metadata(
+                metadata, identifiers_by_bibliotheca_id,
                 identifiers_not_mentioned_by_bibliotheca,
             )
 
@@ -800,59 +1185,44 @@ class BibliothecaCirculationSweep(IdentifierSweepMonitor):
             pools = [lp for lp in identifier.licensed_through
                      if lp.data_source.name==DataSource.BIBLIOTHECA
                      and lp.collection == self.collection]
-            if not pools:
+            if pools:
+                [pool] = pools
+            else:
                 continue
-            for pool in pools:
-                if pool.licenses_owned > 0:
-                    if pool.presentation_edition:
-                        self.log.warn("Removing %s (%s) from circulation",
-                                      pool.presentation_edition.title, pool.presentation_edition.author)
-                    else:
-                        self.log.warn(
-                            "Removing unknown work %s from circulation.",
-                            identifier.identifier
-                        )
-                pool.update_availability(0, 0, 0, 0, self.analytics)
-                pool.last_checked = now
+            if pool.licenses_owned > 0:
+                self.log.warn(
+                    "Removing %s from circulation.",
+                    identifier.identifier
+                )
+            pool.update_availability(0, 0, 0, 0, self.analytics, as_of=now)
 
-    def _process_circulation_data(
-        self, circ, identifiers_by_bibliotheca_id, 
+    def _process_metadata(
+        self, metadata, identifiers_by_bibliotheca_id,
         identifiers_not_mentioned_by_bibliotheca
     ):
-        """Process a single CirculationData object retrieved from
-        Bibliotheca.
+        """Process a single Metadata object (containing CirculationData)
+        retrieved from Bibliotheca.
         """
-        bibliotheca_id = circ[Identifier][Identifier.BIBLIOTHECA_ID]
+        bibliotheca_id = metadata.primary_identifier.identifier
         identifier = identifiers_by_bibliotheca_id[bibliotheca_id]
-        identifiers_not_mentioned_by_bibliotheca.remove(identifier)
-        pools = [lp for lp in identifier.licensed_through
-                 if lp.data_source.name==DataSource.BIBLIOTHECA
-                 and lp.collection == self.collection]
-        if not pools:
-            # We don't have a license pool for this work. That
+        if identifier in identifiers_not_mentioned_by_bibliotheca:
+            # Bibliotheca mentioned this identifier. Remove it from
+            # this list so we know the title is still in the collection.
+            identifiers_not_mentioned_by_bibliotheca.remove(identifier)
+
+        edition, is_new = metadata.edition(self._db)
+        pool, is_new = metadata.circulation.license_pool(self._db, self.collection)
+        if is_new:
+            # We didn't have a license pool for this work. That
             # shouldn't happen--how did we know about the
-            # identifier?--but it shouldn't be a big deal to
-            # create one.
-            pool, ignore = LicensePool.for_foreign_id(
-                self._db, self.collection.data_source, identifier.type,
-                identifier.identifier, collection=self.collection
-            )
-
-            # Bibliotheca books are never open-access.
-            pool.open_access = False
-
+            # identifier?--but now we do.
             for library in self.collection.libraries:
                 self.analytics.collect_event(
-                    library, pool, CirculationEvent.DISTRIBUTOR_TITLE_ADD, 
-                    datetime.datetime.utcnow()
+                    library, pool, CirculationEvent.DISTRIBUTOR_TITLE_ADD,
+                    datetime.utcnow()
                 )
-        else:
-            [pool] = pools
-                
-        self.api.apply_circulation_information_to_licensepool(
-            circ, pool, self.analytics
-        )
-
+        edition, ignore = metadata.apply(edition, collection=self.collection,
+                                         replace=self.replacement_policy)
 
 class BibliothecaEventMonitor(CollectionMonitor):
 
@@ -864,7 +1234,7 @@ class BibliothecaEventMonitor(CollectionMonitor):
     But when a new book comes on the scene, this is where we first
     find out about it. When this happens, we create a LicensePool and
     immediately ensure that we get coverage from the
-    BibliothecaBibliographicCoverageProvider. 
+    BibliothecaBibliographicCoverageProvider.
 
     But getting up-to-date circulation data for that new book requires
     either that we process further events, or that we encounter it in
@@ -872,10 +1242,10 @@ class BibliothecaEventMonitor(CollectionMonitor):
     """
 
     SERVICE_NAME = "Bibliotheca Event Monitor"
-    DEFAULT_START_TIME = datetime.timedelta(365*3)
+    DEFAULT_START_TIME = timedelta(365*3)
     PROTOCOL = ExternalIntegration.BIBLIOTHECA
 
-    def __init__(self, _db, collection, api_class=BibliothecaAPI, 
+    def __init__(self, _db, collection, api_class=BibliothecaAPI,
                  cli_date=None, analytics=None):
         self.analytics = analytics or Analytics(_db)
         super(BibliothecaEventMonitor, self).__init__(_db, collection)
@@ -884,8 +1254,11 @@ class BibliothecaEventMonitor(CollectionMonitor):
             self.api = api_class
         else:
             self.api = api_class(_db, collection)
+        self.replacement_policy = BibliothecaAPI.replacement_policy(
+            _db, self.analytics
+        )
         self.bibliographic_coverage_provider = BibliothecaBibliographicCoverageProvider(
-            collection, self.api
+            collection, self.api, replacement_policy=self.replacement_policy
         )
         if cli_date:
             self.default_start_time = self.create_default_start_time(
@@ -898,7 +1271,7 @@ class BibliothecaEventMonitor(CollectionMonitor):
         The command line date argument should have the format YYYY-MM-DD.
         """
         initialized = get_one(_db, Timestamp, service=self.service_name)
-        default_start_time = datetime.datetime.utcnow() - self.DEFAULT_START_TIME
+        default_start_time = datetime.utcnow() - self.DEFAULT_START_TIME
 
         if cli_date:
             try:
@@ -906,7 +1279,7 @@ class BibliothecaEventMonitor(CollectionMonitor):
                     date = cli_date
                 else:
                     date = cli_date[0]
-                return datetime.datetime.strptime(date, "%Y-%m-%d")
+                return datetime.strptime(date, "%Y-%m-%d")
             except ValueError as e:
                 # Date argument wasn't in the proper format.
                 self.log.warn(
@@ -941,7 +1314,7 @@ class BibliothecaEventMonitor(CollectionMonitor):
     def run_once(self, start, cutoff):
         added_books = 0
         i = 0
-        one_day = datetime.timedelta(days=1)
+        one_day = timedelta(days=1)
         most_recent_timestamp = start
         for start, cutoff, full_slice in self.slice_timespan(
                 start, cutoff, one_day):
@@ -978,7 +1351,7 @@ class BibliothecaEventMonitor(CollectionMonitor):
                      start_time, end_time, internal_event_type):
         # Find or lookup the LicensePool for this event.
         license_pool, is_new = LicensePool.for_foreign_id(
-            self._db, self.api.source, Identifier.BIBLIOTHECA_ID, 
+            self._db, self.api.source, Identifier.BIBLIOTHECA_ID,
             bibliotheca_id, collection=self.collection
         )
 
@@ -1026,3 +1399,50 @@ class BibliothecaEventMonitor(CollectionMonitor):
         title = edition.title or "[no title]"
         self.log.info("%r %s: %s", start_time, title, internal_event_type)
         return start_time
+
+class BibliothecaBibliographicCoverageProvider(BibliographicCoverageProvider):
+    """Fill in bibliographic metadata for Bibliotheca records.
+
+    This will occasionally fill in some availability information for a
+    single Collection, but we rely on Monitors to keep availability
+    information up to date for all Collections.
+    """
+    SERVICE_NAME = "Bibliotheca Bibliographic Coverage Provider"
+    DATA_SOURCE_NAME = DataSource.BIBLIOTHECA
+    PROTOCOL = ExternalIntegration.BIBLIOTHECA
+    INPUT_IDENTIFIER_TYPES = Identifier.BIBLIOTHECA_ID
+
+    # 25 is the maximum batch size for the Bibliotheca API.
+    DEFAULT_BATCH_SIZE = 25
+
+    def __init__(self, collection, api_class=BibliothecaAPI, **kwargs):
+        """Constructor.
+
+        :param collection: Provide bibliographic coverage to all
+            Bibliotheca books in the given Collection.
+        :param api_class: Instantiate this class with the given Collection,
+            rather than instantiating BibliothecaAPI.
+        :param input_identifiers: Passed in by RunCoverageProviderScript.
+            A list of specific identifiers to get coverage for.
+        """
+        super(BibliothecaBibliographicCoverageProvider, self).__init__(
+            collection, **kwargs
+        )
+        if isinstance(api_class, BibliothecaAPI):
+            # This is an already instantiated API object. Use it
+            # instead of creating a new one.
+            self.api = api_class
+        else:
+            # A web application should not use this option because it
+            # will put a non-scoped session in the mix.
+            _db = Session.object_session(collection)
+            self.api = api_class(_db, collection)
+
+    def process_item(self, identifier):
+        metadata = self.api.bibliographic_lookup(identifier)
+        if not metadata:
+            return self.failure(
+                identifier, "Bibliotheca bibliographic lookup failed."
+            )
+        [metadata] = metadata
+        return self.set_metadata(identifier, metadata)

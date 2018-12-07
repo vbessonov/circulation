@@ -31,9 +31,9 @@ EXPIRED_CREDENTIALS = pd(
 )
 
 BLOCKED_CREDENTIALS = pd(
-      "http://librarysimplified.org/terms/problem/credentials-expired",
+      "http://librarysimplified.org/terms/problem/credentials-suspended",
       403,
-      _("Expired credentials."),
+      _("Suspended credentials."),
       _("Your library card has been suspended. Contact your branch library."),
 )
 
@@ -315,4 +315,11 @@ INVALID_REGISTRATION = pd(
     status_code=400,
     title=_("Invalid registration"),
     detail=_("You did not submit enough information to register with the collection."),
+)
+
+SHARED_SECRET_DECRYPTION_ERROR = pd(
+    "http://librarysimplified.org/terms/problem/decryption-error",
+    status_code=502,
+    title=_("Decryption error"),
+    detail=_("Failed to decrypt a shared secret retrieved from another computer.")
 )

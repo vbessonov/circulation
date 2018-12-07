@@ -1,8 +1,10 @@
 import base64
+from collections import defaultdict
 import contextlib
 import datetime
 import os
 import re
+import json
 from lxml import etree
 from nose.tools import (
     set_trace,
@@ -12,17 +14,21 @@ from nose.tools import (
 import feedparser
 from . import DatabaseTest
 
+from core.analytics import Analytics
 from core.lane import (
+    FacetsWithEntryPoint,
     Lane,
 )
 from core.model import (
     create,
     get_one_or_create,
+    CirculationEvent,
     ConfigurationSetting,
     Contributor,
     DataSource,
     DeliveryMechanism,
     ExternalIntegration,
+    Hyperlink,
     Library,
     PresentationCalculationPolicy,
     Representation,
@@ -37,10 +43,14 @@ from core.classifier import (
     Urban_Fantasy
 )
 
-from core.external_search import DummyExternalSearchIndex
+from core.entrypoint import (
+    AudiobooksEntryPoint,
+    EverythingEntryPoint,
+)
+from core.external_search import MockExternalSearchIndex
 
 from core.util.opds_writer import (
-    AtomFeed, 
+    AtomFeed,
     OPDSFeed,
 )
 
@@ -90,10 +100,22 @@ class TestCirculationManagerAnnotator(DatabaseTest):
     def test_open_access_link(self):
         # The resource URL associated with a LicensePoolDeliveryMechanism
         # becomes the `href` of an open-access `link` tag.
-        [lpdm] = self.work.license_pools[0].delivery_mechanisms
+        pool = self.work.license_pools[0]
+        [lpdm] = pool.delivery_mechanisms
+
+        # Temporarily disconnect the Resource's Representation so we
+        # can verify that this works even if there is no
+        # Representation.
+        representation = lpdm.resource.representation
+        lpdm.resource.representation = None
         lpdm.resource.url = "http://foo.com/thefile.epub"
-        link_tag = self.annotator.open_access_link(lpdm)
+        link_tag = self.annotator.open_access_link(pool, lpdm)
         eq_(lpdm.resource.url, link_tag.get('href'))
+
+        # The dcterms:rights attribute may provide a more detailed
+        # explanation of the book's copyright status.
+        rights = link_tag.attrib['{http://purl.org/dc/terms/}rights']
+        eq_(lpdm.rights_status.uri, rights)
 
         # If we have a CDN set up for open-access links, the CDN hostname
         # replaces the original hostname.
@@ -101,10 +123,21 @@ class TestCirculationManagerAnnotator(DatabaseTest):
             config[Configuration.INTEGRATIONS][ExternalIntegration.CDN] = {
                 'foo.com' : 'https://cdn.com/'
             }
-            link_tag = self.annotator.open_access_link(lpdm)
+            link_tag = self.annotator.open_access_link(pool, lpdm)
 
         link_url = link_tag.get('href')
         eq_("https://cdn.com/thefile.epub", link_url)
+
+        # If the Resource has a Representation, the public URL is used
+        # instead of the original Resource URL.
+        lpdm.resource.representation = representation
+        link_tag = self.annotator.open_access_link(pool, lpdm)
+        eq_(representation.public_url, link_tag.get('href'))
+
+        # If there is no Representation, the Resource's original URL is used.
+        lpdm.resource.representation = None
+        link_tag = self.annotator.open_access_link(pool, lpdm)
+        eq_(lpdm.resource.url, link_tag.get('href'))
 
     def test_default_lane_url(self):
         default_lane_url = self.annotator.default_lane_url()
@@ -116,6 +149,34 @@ class TestCirculationManagerAnnotator(DatabaseTest):
         assert "feed" in feed_url_fantasy
         assert str(self.lane.id) in feed_url_fantasy
         assert self._default_library.name not in feed_url_fantasy
+
+    def test_navigation_url(self):
+        navigation_url_fantasy = self.annotator.navigation_url(self.lane)
+        assert "navigation" in navigation_url_fantasy
+        assert str(self.lane.id) in navigation_url_fantasy
+
+    def test_rights_attributes(self):
+        m = self.annotator.rights_attributes
+
+        # Given a LicensePoolDeliveryMechanism with a RightsStatus,
+        # rights_attributes creates a dictionary mapping the dcterms:rights
+        # attribute to the URI associated with the RightsStatus.
+        lp = self._licensepool(None)
+        [lpdm] = lp.delivery_mechanisms
+        eq_({"{http://purl.org/dc/terms/}rights":lpdm.rights_status.uri},
+            m(lpdm))
+
+        # If any link in the chain is broken, rights_attributes returns
+        # an empty dictionary.
+        old_uri = lpdm.rights_status.uri
+        lpdm.rights_status.uri = None
+        eq_({}, m(lpdm))
+        lpdm.rights_status.uri = old_uri
+
+        lpdm.rights_status = None
+        eq_({}, m(lpdm))
+
+        eq_({}, m(None))
 
 
 class TestLibraryAnnotator(VendorIDTest):
@@ -157,27 +218,42 @@ class TestLibraryAnnotator(VendorIDTest):
         for rel, value in link_config.iteritems():
             ConfigurationSetting.for_library(rel, self._default_library).value = value
 
+        # Set up settings for navigation links.
+        ConfigurationSetting.for_library(
+            Configuration.WEB_HEADER_LINKS, self._default_library
+        ).value = json.dumps(["http://example.com/1", "http://example.com/2"])
+        ConfigurationSetting.for_library(
+            Configuration.WEB_HEADER_LABELS, self._default_library
+        ).value = json.dumps(["one", "two"])
+
         self.annotator.add_configuration_links(mock_feed)
 
-        # Eight links were added to the "feed"
-        eq_(8, len(mock_feed))
+        # Ten links were added to the "feed"
+        eq_(10, len(mock_feed))
 
         # They are the links we'd expect.
         links = {}
         for link in mock_feed:
             rel = link.attrib['rel']
             href = link.attrib['href']
-            if rel == 'help':
+            if rel == 'help' or rel == 'related':
                 continue # Tested below
             # Check that the configuration value made it into the link.
             eq_(href, link_config[rel])
             eq_("text/html", link.attrib['type'])
-            
+                
         # There are three help links using different protocols.
         help_links = [x.attrib['href'] for x in mock_feed
                       if x.attrib['rel'] == 'help']
         eq_(set(["mailto:help@me", "http://help/", "uri:help"]),
             set(help_links))
+
+        # There are two navigation links.
+        navigation_links = [x for x in mock_feed if x.attrib['rel'] == 'related']
+        eq_(set(["navigation"]), set([x.attrib["role"] for x in navigation_links]))
+        eq_(set(["http://example.com/1", "http://example.com/2"]),
+            set([x.attrib["href"] for x in navigation_links]))
+        eq_(set(["one", "two"]), set([x.attrib["title"] for x in navigation_links]))
 
     def test_top_level_title(self):
         eq_("Test Top Level Title", self.annotator.top_level_title())
@@ -219,11 +295,40 @@ class TestLibraryAnnotator(VendorIDTest):
         default_lane_url = self.annotator.lane_url(None)
         eq_(default_lane_url, self.annotator.default_lane_url())
 
+        facets = dict(entrypoint="Book")
+        default_lane_url = self.annotator.lane_url(None, facets=facets)
+        eq_(default_lane_url, self.annotator.default_lane_url(facets=facets))
+
         groups_url = self.annotator.lane_url(fantasy_lane_with_sublanes)
         eq_(groups_url, self.annotator.groups_url(fantasy_lane_with_sublanes))
 
+        groups_url = self.annotator.lane_url(fantasy_lane_with_sublanes, facets=facets)
+        eq_(groups_url, self.annotator.groups_url(fantasy_lane_with_sublanes, facets=facets))
+
         feed_url = self.annotator.lane_url(fantasy_lane_without_sublanes)
         eq_(feed_url, self.annotator.feed_url(fantasy_lane_without_sublanes))
+
+        feed_url = self.annotator.lane_url(fantasy_lane_without_sublanes, facets=facets)
+        eq_(feed_url, self.annotator.feed_url(fantasy_lane_without_sublanes, facets=facets))
+
+    def test_fulfill_link_issues_only_open_access_links_when_library_does_not_identify_patrons(self):
+
+        # This library doesn't identify patrons.
+        self.annotator.identifies_patrons = False
+
+        # Because of this, normal fulfillment links are not generated.
+        [pool] = self.work.license_pools
+        [lpdm] = pool.delivery_mechanisms
+        eq_(None,
+            self.annotator.fulfill_link(pool, None, lpdm)
+        )
+
+        # However, fulfillment links _can_ be generated with the
+        # 'open-access' link relation.
+        link = self.annotator.fulfill_link(
+            pool, None, lpdm, OPDSFeed.OPEN_ACCESS_REL
+        )
+        eq_(OPDSFeed.OPEN_ACCESS_REL, link.attrib['rel'])
 
     def test_fulfill_link_includes_device_registration_tags(self):
         """Verify that when Adobe Vendor ID delegation is included, the
@@ -235,7 +340,7 @@ class TestLibraryAnnotator(VendorIDTest):
         identifier = pool.identifier
         patron = self._patron()
         old_credentials = list(patron.credentials)
-        
+
         loan, ignore = pool.loan_to(patron, start=datetime.datetime.utcnow())
         adobe_delivery_mechanism, ignore = DeliveryMechanism.lookup(
             self._db, "text/html", DeliveryMechanism.ADOBE_DRM
@@ -254,7 +359,7 @@ class TestLibraryAnnotator(VendorIDTest):
 
         # No new Credential has been associated with the patron.
         eq_(old_credentials, patron.credentials)
-            
+
         # The fulfill link for Adobe DRM includes information
         # on how to get an Adobe ID in the drm:licensor tag.
         link = self.annotator.fulfill_link(
@@ -329,6 +434,10 @@ class TestLibraryAnnotator(VendorIDTest):
         assert "groups" in default_lane_url
         assert str(self.lane.id) not in default_lane_url
 
+        facets = dict(entrypoint="Book")
+        default_lane_url = self.annotator.default_lane_url(facets=facets)
+        assert "entrypoint=Book" in default_lane_url
+
     def test_groups_url(self):
         groups_url_no_lane = self.annotator.groups_url(None)
         assert "groups" in groups_url_no_lane
@@ -338,10 +447,17 @@ class TestLibraryAnnotator(VendorIDTest):
         assert "groups" in groups_url_fantasy
         assert str(self.lane.id) in groups_url_fantasy
 
+        facets = dict(arg="value")
+        groups_url_facets = self.annotator.groups_url(None, facets=facets)
+        assert "arg=value" in groups_url_facets
+
     def test_feed_url(self):
         # A regular Lane.
-        feed_url_fantasy = self.annotator.feed_url(self.lane, dict(), dict())
+        feed_url_fantasy = self.annotator.feed_url(
+            self.lane, dict(facet="value"), dict()
+        )
         assert "feed" in feed_url_fantasy
+        assert "facet=value" in feed_url_fantasy
         assert str(self.lane.id) in feed_url_fantasy
         assert self._default_library.name in feed_url_fantasy
 
@@ -353,9 +469,12 @@ class TestLibraryAnnotator(VendorIDTest):
         assert self._default_library.name in feed_url_contributor
 
     def test_search_url(self):
-        search_url = self.annotator.search_url(self.lane, "query", dict())
+        search_url = self.annotator.search_url(
+            self.lane, "query", dict(), dict(facet="value")
+        )
         assert "search" in search_url
         assert "query" in search_url
+        assert "facet=value" in search_url
         assert str(self.lane.id) in search_url
 
     def test_facet_url(self):
@@ -384,20 +503,153 @@ class TestLibraryAnnotator(VendorIDTest):
         eq_(entry['id'], pool.identifier.urn)
 
         [(alternate, type)] = [(x['href'], x['type']) for x in entry['links'] if x['rel'] == 'alternate']
-        permalink = self.annotator.permalink_for(work, pool, pool.identifier)
+        permalink, permalink_type = self.annotator.permalink_for(
+            work, pool, pool.identifier
+        )
         eq_(alternate, permalink)
         eq_(OPDSFeed.ENTRY_TYPE, type)
+        eq_(permalink_type, type)
 
         # Make sure we are using the 'permalink' controller -- we were using
         # 'work' and that was wrong.
         assert '/host/permalink' in permalink
 
-    def get_parsed_feed(self, works, lane=None):
+    def test_annotate_work_entry(self):
+        lane = self._lane()
+
+        # Create a Work.
+        work = self._work(with_license_pool=True)
+        [pool] = work.license_pools
+        identifier = pool.identifier
+        edition = pool.presentation_edition
+
+        # Try building an entry for this Work with and without
+        # patron authentication turned on -- each setting is valid
+        # but will result in different links being available.
+        linksets = []
+        for auth in (True, False):
+            annotator = LibraryAnnotator(
+                None, lane, self._default_library, test_mode=True,
+                library_identifies_patrons=auth
+            )
+            feed = AcquisitionFeed(self._db, "test", "url", [], annotator)
+            entry = feed._make_entry_xml(work, edition)
+            annotator.annotate_work_entry(
+                work, pool, edition, identifier, feed, entry
+            )
+            parsed = feedparser.parse(etree.tostring(entry))
+            [entry_parsed] = parsed['entries']
+            linksets.append(set([x['rel'] for x in entry_parsed['links']]))
+
+        with_auth, no_auth = linksets
+
+        # Some links are present no matter what.
+        for expect in [u'alternate', u'issues', u'related']:
+            assert expect in with_auth
+            assert expect in no_auth
+
+        # A library with patron authentication offers some additional
+        # links -- one to borrow the book and one to annotate the
+        # book.
+        for expect in [
+                u'http://www.w3.org/ns/oa#annotationservice',
+                u'http://opds-spec.org/acquisition/borrow'
+        ]:
+            assert expect in with_auth
+            assert expect not in no_auth
+
+        # We can also build an entry for a work with no license pool,
+        # but it will have no borrow link.
+        work = self._work(with_license_pool=False)
+        edition = work.presentation_edition
+        identifier = edition.primary_identifier
+
+        annotator = LibraryAnnotator(
+            None, lane, self._default_library, test_mode=True,
+            library_identifies_patrons=True
+        )
+        feed = AcquisitionFeed(self._db, "test", "url", [], annotator)
+        entry = feed._make_entry_xml(work, edition)
+        annotator.annotate_work_entry(
+            work, None, edition, identifier, feed, entry
+        )
+        parsed = feedparser.parse(etree.tostring(entry))
+        [entry_parsed] = parsed['entries']
+        links = set([x['rel'] for x in entry_parsed['links']])
+
+        # These links are still present.
+        for expect in [u'alternate', u'issues', u'related', u'http://www.w3.org/ns/oa#annotationservice']:
+            assert expect in links
+
+        # But the borrow link is gone.
+        assert u'http://opds-spec.org/acquisition/borrow' not in links
+
+        # There are no links to create analytics events for this title,
+        # because the library has no analytics configured.
+        open_book_rel = 'http://librarysimplified.org/terms/rel/analytics/open-book'
+        assert open_book_rel not in links
+
+        # If analytics are configured, a link is added to
+        # create an 'open_book' analytics event for this title.
+        Analytics.GLOBAL_ENABLED = True
+        entry = feed._make_entry_xml(work, edition)
+        annotator.annotate_work_entry(
+            work, None, edition, identifier, feed, entry
+        )
+        parsed = feedparser.parse(etree.tostring(entry))
+        [entry_parsed] = parsed['entries']
+        [analytics_link] = [x['href'] for x in entry_parsed['links']
+                            if x['rel'] == open_book_rel]
+        expect = annotator.url_for(
+            'track_analytics_event',
+            identifier_type=identifier.type,
+            identifier=identifier.identifier,
+            event_type=CirculationEvent.OPEN_BOOK,
+            library_short_name=self._default_library.short_name,
+            _external=True
+        )
+        eq_(expect, analytics_link)
+
+    def test_annotate_feed(self):
+        lane = self._lane()
+        linksets = []
+        for auth in (True, False):
+            annotator = LibraryAnnotator(
+                None, lane, self._default_library, test_mode=True,
+                library_identifies_patrons=auth
+            )
+            feed = AcquisitionFeed(self._db, "test", "url", [], annotator)
+            annotator.annotate_feed(feed, lane)
+            parsed = feedparser.parse(unicode(feed))
+            linksets.append([x['rel'] for x in parsed['feed']['links']])
+
+        with_auth, without_auth = linksets
+
+        # There's always a self link, a search link, and an auth
+        # document link.
+        for rel in (
+                'self', 'search', u'http://opds-spec.org/auth/document'
+        ):
+            assert rel in with_auth
+            assert rel in without_auth
+
+        # But there's only a bookshelf link and an annotation link
+        # when patron authentication is enabled.
+        for rel in (
+                u'http://opds-spec.org/shelf',
+                u'http://www.w3.org/ns/oa#annotationservice'
+        ):
+            assert rel in with_auth
+            assert rel not in without_auth
+
+
+    def get_parsed_feed(self, works, lane=None, **kwargs):
         if not lane:
             lane = self._lane(display_name="Main Lane")
         feed = AcquisitionFeed(
             self._db, "test", "url", works,
-            LibraryAnnotator(None, lane, self._default_library, test_mode=True)
+            LibraryAnnotator(None, lane, self._default_library, test_mode=True,
+                             **kwargs)
         )
         return feedparser.parse(unicode(feed))
 
@@ -481,7 +733,7 @@ class TestLibraryAnnotator(VendorIDTest):
         work.presentation_edition.add_contributor(u'Oprah', Contributor.AUTHOR_ROLE)
         work.calculate_presentation(
             PresentationCalculationPolicy(regenerate_opds_entries=True),
-            DummyExternalSearchIndex()
+            MockExternalSearchIndex()
         )
         [entry] = self.get_parsed_feed([work]).entries
         contributor_links = [l for l in entry.links if l.rel == 'contributor']
@@ -499,7 +751,7 @@ class TestLibraryAnnotator(VendorIDTest):
         self._db.commit()
         work.calculate_presentation(
             PresentationCalculationPolicy(regenerate_opds_entries=True),
-            DummyExternalSearchIndex()
+            MockExternalSearchIndex()
         )
         feed = self.get_parsed_feed([work])
         [entry] = feed.entries
@@ -538,7 +790,7 @@ class TestLibraryAnnotator(VendorIDTest):
         self._external_integration(
             ExternalIntegration.NOVELIST,
             goal=ExternalIntegration.METADATA_GOAL, username=u'library',
-            password=u'sure', libraries=[self._default_library]
+            password=u'sure', libraries=[self._default_library],
         )
 
         feed = self.get_parsed_feed([work])
@@ -552,13 +804,20 @@ class TestLibraryAnnotator(VendorIDTest):
         work = self._work(with_open_access_download=True)
         identifier_str = work.license_pools[0].identifier.identifier
         uri_parts = ['/annotations', identifier_str]
-        rel_with_partials = {
-            'http://www.w3.org/ns/oa#annotationservice' : uri_parts
-        }
+        annotation_rel = 'http://www.w3.org/ns/oa#annotationservice'
+        rel_with_partials = { annotation_rel : uri_parts }
 
         feed = self.get_parsed_feed([work])
         [entry] = feed.entries
         self.assert_link_on_entry(entry, partials_by_rel=rel_with_partials)
+
+        # If the library does not authenticate patrons, no link to the
+        # annotation service is provided.
+        feed = self.get_parsed_feed(
+            [work], library_identifies_patrons=False
+        )
+        [entry] = feed.entries
+        assert annotation_rel not in [x['rel'] for x in entry['links']]
 
     def test_work_entry_includes_updated(self):
         work = self._work(with_open_access_download=True)
@@ -643,7 +902,7 @@ class TestLibraryAnnotator(VendorIDTest):
         parser = OPDSXMLParser()
         licensor = parser._xpath1(tree, "//atom:feed/drm:licensor")
 
-        adobe_patron_identifier = cls._adobe_patron_identifier(patron)
+        adobe_patron_identifier = AuthdataUtility._adobe_patron_identifier(patron)
 
         # The DRM licensing information includes the Adobe vendor ID
         # and the patron's patron identifier for Adobe purposes.
@@ -667,7 +926,7 @@ class TestLibraryAnnotator(VendorIDTest):
         # specific book, that context would otherwise be lost.
         eq_('http://librarysimplified.org/terms/drm/scheme/ACS',
             licensor.attrib['{http://librarysimplified.org/terms/drm}scheme'])
-            
+
         now = datetime.datetime.utcnow()
         tomorrow = now + datetime.timedelta(days=1)
 
@@ -710,7 +969,7 @@ class TestLibraryAnnotator(VendorIDTest):
 
         # One of these availability tags has 'since' but not 'until'.
         # The other one has both.
-        [no_until] = [x for x in availabilities if 'until' not in x.attrib] 
+        [no_until] = [x for x in availabilities if 'until' not in x.attrib]
         eq_(now_s, no_until.attrib['since'])
 
         [has_until] = [x for x in availabilities if 'until' in x.attrib]
@@ -731,7 +990,7 @@ class TestLibraryAnnotator(VendorIDTest):
         assert "simplified:username" in raw
         eq_(patron.username, feed_details['simplified_patron']['simplified:username'])
         eq_(u'987654321', feed_details['simplified_patron']['simplified:authorizationidentifier'])
-        
+
     def test_loans_feed_includes_annotations_link(self):
         patron = self._patron()
         feed_obj = LibraryLoanAndHoldAnnotator.active_loans_for(
@@ -763,7 +1022,7 @@ class TestLibraryAnnotator(VendorIDTest):
 
         # ...but it's empty.
         assert '<entry>' not in unicode(feed_obj)
-        
+
     def test_acquisition_feed_includes_license_information(self):
         work = self._work(with_open_access_download=True)
         pool = work.license_pools[0]
@@ -781,7 +1040,7 @@ class TestLibraryAnnotator(VendorIDTest):
         u = unicode(feed)
         holds_re = re.compile('<opds:holds\W+total="25"\W*/>', re.S)
         assert holds_re.search(u) is not None
-        
+
         copies_re = re.compile('<opds:copies[^>]+available="50"', re.S)
         assert copies_re.search(u) is not None
 
@@ -803,10 +1062,10 @@ class TestLibraryAnnotator(VendorIDTest):
             DeliveryMechanism.STREAMING_TEXT_CONTENT_TYPE, DeliveryMechanism.OVERDRIVE_DRM,
             RightsStatus.IN_COPYRIGHT, None
         )
-        
+
         now = datetime.datetime.utcnow()
         loan, ignore = pool.loan_to(patron, start=now)
-        
+
         feed_obj = LibraryLoanAndHoldAnnotator.active_loans_for(
             None, patron, test_mode=True)
         raw = unicode(feed_obj)
@@ -815,11 +1074,11 @@ class TestLibraryAnnotator(VendorIDTest):
         eq_(1, len(entries))
 
         links = entries[0]['links']
-        
+
         # Before we fulfill the loan, there are fulfill links for all three mechanisms.
         fulfill_links = [link for link in links if link['rel'] == "http://opds-spec.org/acquisition"]
         eq_(3, len(fulfill_links))
-        
+
         eq_(set([mech1.delivery_mechanism.drm_scheme_media_type, mech2.delivery_mechanism.drm_scheme_media_type,
                  OPDSFeed.ENTRY_TYPE]),
             set([link['type'] for link in fulfill_links]))
@@ -836,10 +1095,10 @@ class TestLibraryAnnotator(VendorIDTest):
         eq_(1, len(entries))
 
         links = entries[0]['links']
-        
+
         fulfill_links = [link for link in links if link['rel'] == "http://opds-spec.org/acquisition"]
         eq_(2, len(fulfill_links))
-        
+
         eq_(set([mech1.delivery_mechanism.drm_scheme_media_type,
                  OPDSFeed.ENTRY_TYPE]),
             set([link['type'] for link in fulfill_links]))
@@ -854,7 +1113,7 @@ class TestLibraryAnnotator(VendorIDTest):
             DeliveryMechanism.STREAMING_TEXT_CONTENT_TYPE, DeliveryMechanism.OVERDRIVE_DRM,
             RightsStatus.IN_COPYRIGHT, None
         )
-        
+
         now = datetime.datetime.utcnow()
         loan, ignore = pool.loan_to(patron, start=now)
         fulfillment = FulfillmentInfo(
@@ -872,21 +1131,21 @@ class TestLibraryAnnotator(VendorIDTest):
         eq_(1, len(entries))
 
         links = entries[0]['links']
-        
+
         # The feed for a single fulfillment only includes one fulfill link.
         fulfill_links = [link for link in links if link['rel'] == "http://opds-spec.org/acquisition"]
         eq_(1, len(fulfill_links))
-        
+
         eq_(Representation.TEXT_HTML_MEDIA_TYPE + DeliveryMechanism.STREAMING_PROFILE,
             fulfill_links[0]['type'])
         eq_("http://streaming_link", fulfill_links[0]['href'])
 
 
     def test_drm_device_registration_feed_tags(self):
-        """Check that drm_device_registration_feed_tags returns 
-        a generic drm:licensor tag, except with the drm:scheme attribute 
+        """Check that drm_device_registration_feed_tags returns
+        a generic drm:licensor tag, except with the drm:scheme attribute
         set.
-        """ 
+        """
         self.initialize_adobe(self._default_library)
         annotator = LibraryLoanAndHoldAnnotator(None, None, self._default_library, test_mode=True)
         patron = self._patron()
@@ -902,7 +1161,7 @@ class TestLibraryAnnotator(VendorIDTest):
         # generic tag.
         del feed_tag.attrib[key]
         eq_(etree.tostring(feed_tag), etree.tostring(generic_tag))
-        
+
     def test_borrow_link_raises_unfulfillable_work(self):
         edition, pool = self._edition(with_license_pool=True)
         kindle_mechanism = pool.set_delivery_mechanism(
@@ -915,69 +1174,79 @@ class TestLibraryAnnotator(VendorIDTest):
         identifier = pool.identifier
 
         annotator = LibraryLoanAndHoldAnnotator(None, None, self._default_library, test_mode=True)
-        
+
         # If there's no way to fulfill the book, borrow_link raises
         # UnfulfillableWork.
         assert_raises(
             UnfulfillableWork,
             annotator.borrow_link,
-            identifier, None, [])
+            pool, None, [])
 
         assert_raises(
             UnfulfillableWork,
             annotator.borrow_link,
-            identifier, None, [kindle_mechanism])
+            pool, None, [kindle_mechanism])
 
         # If there's a fulfillable mechanism, everything's fine.
-        link = annotator.borrow_link(identifier, None, [epub_mechanism])
+        link = annotator.borrow_link(pool, None, [epub_mechanism])
         assert link != None
 
         link = annotator.borrow_link(
-            identifier, None, [epub_mechanism, kindle_mechanism]
+            pool, None, [epub_mechanism, kindle_mechanism]
         )
         assert link != None
 
     def test_feed_includes_lane_links(self):
-        lane = self._lane()
-        annotator = LibraryAnnotator(None, lane, self._default_library, test_mode=True)
-        feed = AcquisitionFeed(
-            self._db, "test", "url", [], annotator
-        )
-        annotator.annotate_feed(feed, lane)
-        raw = unicode(feed)
-        parsed = feedparser.parse(raw)['feed']
-        links = parsed['links']
+        def annotated_links(lane, annotator):
+            # Create an AcquisitionFeed is using the given Annotator.
+            # extract its links and return a dictionary that maps link
+            # relations to URLs.
+            feed = AcquisitionFeed(self._db, "test", "url", [], annotator)
+            annotator.annotate_feed(feed, lane)
+            raw = unicode(feed)
+            parsed = feedparser.parse(raw)['feed']
+            links = parsed['links']
 
-        [search_link] = [x for x in links if x['rel'].lower() == "search".lower()]
-        assert '/lane_search' in search_link['href']
-        assert str(lane.id) in search_link['href']
+            d = defaultdict(list)
+            for link in links:
+                d[link['rel'].lower()].append(link['href'])
+            return d
+
+        # When an EntryPoint is explicitly selected, it shows up in the
+        # link to the search controller.
+        facets = FacetsWithEntryPoint(entrypoint=AudiobooksEntryPoint)
+        lane = self._lane()
+        annotator = LibraryAnnotator(
+            None, lane, self._default_library, test_mode=True, facets=facets
+        )
+        [url] = annotated_links(lane, annotator)['search']
+        assert '/lane_search' in url
+        assert 'entrypoint=%s' % AudiobooksEntryPoint.INTERNAL_NAME in url
+        assert str(lane.id) in url
+
+        # When the selected EntryPoint is a default, it's not used --
+        # instead, we search everything.
+        annotator.facets.entrypoint_is_default = True
+        links = annotated_links(lane, annotator)
+        [url] = links['search']
+        assert 'entrypoint=%s' % EverythingEntryPoint.INTERNAL_NAME in url
 
         # This lane isn't based on a custom list, so there's no crawlable link.
-        crawlable_links = [x for x in links if x['rel'].lower() == "http://opds-spec.org/crawlable".lower()]
-        eq_(0, len(crawlable_links))
+        eq_([], links["http://opds-spec.org/crawlable"])
 
         # It's also not crawlable if it's based on multiple lists.
         list1, ignore = self._customlist()
         list2, ignore = self._customlist()
         lane.customlists = [list1, list2]
-        annotator.annotate_feed(feed, lane)
-        raw = unicode(feed)
-        parsed = feedparser.parse(raw)['feed']
-        links = parsed['links'] 
-        # This lane isn't based on a custom list, so there's no crawlable link.
-        crawlable_links = [x for x in links if x['rel'].lower() == "http://opds-spec.org/crawlable".lower()]
-        eq_(0, len(crawlable_links))
+        links = annotated_links(lane, annotator)
+        eq_([], links["http://opds-spec.org/crawlable"])
 
-        # But if it's based on one list, it gets a crawlable link.
+        # A lane based on a single list gets a crawlable link.
         lane.customlists = [list1]
-        annotator.annotate_feed(feed, lane)
-        raw = unicode(feed)
-        parsed = feedparser.parse(raw)['feed']
-        links = parsed['links'] 
-
-        [crawlable_link] = [x for x in links if x['rel'].lower() == "http://opds-spec.org/crawlable".lower()]
-        assert '/crawlable_list_feed' in crawlable_link['href']
-        assert str(list1.name) in crawlable_link['href']
+        links = annotated_links(lane, annotator)
+        [crawlable] = links['http://opds-spec.org/crawlable']
+        assert '/crawlable_list_feed' in crawlable
+        assert str(list1.name) in crawlable
 
     def test_acquisition_links(self):
         annotator = LibraryLoanAndHoldAnnotator(None, None, self._default_library, test_mode=True)
@@ -997,7 +1266,7 @@ class TestLibraryAnnotator(VendorIDTest):
         # Loan of a licensed book.
         work2 = self._work(with_license_pool=True)
         loan2, ignore = work2.license_pools[0].loan_to(patron, start=now, end=tomorrow)
-        
+
         # Hold on a licensed book.
         work3 = self._work(with_license_pool=True)
         hold, ignore = work3.license_pools[0].on_hold_to(patron, start=now, end=tomorrow)
@@ -1013,7 +1282,7 @@ class TestLibraryAnnotator(VendorIDTest):
         eq_('http://librarysimplified.org/terms/rel/revoke', revoke.attrib.get("rel"))
         assert "fulfill" in fulfill.attrib.get("href")
         eq_('http://opds-spec.org/acquisition', fulfill.attrib.get("rel"))
-        eq_(work1.license_pools[0].delivery_mechanisms[0].resource.url, open_access.attrib.get("href"))
+        assert 'fulfill' in open_access.attrib.get("href")
         eq_('http://opds-spec.org/acquisition/open-access', open_access.attrib.get("rel"))
 
         loan2_links = annotator.acquisition_links(
@@ -1041,6 +1310,43 @@ class TestLibraryAnnotator(VendorIDTest):
         assert "borrow" in borrow.attrib.get("href")
         eq_('http://opds-spec.org/acquisition/borrow', borrow.attrib.get("rel"))
 
+        # If patron authentication is turned off for the library, then
+        # only open-access links are displayed.
+        annotator.identifies_patrons = False
+
+        [open_access] = annotator.acquisition_links(
+            loan1.license_pool, loan1, None, None, feed, loan1.license_pool.identifier)
+        eq_('http://opds-spec.org/acquisition/open-access', open_access.attrib.get("rel"))
+
+        # This may include links with the open-access relation for
+        # non-open-access works that are available without
+        # authentication.  To get such link, you pass in a list of
+        # LicensePoolDeliveryMechanisms as
+        # `direct_fufillment_delivery_mechanisms`.
+        [lp4] = work4.license_pools
+        [lpdm4] = lp4.delivery_mechanisms
+        lpdm4.set_rights_status(RightsStatus.IN_COPYRIGHT)
+        [not_open_access] = annotator.acquisition_links(
+            lp4, None, None, None, feed, lp4.identifier,
+            direct_fulfillment_delivery_mechanisms=[lpdm4]
+        )
+
+        # The link relation is OPDS 'open-access', which just means the
+        # book can be downloaded with no hassle.
+        eq_('http://opds-spec.org/acquisition/open-access', not_open_access.attrib.get("rel"))
+
+        # The dcterms:rights attribute provides a more detailed
+        # explanation of the book's copyright status -- note that it's
+        # not "open access" in the typical sense.
+        rights = not_open_access.attrib['{http://purl.org/dc/terms/}rights']
+        eq_(RightsStatus.IN_COPYRIGHT, rights)
+
+        # Hold links are absent even when there are active holds in the
+        # database -- there is no way to distinguish one patron from
+        # another so the concept of a 'hold' is meaningless.
+        hold_links = annotator.acquisition_links(
+            hold.license_pool, None, hold, None, feed, hold.license_pool.identifier)
+        eq_([], hold_links)
 
 class TestSharedCollectionAnnotator(DatabaseTest):
     def setup(self):
@@ -1077,7 +1383,7 @@ class TestSharedCollectionAnnotator(DatabaseTest):
         given feed or entry, as well as its link 'type' value and parts
         of its 'href' value.
         """
-        def get_link_by_rel(rel):
+        def get_link_by_rel(rel, should_exist=True):
             try:
                 [link] = [x for x in entry['links'] if x['rel']==rel]
             except ValueError as e:
@@ -1115,8 +1421,15 @@ class TestSharedCollectionAnnotator(DatabaseTest):
         feed = self.get_parsed_feed([open_access_work, licensed_work])
         [open_access_entry, licensed_entry] = feed.entries
 
-        self.assert_link_on_entry(open_access_entry, rels=[OPDSFeed.BORROW_REL])
+        self.assert_link_on_entry(open_access_entry, rels=[Hyperlink.OPEN_ACCESS_DOWNLOAD])
         self.assert_link_on_entry(licensed_entry, rels=[OPDSFeed.BORROW_REL])
+
+        # The open access entry shouldn't have a borrow link, and the licensed entry
+        # shouldn't have an open access link.
+        links = [x for x in open_access_entry['links'] if x['rel']==OPDSFeed.BORROW_REL]
+        eq_(0, len(links))
+        links = [x for x in licensed_entry['links'] if x['rel']==Hyperlink.OPEN_ACCESS_DOWNLOAD]
+        eq_(0, len(links))
 
     def test_borrow_link_raises_unfulfillable_work(self):
         edition, pool = self._edition(with_license_pool=True)
@@ -1130,25 +1443,25 @@ class TestSharedCollectionAnnotator(DatabaseTest):
         identifier = pool.identifier
 
         annotator = SharedCollectionLoanAndHoldAnnotator(self.collection, None, test_mode=True)
-        
+
         # If there's no way to fulfill the book, borrow_link raises
         # UnfulfillableWork.
         assert_raises(
             UnfulfillableWork,
             annotator.borrow_link,
-            identifier, None, [])
+            pool, None, [])
 
         assert_raises(
             UnfulfillableWork,
             annotator.borrow_link,
-            identifier, None, [kindle_mechanism])
+            pool, None, [kindle_mechanism])
 
         # If there's a fulfillable mechanism, everything's fine.
-        link = annotator.borrow_link(identifier, None, [epub_mechanism])
+        link = annotator.borrow_link(pool, None, [epub_mechanism])
         assert link != None
 
         link = annotator.borrow_link(
-            identifier, None, [epub_mechanism, kindle_mechanism]
+            pool, None, [epub_mechanism, kindle_mechanism]
         )
         assert link != None
 
@@ -1170,7 +1483,7 @@ class TestSharedCollectionAnnotator(DatabaseTest):
         # Loan of a licensed book.
         work2 = self._work(with_license_pool=True)
         loan2, ignore = work2.license_pools[0].loan_to(client, start=now, end=tomorrow)
-        
+
         # Hold on a licensed book.
         work3 = self._work(with_license_pool=True)
         hold, ignore = work3.license_pools[0].on_hold_to(client, start=now, end=tomorrow)
@@ -1186,7 +1499,7 @@ class TestSharedCollectionAnnotator(DatabaseTest):
         eq_('http://librarysimplified.org/terms/rel/revoke', revoke.attrib.get("rel"))
         assert "shared_collection_fulfill" in fulfill.attrib.get("href")
         eq_('http://opds-spec.org/acquisition', fulfill.attrib.get("rel"))
-        eq_(work1.license_pools[0].delivery_mechanisms[0].resource.url, open_access.attrib.get("href"))
+        eq_(work1.license_pools[0].delivery_mechanisms[0].resource.representation.mirror_url, open_access.attrib.get("href"))
         eq_('http://opds-spec.org/acquisition/open-access', open_access.attrib.get("rel"))
         assert 'shared_collection_loan_info' in info.attrib.get("href")
         eq_("self", info.attrib.get("rel"))
@@ -1219,8 +1532,3 @@ class TestSharedCollectionAnnotator(DatabaseTest):
         [borrow] = work4_links
         assert "shared_collection_borrow" in borrow.attrib.get("href")
         eq_('http://opds-spec.org/acquisition/borrow', borrow.attrib.get("rel"))
-
-            
-        
-
-

@@ -90,6 +90,7 @@ class FirstBookAuthenticationAPI(BasicAuthenticationProvider):
             urllib.quote, (barcode, pin)
         ))
         try:
+            self.log.error("FIRSTBOOK REQUEST %s", url)
             response = self.request(url)
         except requests.exceptions.ConnectionError, e:
             raise RemoteInitiatedServerError(

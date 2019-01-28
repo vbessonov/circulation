@@ -124,10 +124,13 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
 
     def _run_self_tests(self, _db):
 
+        now = datetime.datetime.utcnow()
+
         def count_loans_and_holds():
             """Count recent circulation events that affected loans or holds.
             """
-            count = len(list(self.recent_activity(minutes=60)))
+            one_hour_ago = now - datetime.timedelta(hours=1)
+            count = len(list(self.recent_activity(since=one_hour_ago)))
             return "%s circulation events in the last hour" % count
 
         yield self.run_test(
@@ -139,8 +142,9 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
             """Count changes to title metadata (usually because of
             new titles).
             """
+            one_day_ago = now - datetime.timedelta(hours=24)
             return "%s titles added/updated in the last day" % (
-                len(list(self.updated_titles(minutes=60*24)))
+                len(list(self.updated_titles(since=one_day_ago)))
             )
 
         yield self.run_test(
@@ -350,7 +354,14 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         response = self.request(url, method='get', params=args)
         return response
 
-    def fulfill(self, patron, pin, licensepool, internal_format):
+    def fulfill(self, patron, pin, licensepool, internal_format, **kwargs):
+        """Get the actual resource file to the patron.
+
+        :param kwargs: A container for arguments to fulfill()
+           which are not relevant to this vendor.
+
+        :return: a FulfillmentInfo object.
+        """
         book_id = licensepool.identifier.identifier
         response = self.loan_request(patron.authorization_identifier, pin, book_id)
         if response.status_code != 200:

@@ -5,6 +5,7 @@ import os
 import base64
 import random
 import json
+import jwt
 import re
 import urllib
 import urlparse
@@ -163,8 +164,6 @@ def setup_admin_controllers(manager):
     manager.admin_library_settings_controller = LibrarySettingsController(manager)
     from api.admin.controller.individual_admin_settings import IndividualAdminSettingsController
     manager.admin_individual_admin_settings_controller = IndividualAdminSettingsController(manager)
-    from api.admin.controller.sitewide_registration import SitewideRegistrationController
-    manager.admin_sitewide_registration_controller = SitewideRegistrationController(manager)
     from api.admin.controller.sitewide_services import *
     manager.admin_sitewide_services_controller = SitewideServicesController(manager)
     manager.admin_logging_services_controller = LoggingServicesController(manager)
@@ -1811,6 +1810,22 @@ class LanesController(AdminCirculationManagerController):
         create_default_lanes(self._db, flask.request.library)
         return Response(unicode(_("Success")), 200)
 
+    def change_order(self):
+        self.require_library_manager(flask.request.library)
+
+        submitted_lanes = json.loads(flask.request.data)
+
+        def update_lane_order(lanes):
+            for index, lane_data in enumerate(lanes):
+                lane_id = lane_data.get("id")
+                lane = self._db.query(Lane).filter(Lane.id==lane_id).one()
+                lane.priority = index
+                update_lane_order(lane_data.get("sublanes", []))
+
+        update_lane_order(submitted_lanes)
+
+        return Response(unicode(_("Success")), 200)
+
 
 class DashboardController(AdminCirculationManagerController):
 
@@ -2234,7 +2249,7 @@ class SettingsController(AdminCirculationManagerController):
                     "The configuration value for %(setting)s is invalid.",
                     setting=setting.get("label"),
                 ))
-        if not value and setting.get("required") and not setting.get("default"):
+        if not value and setting.get("required") and not "default" in setting.keys():
             return INCOMPLETE_CONFIGURATION.detailed(
                 _("The configuration is missing a required setting: %(setting)s",
                   setting=setting.get("label")))
@@ -2493,6 +2508,11 @@ class SettingsController(AdminCirculationManagerController):
             if error:
                 return error
 
+    def _value(self, field):
+        # Extract the user's input for this field. If this is a sitewide setting,
+        # then the input needs to be accessed via "value" rather than via the setting's key.
+        return flask.request.form.get(field.get("key")) or flask.request.form.get("value")
+
     def validate_email(self, settings):
         """Find any email addresses that the user has submitted, and make sure that
         they are in a valid format.
@@ -2503,9 +2523,9 @@ class SettingsController(AdminCirculationManagerController):
         # to validate.
         if isinstance(settings, (list,)):
             # Find the fields that have to do with email addresses and are not blank
-            email_fields = filter(lambda s: s.get("format") == "email" and flask.request.form.get(s.get("key")), settings)
+            email_fields = filter(lambda s: s.get("format") == "email" and self._value(s), settings)
             # Narrow the email-related fields down to the ones for which the user actually entered a value
-            email_inputs = [flask.request.form.get(field.get("key")) for field in email_fields]
+            email_inputs = [self._value(field) for field in email_fields]
             # Now check that each email input is in a valid format
         else:
         # If the IndividualAdminSettingsController is calling this method, then we already have the
@@ -2524,31 +2544,25 @@ class SettingsController(AdminCirculationManagerController):
         """Find any URLs that the user has submitted, and make sure that
         they are in a valid format."""
         # Find the fields that have to do with URLs and are not blank.
-        # If this is a sitewide setting, then the user input needs to be accessed
-        # via "value" rather than via the setting's key.
-        url_fields = filter(lambda s: s.get("format") == "url" and
-                            (flask.request.form.get(s.get("key")) or flask.request.form.get("value"))
-                            , settings)
-        # Narrow the URL-related fields down to the ones for which the user actually entered a value
-        url_inputs = [(flask.request.form.get(field.get("key")) or flask.request.form.get("value")) for field in url_fields]
+        url_fields = filter(lambda s: s.get("format") == "url" and self._value(s), settings)
 
-        for url in url_inputs:
-            if not self._is_url(url):
+        for field in url_fields:
+            url = self._value(field)
+            # In a few special cases, we want to allow a value that isn't a normal URL;
+            # for example, the patron web client URL can be set to "*".
+            allowed = field.get("allowed") or []
+            if not self._is_url(url, allowed):
                 return INVALID_URL.detailed(_('"%(url)s" is not a valid URL.', url=url))
 
-    def _is_url(self, url):
-        return any([url.startswith(protocol + "://") for protocol in "http", "https"])
+    def _is_url(self, url, allowed):
+        has_protocol = any([url.startswith(protocol + "://") for protocol in "http", "https"])
+        return has_protocol or (url in allowed)
 
     def validate_number(self, settings):
         """Find any numbers that the user has submitted, and make sure that they are 1) actually numbers,
         2) positive, and 3) lower than the specified maximum, if there is one."""
         # Find the fields that should have numeric input and are not blank.
-        number_fields = filter(
-                            lambda s: ("number" in [s.get("type"), s.get("format")]) and
-                            (flask.request.form.get(s.get("key")) or flask.request.form.get("value"))
-                            , settings
-                        )
-
+        number_fields = filter(lambda s: s.get("type") == "number" and self._value(s), settings)
         for field in number_fields:
             if self._number_error(field):
                 return self._number_error(field)
@@ -2570,18 +2584,171 @@ class SettingsController(AdminCirculationManagerController):
 
     def validate_language_code(self, settings):
         # Find the fields that should contain language codes and are not blank.
-        language_fields = filter(lambda s: s.get("format") == "language-code" and
-                            (flask.request.form.get(s.get("key")))
-                            , settings)
-        # Get the language codes that the user entered; this produces a nested list.
-        language_inputs = [flask.request.form.getlist(field.get("key")) for field in language_fields]
-        # Flatten the nested list of language codes so that it can be iterated over.
-        flattened_list = [language for list in language_inputs for language in list]
-
-        for language in flattened_list:
-            if language and not self._is_language(language):
+        language_fields = filter(lambda s: s.get("format") == "language-code" and self._value(s), settings)
+        # Get the language codes that the user entered.
+        language_inputs = [self._value(field) for field in language_fields]
+        for language in language_inputs:
+            if not self._is_language(language):
                 return UNKNOWN_LANGUAGE.detailed(_('"%(language)s" is not a valid language code.', language=language))
 
     def _is_language(self, language):
         # Check that the input string is in the list of recognized language codes.
         return LanguageCodes.string_to_alpha_3(language)
+
+
+class SitewideRegistrationController(SettingsController):
+    """A controller for managing a circulation manager's registrations
+    with external services.
+
+    Currently the only supported site-wide registration is with a
+    metadata wrangler. The protocol for registration with library
+    registries and ODL collections is similar, but those registrations
+    happen on the level of the individual library, not on the level of
+    the circulation manager.
+    """
+
+    def process_sitewide_registration(self, integration, do_get=HTTP.debuggable_get,
+                              do_post=HTTP.debuggable_post
+    ):
+        """Performs a sitewide registration for a particular service.
+
+        :return: A ProblemDetail or, if successful, None
+        """
+
+        self.require_system_admin()
+
+        if not integration:
+            return MISSING_SERVICE
+
+        catalog_response = self.get_catalog(do_get, integration.url)
+        if isinstance(catalog_response, ProblemDetail):
+            return catalog_response
+
+        if isinstance(self.check_content_type(catalog_response), ProblemDetail):
+            return self.check_content_type(catalog_response)
+
+        catalog = catalog_response.json()
+        links = catalog.get('links', [])
+
+        register_url = self.get_registration_link(catalog, links)
+        if isinstance(register_url, ProblemDetail):
+            return register_url
+
+        headers = self.update_headers(integration)
+        if isinstance(headers, ProblemDetail):
+            return headers
+
+        response = self.register(register_url, headers, do_post)
+        if isinstance(response, ProblemDetail):
+            return response
+
+        shared_secret = self.get_shared_secret(response)
+        if isinstance(shared_secret, ProblemDetail):
+            return shared_secret
+
+        ignore, private_key = self.manager.sitewide_key_pair
+        decryptor = Configuration.cipher(private_key)
+        shared_secret = decryptor.decrypt(base64.b64decode(shared_secret))
+        integration.password = unicode(shared_secret)
+
+    def get_catalog(self, do_get, url):
+        """Get the catalog for this service."""
+
+        try:
+            response = do_get(url)
+        except Exception as e:
+            return REMOTE_INTEGRATION_FAILED.detailed(e.message)
+
+        if isinstance(response, ProblemDetail):
+            return response
+        return response
+
+    def check_content_type(self, catalog_response):
+        """Make sure the catalog for the service is in a valid format."""
+
+        content_type = catalog_response.headers.get('Content-Type')
+        if content_type != 'application/opds+json':
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _('The service did not provide a valid catalog.')
+            )
+
+    def get_registration_link(self, catalog, links):
+        """Get the link for registration from the catalog."""
+
+        register_link_filter = lambda l: (
+            l.get('rel')=='register' and
+            l.get('type')==self.METADATA_SERVICE_URI_TYPE
+        )
+
+        register_urls = filter(register_link_filter, links)
+        if not register_urls:
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _('The service did not provide a register link.')
+            )
+
+        # Get the full registration url.
+        register_url = register_urls[0].get('href')
+        if not register_url.startswith('http'):
+            # We have a relative path. Create a full registration url.
+            base_url = catalog.get('id')
+            register_url = urlparse.urljoin(base_url, register_url)
+
+        return register_url
+
+    def update_headers(self, integration):
+        """If the integration has an existing shared_secret, use it to access the
+        server and update it."""
+
+        # NOTE: This is no longer technically necessary since we prove
+        # ownership with a signed JWT.
+        headers = { 'Content-Type' : 'application/x-www-form-urlencoded' }
+        if integration.password:
+            token = base64.b64encode(integration.password.encode('utf-8'))
+            headers['Authorization'] = 'Bearer ' + token
+        return headers
+
+    def register(self, register_url, headers, do_post):
+        """Register this server using the sitewide registration document."""
+
+        try:
+            body = self.sitewide_registration_document()
+            response = do_post(
+                register_url, body, allowed_response_codes=['2xx'],
+                headers=headers
+            )
+        except Exception as e:
+            return REMOTE_INTEGRATION_FAILED.detailed(e.message)
+        return response
+
+    def get_shared_secret(self, response):
+        """Find the shared secret which we need to use in order to register this
+        service, or return an error message if there is no shared secret."""
+
+        registration_info = response.json()
+        shared_secret = registration_info.get('metadata', {}).get('shared_secret')
+
+        if not shared_secret:
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _('The service did not provide registration information.')
+            )
+        return shared_secret
+
+    def sitewide_registration_document(self):
+        """Generate the document to be sent as part of a sitewide registration
+        request.
+
+        :return: A dictionary with keys 'url' and 'jwt'. 'url' is the URL to
+            this site's public key document, and 'jwt' is a JSON Web Token
+            proving control over that URL.
+        """
+
+        public_key, private_key = self.manager.sitewide_key_pair
+        # Advertise the public key so that the foreign site can encrypt
+        # things for us.
+        public_key_dict = dict(type='RSA', value=public_key)
+        public_key_url = self.url_for('public_key_document')
+        in_one_minute = datetime.utcnow() + timedelta(seconds=60)
+        payload = {'exp': in_one_minute}
+        # Sign a JWT with the private key to prove ownership of the site.
+        token = jwt.encode(payload, private_key, algorithm='RS256')
+        return dict(url=public_key_url, jwt=token)

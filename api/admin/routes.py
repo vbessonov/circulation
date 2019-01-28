@@ -625,12 +625,13 @@ def lane_hide(lane_identifier):
 def reset_lanes():
     return app.manager.admin_lanes_controller.reset()
 
-@app.route('/admin/sitewide_registration', methods=['POST'])
+@library_route("/admin/lanes/change_order", methods=["POST"])
+@has_library
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
-def sitewide_registration():
-    return app.manager.admin_sitewide_registration_controller.process_sitewide_registration()
+def change_lane_order():
+    return app.manager.admin_lanes_controller.change_order()
 
 @app.route('/admin/sign_in_again')
 def admin_sign_in_again():

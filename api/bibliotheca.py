@@ -414,7 +414,14 @@ class BibliothecaAPI(BaseCirculationAPI, HasSelfTests):
         )
         return loan
 
-    def fulfill(self, patron, password, pool, internal_delivery):
+    def fulfill(self, patron, password, pool, internal_delivery, **kwargs):
+        """Get the actual resource file to the patron.
+
+        :param kwargs: A container for standard arguments to fulfill()
+           which are not relevant to this implementation.
+
+        :return: a FulfillmentInfo object.
+        """
         media_type, drm_scheme = self.internal_format_to_delivery_mechanism.get(
             internal_delivery, internal_delivery
         )
@@ -557,8 +564,6 @@ class BibliothecaAPI(BaseCirculationAPI, HasSelfTests):
             # assumption is in the right order of magnitude. But this
             # needs to be explicitly verified.
             duration = part.get('duration', 0) / 1000.0
-
-            spine_kwargs = {}
 
             part_number = int(part.get('part', 0))
 

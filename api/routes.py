@@ -1,5 +1,6 @@
 from nose.tools import set_trace
 from functools import wraps, update_wrapper
+import logging
 import os
 
 import flask
@@ -40,7 +41,13 @@ def initialize_circulation_manager():
         pass
     else:
         if getattr(app, 'manager', None) is None:
-            app.manager = CirculationManager(app._db)
+            try:
+                app.manager = CirculationManager(app._db)
+            except Exception, e:
+                logging.error(
+                    "Error instantiating circulation manager!", exc_info=e
+                )
+                raise e
             # Make sure that any changes to the database (as might happen
             # on initial setup) are committed before continuing.
             app.manager._db.commit()
@@ -364,11 +371,12 @@ def borrow(identifier_type, identifier, mechanism_id=None):
 
 @library_route('/works/<license_pool_id>/fulfill')
 @library_route('/works/<license_pool_id>/fulfill/<mechanism_id>')
+@library_route('/works/<license_pool_id>/fulfill/<mechanism_id>/<part>')
 @has_library
 @allows_patron_web
 @returns_problem_detail
-def fulfill(license_pool_id, mechanism_id=None):
-    return app.manager.loans.fulfill(license_pool_id, mechanism_id)
+def fulfill(license_pool_id, mechanism_id=None, part=None):
+    return app.manager.loans.fulfill(license_pool_id, mechanism_id, part)
 
 @library_route('/loans/<license_pool_id>/revoke', methods=['GET', 'PUT'])
 @has_library

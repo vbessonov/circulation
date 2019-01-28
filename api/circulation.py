@@ -782,7 +782,7 @@ class CirculationAPI(object):
             # impact on implementation signatures. Most vendor APIs
             # will ignore one or more of these arguments.
             fulfillment = api.fulfill(
-                patron, pin, licensepool, internal_format=internal_format,
+                patron, pin, licensepool, format_type=internal_format,
                 part=part, fulfill_part_url=fulfill_part_url
             )
             if not fulfillment or not (

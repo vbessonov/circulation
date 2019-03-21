@@ -168,6 +168,7 @@ class TestViewController(AdminControllerTest):
     def test_redirect_to_sign_in(self):
         with self.app.test_request_context('/admin/web/collection/a/(b)/book/c/(d)'):
             response = self.manager.admin_view_controller("a/(b)", "c/(d)")
+            eq_("test", response)
             eq_(302, response.status_code)
             location = response.headers.get("Location")
             assert "sign_in" in location

@@ -335,7 +335,8 @@ class ViewController(AdminController):
                     redirect_url = redirect_url.replace(
                         quoted_book,
                         quoted_book.replace("/", "%2F"))
-                return redirect(self.url_for('admin_sign_in', redirect=redirect_url))
+                
+                return self.url_for('admin_sign_in', redirect=redirect_url)
 
             if not collection and not book and not path:
                 if self._db.query(Library).count() > 0:

@@ -172,6 +172,7 @@ class TestViewController(AdminControllerTest):
             location = response.headers.get("Location")
             assert "sign_in" in location
             assert "admin%2Fweb" in location
+            eq_("test", location)
             assert "collection%2Fa%2F%28b%29" in location
             assert "book%2Fc%2F%28d%29" in location
 

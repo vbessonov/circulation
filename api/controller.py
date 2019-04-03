@@ -143,7 +143,7 @@ from adobe_vendor_id import (
 )
 from circulation import CirculationAPI
 from shared_collection import SharedCollectionAPI
-from odl import ODLWithConsolidatedCopiesAPI
+from odl import ODLAPI
 from novelist import (
     NoveListAPI,
     MockNoveListAPI,
@@ -776,7 +776,7 @@ class OPDSFeedController(CirculationManagerController):
             collection_name=collection.name
         )
         lane = CrawlableCollectionBasedLane(None, [collection])
-        if collection.protocol in [ODLWithConsolidatedCopiesAPI.NAME]:
+        if collection.protocol in [ODLAPI.NAME]:
             annotator = SharedCollectionAnnotator(collection, lane)
         else:
             annotator = CirculationManagerAnnotator(lane)
@@ -868,13 +868,17 @@ class OPDSFeedController(CirculationManagerController):
 
         annotator = self.manager.annotator(lane, facets)
         info = OpenSearchDocument.search_info(lane)
+        search_engine = self.manager.external_search
+        if not search_engine:
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _("The search index for this site is not properly configured.")
+            )
         opds_feed = AcquisitionFeed.search(
             _db=self._db, title=info['name'],
-            url=this_url, lane=lane, search_engine=self.manager.external_search,
+            url=this_url, lane=lane, search_engine=search_engine,
             query=query, annotator=annotator, pagination=pagination,
             facets=facets,
         )
-
         return feed_response(opds_feed)
 
 class MARCRecordController(CirculationManagerController):
@@ -1615,7 +1619,7 @@ class WorkController(CirculationManagerController):
             lane = RecommendationLane(
                 library, work, lane_name, novelist_api=novelist_api
             )
-        except ValueError, e:
+        except CannotLoadConfiguration, e:
             # NoveList isn't configured.
             return NO_SUCH_LANE.detailed(_("Recommendations not available"))
 
@@ -1780,7 +1784,7 @@ class ODLNotificationController(CirculationManagerController):
             return NO_ACTIVE_LOAN.detailed(_("No loan was found for this identifier."))
 
         collection = loan.license_pool.collection
-        if collection.protocol != ODLWithConsolidatedCopiesAPI.NAME:
+        if collection.protocol != ODLAPI.NAME:
             return INVALID_LOAN_FOR_ODL_NOTIFICATION
 
         api = self.manager.circulation_apis[library.id].api_for_license_pool(loan.license_pool)

@@ -417,6 +417,13 @@ def patron_auth_services():
 def patron_auth_service(service_id):
     return app.manager.admin_patron_auth_services_controller.process_delete(service_id)
 
+@app.route("/admin/patron_authentication_service_self_tests/<identifier>", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def patron_auth_self_tests(identifier):
+    return app.manager.admin_patron_auth_service_self_tests_controller.process_patron_auth_service_self_tests(identifier)
+
 @library_route("/admin/manage_patrons", methods=['POST'])
 @has_library
 @returns_json_or_response_or_problem_detail
@@ -467,6 +474,13 @@ def analytics_service(service_id):
 @requires_csrf_token
 def cdn_services():
     return app.manager.admin_cdn_services_controller.process_cdn_services()
+
+@app.route("/admin/search_service_self_tests/<identifier>", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def search_service_self_tests(identifier):
+    return app.manager.admin_search_service_self_tests_controller.process_search_service_self_tests(identifier)
 
 @app.route("/admin/cdn_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail

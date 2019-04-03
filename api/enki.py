@@ -31,6 +31,7 @@ from core.util.http import (
 from core.model import (
     CirculationEvent,
     Collection,
+    ConfigurationSetting,
     DataSource,
     DeliveryMechanism,
     Edition,
@@ -58,6 +59,7 @@ from core.monitor import (
     Monitor,
     IdentifierSweepMonitor,
     CollectionMonitor,
+    TimelineMonitor,
 )
 
 from core.analytics import Analytics
@@ -68,11 +70,15 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
 
     PRODUCTION_BASE_URL = "https://enkilibrary.org/API/"
 
+    ENKI_LIBRARY_ID_KEY = u'enki_library_id'
     DESCRIPTION = _("Integrate an Enki collection.")
     SETTINGS = [
-        { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID"), "required": True },
         { "key": ExternalIntegration.URL, "label": _("URL"), "default": PRODUCTION_BASE_URL, "required": True, "format": "url" },
     ] + BaseCirculationAPI.SETTINGS
+
+    LIBRARY_SETTINGS = [
+        { "key": ENKI_LIBRARY_ID_KEY, "label": _("Library ID"), "required": True },
+    ]
 
     list_endpoint = "ListAPI"
     item_endpoint = "ItemAPI"
@@ -107,16 +113,18 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
             )
 
         self.collection_id = collection.id
-        self.library_id = collection.external_account_id
         self.base_url = collection.external_integration.url or self.PRODUCTION_BASE_URL
-
-        if not self.library_id or not self.base_url:
-            raise CannotLoadConfiguration(
-                "Enki configuration is incomplete."
-            )
 
     def external_integration(self, _db):
         return self.collection.external_integration
+
+    def enki_library_id(self, library):
+        """Find the Enki library ID for the given library."""
+        _db = Session.object_session(library)
+        return ConfigurationSetting.for_library_and_externalintegration(
+            _db, self.ENKI_LIBRARY_ID_KEY, library,
+            self.external_integration(_db)
+        ).value
 
     @property
     def collection(self):
@@ -219,7 +227,6 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         args = dict(
             method='getRecentActivity',
             minutes=minutes,
-            lib=self.library_id
         )
         response = self.request(url, params=args)
         data = json.loads(response.content)
@@ -246,7 +253,9 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
             method='getUpdateTitles',
             minutes=minutes,
             id='secontent',
-            lib=self.library_id
+            lib='0', # This is a stand-in value -- it doesn't matter
+                     # which library we ask about since they all have
+                     # the same collection.
         )
         response = self.request(url, params=args)
         for metadata in BibliographicParser().process_all(response.content):
@@ -264,8 +273,10 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         args = dict(
             method="getItem",
             recordid=enki_id,
-            lib=self.library_id,
             size="large",
+            lib='0', # This is a stand-in value -- it doesn't matter
+                     # which library we ask about since they all have
+                     # the same collection.
         )
         response = self.request(url, params=args)
         try:
@@ -295,7 +306,6 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         args['id'] = "secontent"
         args['strt'] = strt
         args['qty'] = qty
-        args['lib'] = self.library_id
         response = self.request(url, params=args)
         for metadata in BibliographicParser().process_all(response.content):
             yield metadata
@@ -313,7 +323,11 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
     def checkout(self, patron, pin, licensepool, internal_format):
         identifier = licensepool.identifier
         enki_id = identifier.identifier
-        response = self.loan_request(patron.authorization_identifier, pin, enki_id)
+        enki_library_id = self.enki_library_id(patron.library)
+        response = self.loan_request(
+            patron.authorization_identifier, pin, enki_id,
+            enki_library_id
+        )
         if response.status_code != 200:
             raise CannotLoan(response.status_code)
         result = json.loads(response.content)['result']
@@ -341,14 +355,14 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         )
         return loan
 
-    def loan_request(self, barcode, pin, book_id):
+    def loan_request(self, barcode, pin, book_id, enki_library_id):
         self.log.debug ("Sending checkout request for %s" % book_id)
         url = str(self.base_url) + str(self.user_endpoint)
         args = dict()
         args['method'] = "getSELink"
         args['username'] = barcode
         args['password'] = pin
-        args['lib'] = self.library_id
+        args['lib'] = enki_library_id
         args['id'] = book_id
 
         response = self.request(url, method='get', params=args)
@@ -363,7 +377,10 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         :return: a FulfillmentInfo object.
         """
         book_id = licensepool.identifier.identifier
-        response = self.loan_request(patron.authorization_identifier, pin, book_id)
+        enki_library_id = self.enki_library_id(patron.library)
+        response = self.loan_request(
+            patron.authorization_identifier, pin, book_id, enki_library_id
+        )
         if response.status_code != 200:
             raise CannotFulfill(response.status_code)
         result = json.loads(response.content)['result']
@@ -409,7 +426,10 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
         return (url, item_type, expires)
 
     def patron_activity(self, patron, pin):
-        response = self.patron_request(patron.authorization_identifier, pin)
+        enki_library_id = self.enki_library_id(patron.library)
+        response = self.patron_request(
+            patron.authorization_identifier, pin, enki_library_id
+        )
         if response.status_code != 200:
             raise PatronNotFoundOnRemote(response.status_code)
         result = json.loads(response.content).get('result', {})
@@ -429,14 +449,14 @@ class EnkiAPI(BaseCirculationAPI, HasSelfTests):
             for hold in holds:
                 yield self.parse_patron_holds(hold)
 
-    def patron_request(self, patron, pin):
+    def patron_request(self, patron, pin, enki_library_id):
         self.log.debug ("Querying Enki for information on patron %s" % patron)
         url = str(self.base_url) + str(self.user_endpoint)
         args = dict()
         args['method'] = "getSEPatronData"
         args['username'] = patron
         args['password'] = pin
-        args['lib'] = self.library_id
+        args['lib'] = enki_library_id
 
         return self.request(url, method='get', params=args)
 
@@ -476,9 +496,16 @@ class MockEnkiAPI(EnkiAPI):
                 _db, name="Test Enki Collection", protocol=EnkiAPI.ENKI
             )
             collection.protocol=EnkiAPI.ENKI
-            collection.external_account_id=u'c';
         if collection not in library.collections:
             library.collections.append(collection)
+
+        # Set the "Enki library ID" variable between the default library
+        # and this Enki collection.
+        ConfigurationSetting.for_library_and_externalintegration(
+            _db, self.ENKI_LIBRARY_ID_KEY, library,
+            collection.external_integration
+        ).value = 'c'
+
         super(MockEnkiAPI, self).__init__(
             _db, collection, *args, **kwargs
         )
@@ -665,7 +692,7 @@ class BibliographicParser(object):
         return circulationdata
 
 
-class EnkiImport(CollectionMonitor):
+class EnkiImport(CollectionMonitor, TimelineMonitor):
     """Make sure our local collection is up-to-date with the remote
     Enki collection.
     """
@@ -692,26 +719,36 @@ class EnkiImport(CollectionMonitor):
     def collection(self):
         return Collection.by_id(self._db, id=self.collection_id)
 
-    def run_once(self, start, cutoff):
+    def catch_up_from(self, start, cutoff, progress):
+        """Find Enki books that changed recently.
+
+        :param start: Find all books that changed since this date.
+        """
         if start is None:
             # This is the first time the monitor has run, so it's
             # important that we get the entire collection, even though that
             # will take a long time.
-            self.full_import()
+            new_titles = self.full_import()
+            circulation_updates = 0
         else:
             # We've run the monitor before, so we just need to learn
             # about new titles and circulation changes since the last time.
             #
             # Give us five minutes of overlap because it's very important
             # we don't miss anything.
-            since = start-self.FIVE_MINUTES
+            new_titles, circulation_updates = self.incremental_import(start)
 
-            self.incremental_import(since)
+        progress.achievements = (
+            "New or modified titles: %d. Titles with circulation changes: %d." % (
+                new_titles, circulation_updates
+            )
+        )
 
     def full_import(self):
         """Import the entire Enki collection, page by page."""
         id_start = 0
         batch_size = self.DEFAULT_BATCH_SIZE
+        total_items = 0
         while True:
             items_this_page = 0
             for bibliographic in self.api.get_all_titles(
@@ -719,26 +756,33 @@ class EnkiImport(CollectionMonitor):
             ):
                 self.process_book(bibliographic)
                 items_this_page += 1
+                total_items += 1
             self._db.commit()
             if items_this_page == 0:
                 # When we get an empty page we know it's time to stop.
                 break
             id_start += self.DEFAULT_BATCH_SIZE
+        return total_items
 
     def incremental_import(self, since):
         # Take care of new titles and titles with updated metadata.
+        new_titles = 0
         for metadata in self.api.updated_titles(since):
             self.process_book(metadata)
+            new_titles += 1
         self._db.commit()
 
         # Take care of titles whose circulation status changed.
-        self.update_circulation(since)
+        circulation_changes = self.update_circulation(since)
         self._db.commit()
+        return new_titles, circulation_changes
 
     def update_circulation(self, since):
         """Process circulation events that happened since `since`."""
+        circulation_changes = 0
         for circulation in self.api.recent_activity(since):
-            license_pool, made_changes = circulation.apply(
+            circulation_changes += 1
+            license_pool, is_new = circulation.license_pool(
                 self._db, self.collection
             )
             if not license_pool.work:
@@ -749,6 +793,12 @@ class EnkiImport(CollectionMonitor):
                 metadata = self.api.get_item(license_pool.identifier.identifier)
                 if metadata:
                     self.process_book(metadata)
+            else:
+                license_pool, made_changes = circulation.apply(
+                    self._db, self.collection
+                )
+
+        return circulation_changes
 
     def process_book(self, bibliographic):
 
@@ -762,30 +812,20 @@ class EnkiImport(CollectionMonitor):
         presentation-ready Work will be created for the LicensePool.
         """
         availability = bibliographic.circulation
-        license_pool, new_license_pool = availability.license_pool(
-            self._db, self.collection
-        )
-        now = datetime.datetime.utcnow()
         edition, new_edition = bibliographic.edition(self._db)
-        license_pool.edition = edition
+        now = datetime.datetime.utcnow()
         policy = ReplacementPolicy(
             identifiers=False,
             subjects=True,
             contributions=True,
             formats=True,
         )
-        availability.apply(
-            self._db,
-            license_pool.collection,
-            replace=policy,
-        )
         bibliographic.apply(edition, self.collection, replace=policy)
-        if not license_pool.work:
-            work, is_new = license_pool.calculate_work()
-            if work:
-                work.set_presentation_ready()
+        license_pool, ignore = availability.license_pool(
+            self._db, self.collection
+        )
 
-        if new_license_pool or new_edition:
+        if new_edition:
             for library in self.collection.libraries:
                 self.analytics.collect_event(library, license_pool, CirculationEvent.DISTRIBUTOR_TITLE_ADD, now)
 

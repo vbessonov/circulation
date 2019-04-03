@@ -120,8 +120,8 @@ from api.opds_for_distributors import (
     OPDSForDistributorsReaperMonitor,
 )
 from api.odl import (
-    ODLBibliographicImporter,
-    ODLBibliographicImportMonitor,
+    ODLImporter,
+    ODLImportMonitor,
     SharedODLImporter,
     SharedODLImportMonitor,
 )
@@ -1679,23 +1679,28 @@ class NovelistSnapshotScript(TimestampScript, LibraryInputScript):
 
     def do_run(self, output=sys.stdout, *args, **kwargs):
         parsed = self.parse_command_line(self._db, *args, **kwargs)
-        api = NoveListAPI.from_config(parsed.libraries[0])
-        if (api):
-            response = api.put_items_novelist(parsed.libraries[0])
+        for library in parsed.libraries:
+            try:
+                api = NoveListAPI.from_config(library)
+            except CannotLoadConfiguration as e:
+                self.log.info(e.message)
+                continue
+            if (api):
+                response = api.put_items_novelist(library)
 
-            if (response):
-                result = "NoveList API Response\n"
-                result += str(response)
+                if (response):
+                    result = "NoveList API Response\n"
+                    result += str(response)
 
-                output.write(result)
+                    output.write(result)
 
-class ODLBibliographicImportScript(OPDSImportScript):
-    """Import bibliographic information from the feed associated
+class ODLImportScript(OPDSImportScript):
+    """Import information from the feed associated
     with an ODL collection."""
 
-    IMPORTER_CLASS = ODLBibliographicImporter
-    MONITOR_CLASS = ODLBibliographicImportMonitor
-    PROTOCOL = ODLBibliographicImporter.NAME
+    IMPORTER_CLASS = ODLImporter
+    MONITOR_CLASS = ODLImportMonitor
+    PROTOCOL = ODLImporter.NAME
 
 class SharedODLImportScript(OPDSImportScript):
     IMPORTER_CLASS = SharedODLImporter

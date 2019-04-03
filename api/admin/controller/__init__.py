@@ -23,6 +23,7 @@ from api.authenticator import (
     CannotCreateLocalPatron,
     PatronData,
 )
+from core.external_search import ExternalSearchIndex
 from core.model import (
     create,
     get_one,
@@ -113,7 +114,7 @@ from api.bibliotheca import BibliothecaAPI
 from api.axis import Axis360API
 from api.rbdigital import RBDigitalAPI
 from api.enki import EnkiAPI
-from api.odl import ODLWithConsolidatedCopiesAPI, SharedODLAPI
+from api.odl import ODLAPI, SharedODLAPI
 from core.local_analytics_provider import LocalAnalyticsProvider
 
 from api.adobe_vendor_id import AuthdataUtility
@@ -140,6 +141,8 @@ def setup_admin_controllers(manager):
     manager.admin_dashboard_controller = DashboardController(manager)
     manager.admin_settings_controller = SettingsController(manager)
     manager.admin_patron_controller = PatronController(manager)
+    from api.admin.controller.self_tests import SelfTestsController
+    manager.admin_self_tests_controller = SelfTestsController(manager)
     from api.admin.controller.discovery_services import DiscoveryServicesController
     manager.admin_discovery_services_controller = DiscoveryServicesController(manager)
     from api.admin.controller.discovery_service_library_registrations import DiscoveryServiceLibraryRegistrationsController
@@ -152,6 +155,8 @@ def setup_admin_controllers(manager):
     manager.admin_metadata_services_controller = MetadataServicesController(manager)
     from api.admin.controller.patron_auth_services import PatronAuthServicesController
     manager.admin_patron_auth_services_controller = PatronAuthServicesController(manager)
+    from api.admin.controller.patron_auth_service_self_tests import PatronAuthServiceSelfTestsController
+    manager.admin_patron_auth_service_self_tests_controller = PatronAuthServiceSelfTestsController(manager)
     from api.admin.controller.admin_auth_services import AdminAuthServicesController
     manager.admin_auth_services_controller = AdminAuthServicesController(manager)
     from api.admin.controller.collection_settings import CollectionSettingsController
@@ -169,11 +174,12 @@ def setup_admin_controllers(manager):
     from api.admin.controller.sitewide_services import *
     manager.admin_sitewide_services_controller = SitewideServicesController(manager)
     manager.admin_logging_services_controller = LoggingServicesController(manager)
+    from api.admin.controller.search_service_self_tests import SearchServiceSelfTestsController
+    manager.admin_search_service_self_tests_controller = SearchServiceSelfTestsController(manager)
     manager.admin_search_services_controller = SearchServicesController(manager)
     manager.admin_storage_services_controller = StorageServicesController(manager)
     from api.admin.controller.catalog_services import *
     manager.admin_catalog_services_controller = CatalogServicesController(manager)
-
 
 class AdminController(object):
 
@@ -1996,8 +2002,11 @@ class DashboardController(AdminCirculationManagerController):
                     join(
                         Hold,
                         Patron,
-                        Patron.id == Hold.patron_id,
-                        Patron.library_id == library.id,
+                        and_(
+                            Patron.id == Hold.patron_id,
+                            Patron.library_id == library.id,
+                            Hold.id != None,
+                        )
                     )
                 )
             ).alias()
@@ -2193,7 +2202,7 @@ class SettingsController(AdminCirculationManagerController):
                      Axis360API,
                      RBDigitalAPI,
                      EnkiAPI,
-                     ODLWithConsolidatedCopiesAPI,
+                     ODLAPI,
                      SharedODLAPI,
                      FeedbooksOPDSImporter,
                     ]
@@ -2266,7 +2275,6 @@ class SettingsController(AdminCirculationManagerController):
         services = []
         for service in self._db.query(ExternalIntegration).filter(
             ExternalIntegration.goal==goal):
-
             candidates = [p for p in protocols if p.get("name") == service.protocol]
             if not candidates:
                 continue
@@ -2288,16 +2296,18 @@ class SettingsController(AdminCirculationManagerController):
                         key, service).value
                 settings[key] = value
 
-            services.append(
-                dict(
-                    id=service.id,
-                    name=service.name,
-                    protocol=service.protocol,
-                    settings=settings,
-                    libraries=libraries,
-                )
+            service_info = dict(
+                id=service.id,
+                name=service.name,
+                protocol=service.protocol,
+                settings=settings,
+                libraries=libraries,
             )
 
+            if "test_search_term" in [x.get("key") for x in protocol.get("settings")]:
+                service_info["self_test_results"] = self._get_prior_test_results(service)
+
+            services.append(service_info)
         return services
 
     def _set_integration_setting(self, integration, setting):
@@ -2390,43 +2400,63 @@ class SettingsController(AdminCirculationManagerController):
 
         return protocols
 
+    def _get_prior_test_results(self, item, protocol_class=None):
+        # :param item: An ExternalSearchIndex, an ExternalIntegration for patron authentication, or a Collection
+        if not protocol_class and hasattr(self, "protocol_class"):
+            protocol_class = self.protocol_class
 
-    def _get_prior_test_results(self, collection, protocolClass):
-        """This helper function returns previous self test results for a given
-        collection if it has a protocol.  Used by both SelfTestsController and
-        CollectionSettingsController
-        """
-        provider_apis = list(self.PROVIDER_APIS)
-        provider_apis.append(OPDSImportMonitor)
-
-        self_test_results = None
-        protocol = protocolClass
-
-        if not collection or not collection.protocol:
+        if not item:
             return None
 
-        if collection.protocol == OPDSImportMonitor.PROTOCOL:
-            protocol = OPDSImportMonitor
-
         self_test_results = None
-        if protocol in provider_apis and issubclass(protocol, HasSelfTests):
-            if (collection.protocol == OPDSImportMonitor.PROTOCOL):
-                extra_args = (OPDSImporter,)
-            else:
-                extra_args = ()
-            try:
-                self_test_results = protocol.prior_test_results(
-                    self._db, protocol, self._db, collection, *extra_args
+
+        try:
+            if self.type == "collection":
+                if not item.protocol or not len(item.protocol):
+                    return None
+                provider_apis = list(self.PROVIDER_APIS)
+                provider_apis.append(OPDSImportMonitor)
+
+                if item.protocol == OPDSImportMonitor.PROTOCOL:
+                    protocol_class = OPDSImportMonitor
+
+                if protocol_class in provider_apis and issubclass(protocol_class, HasSelfTests):
+                    if (item.protocol == OPDSImportMonitor.PROTOCOL):
+                        extra_args = (OPDSImporter,)
+                    else:
+                        extra_args = ()
+
+                    self_test_results = protocol_class.prior_test_results(
+                        self._db, protocol_class, self._db, item, *extra_args
+                    )
+
+            elif self.type == "search service":
+                self_test_results = ExternalSearchIndex.prior_test_results(
+                    self._db, None, self._db, item
                 )
-            except Exception, e:
-                # This is bad, but not so bad that we should short-circuit
-                # this whole process -- that might prevent an admin from
-                # making the configuration changes necessary to fix
-                # this problem.
-                message = _("Exception getting self-test results for collection %s: %s")
-                args = (collection.name, e.message)
-                logging.warn(message, *args, exc_info=e)
-                self_test_results = dict(exception=message % args)
+
+            elif self.type == "patron authentication service":
+                library = None
+                if len(item.libraries):
+                    library = item.libraries[0]
+                    self_test_results = protocol_class.prior_test_results(
+                        self._db, None, library, item
+                    )
+                else:
+                    self_test_results = dict(
+                        exception=_("You must associate this service with at least one library before you can run self tests for it."),
+                        disabled=True
+                    )
+
+        except Exception, e:
+            # This is bad, but not so bad that we should short-circuit
+            # this whole process -- that might prevent an admin from
+            # making the configuration changes necessary to fix
+            # this problem.
+            message = _("Exception getting self-test results for %s %s: %s")
+            args = (self.type, item.name, e.message)
+            logging.warn(message, *args, exc_info=e)
+            self_test_results = dict(exception=message % args)
 
         return self_test_results
 
@@ -2531,7 +2561,7 @@ class SettingsController(AdminCirculationManagerController):
         service = get_one(self._db, ExternalIntegration, id=id, goal=goal)
         if not service:
             return MISSING_SERVICE
-        if protocol != service.protocol:
+        if protocol and (protocol != service.protocol):
             return CANNOT_CHANGE_PROTOCOL
         return service
 
@@ -2579,7 +2609,15 @@ class SettingsController(AdminCirculationManagerController):
     def _value(self, field):
         # Extract the user's input for this field. If this is a sitewide setting,
         # then the input needs to be accessed via "value" rather than via the setting's key.
-        return flask.request.form.get(field.get("key")) or flask.request.form.get("value")
+        # We use getlist instead of get so that, if the field is such that the user can input multiple values
+        # (e.g. language codes), we'll extract all the values, not just the first one.
+
+        value = flask.request.form.getlist(field.get("key"))
+        if not value:
+            return flask.request.form.get("value")
+        elif len(value) == 1:
+            return value[0]
+        return value
 
     def validate_email(self, settings):
         """Find any email addresses that the user has submitted, and make sure that
@@ -2653,16 +2691,20 @@ class SettingsController(AdminCirculationManagerController):
     def validate_language_code(self, settings):
         # Find the fields that should contain language codes and are not blank.
         language_fields = filter(lambda s: s.get("format") == "language-code" and self._value(s), settings)
-        # Get the language codes that the user entered.
-        language_inputs = [self._value(field) for field in language_fields]
-        for language in language_inputs:
+
+        for language in self._list_of_values(language_fields):
             if not self._is_language(language):
                 return UNKNOWN_LANGUAGE.detailed(_('"%(language)s" is not a valid language code.', language=language))
 
     def _is_language(self, language):
-        # Check that the input string is in the list of recognized language codes.
+        # Check that the input string is in the list of recognized languages or language codes.
         return LanguageCodes.string_to_alpha_3(language)
 
+    def _list_of_values(self, fields):
+        result = []
+        for field in fields:
+            result += self._value(field)
+        return filter(None, result)
 
 class SitewideRegistrationController(SettingsController):
     """A controller for managing a circulation manager's registrations

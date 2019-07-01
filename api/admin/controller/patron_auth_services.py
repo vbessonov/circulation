@@ -7,6 +7,7 @@ from . import SettingsController
 from api.authenticator import AuthenticationProvider
 from api.simple_authentication import SimpleAuthenticationProvider
 from api.millenium_patron import MilleniumPatronAPI
+from api.kansas_patron import KansasAuthenticationAPI
 from api.sip import SIP2AuthenticationProvider
 from api.firstbook import FirstBookAuthenticationAPI as OldFirstBookAuthenticationAPI
 from api.firstbook2 import FirstBookAuthenticationAPI
@@ -29,6 +30,7 @@ class PatronAuthServicesController(SettingsController):
                          FirstBookAuthenticationAPI,
                          OldFirstBookAuthenticationAPI,
                          CleverAuthenticationAPI,
+                         KansasAuthenticationAPI
                         ]
         self.protocols = self._get_integration_protocols(self.provider_apis)
 
@@ -37,6 +39,7 @@ class PatronAuthServicesController(SettingsController):
                                 SIP2AuthenticationProvider.__module__,
                                 FirstBookAuthenticationAPI.__module__,
                                 OldFirstBookAuthenticationAPI.__module__,
+                                KansasAuthenticationAPI.__module__,
                                ]
         self.type = _("patron authentication service")
 
@@ -62,9 +65,9 @@ class PatronAuthServicesController(SettingsController):
     def process_post(self):
         protocol = flask.request.form.get("protocol")
         is_new = False
-        error = self.validate_form_fields(protocol)
-        if error:
-            return error
+        protocol_error = self.validate_form_fields(protocol)
+        if protocol_error:
+            return protocol_error
 
         id = flask.request.form.get("id")
         if id:
@@ -81,6 +84,11 @@ class PatronAuthServicesController(SettingsController):
             )
             if isinstance(auth_service, ProblemDetail):
                 return auth_service
+
+        format_error = self.validate_formats()
+        if format_error:
+            self._db.rollback()
+            return format_error
 
         name = self.get_name(auth_service)
         if isinstance(name, ProblemDetail):

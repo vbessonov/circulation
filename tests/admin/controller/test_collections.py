@@ -330,18 +330,6 @@ class TestCollectionSettings(SettingsControllerTest):
             response = self.manager.admin_collection_settings_controller.process_collections()
             eq_(response.uri, INCOMPLETE_CONFIGURATION.uri)
 
-        with self.request_context_with_admin("/", method="POST"):
-            flask.request.form = MultiDict([
-                ("name", "collection1"),
-                ("protocol", "Axis 360"),
-                ("password", "password"),
-                ("external_account_id", "account_id"),
-                ("url", "bad_url")
-            ])
-            response = self.manager.admin_collection_settings_controller.process_collections()
-            eq_(response.uri, INVALID_URL.uri)
-            assert "bad_url" in response.detail
-
     def test_collections_post_create(self):
         l1, ignore = create(
             self._db, Library, name="Library 1", short_name="L1",
@@ -664,6 +652,7 @@ class TestCollectionSettings(SettingsControllerTest):
 
     def test_collection_delete(self):
         collection = self._collection()
+        eq_(False, collection.marked_for_deletion)
 
         with self.request_context_with_admin("/", method="DELETE"):
             self.admin.remove_role(AdminRole.SYSTEM_ADMIN)
@@ -675,8 +664,12 @@ class TestCollectionSettings(SettingsControllerTest):
             response = self.manager.admin_collection_settings_controller.process_delete(collection.id)
             eq_(response.status_code, 200)
 
-        collection = get_one(self._db, Collection, id=collection.id)
-        eq_(None, collection)
+        # The collection should still be available because it is not immediately deleted.
+        # The collection will be deleted in the background by a script, but it is
+        # now marked for deletion
+        fetchedCollection = get_one(self._db, Collection, id=collection.id)
+        eq_(collection, fetchedCollection)
+        eq_(True, fetchedCollection.marked_for_deletion)
 
     def test_collection_delete_cant_delete_parent(self):
         parent = self._collection(protocol=ExternalIntegration.OVERDRIVE)

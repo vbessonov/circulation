@@ -25,7 +25,10 @@ from core.model import (
     get_one,
     get_one_or_create,
 )
-from core.metadata_layer import FormatData
+from core.metadata_layer import (
+    FormatData,
+    TimestampData,
+)
 from core.selftest import HasSelfTests
 from circulation import (
     BaseCirculationAPI,
@@ -194,8 +197,14 @@ class OPDSForDistributorsAPI(BaseCirculationAPI, HasSelfTests):
             end_date=None,
         )
 
-    def fulfill(self, patron, pin, licensepool, internal_format):
-        """Retrieve a bearer token that can be used to download the book."""
+    def fulfill(self, patron, pin, licensepool, internal_format, **kwargs):
+        """Retrieve a bearer token that can be used to download the book.
+
+        :param kwargs: A container for arguments to fulfill()
+           which are not relevant to this vendor.
+
+        :return: a FulfillmentInfo object.
+        """
 
         links = licensepool.identifier.links
         # Find the acquisition link with the right media type.
@@ -326,9 +335,15 @@ class OPDSForDistributorsReaperMonitor(OPDSForDistributorsImportMonitor):
         parsed_feed = feedparser.parse(feed)
         identifiers = [entry.get("id") for entry in parsed_feed.get("entries", [])]
         self.seen_identifiers.update(identifiers)
+        return [], {}
 
-    def run_once(self, start_ignore, cutoff_ignore):
-        super(OPDSForDistributorsReaperMonitor, self).run_once(start_ignore, cutoff_ignore)
+    def run_once(self, progress):
+        """Check to see if any identifiers we know about are no longer
+        present on the remote. If there are any, remove them.
+
+        :param progress: A TimestampData, ignored.
+        """
+        super(OPDSForDistributorsReaperMonitor, self).run_once(progress)
 
         # At this point we've gone through the feed and collected all the identifiers.
         # If there's anything we didn't see, we know it's no longer available.
@@ -344,14 +359,17 @@ class OPDSForDistributorsReaperMonitor(OPDSForDistributorsImportMonitor):
             LicensePool.licenses_available > 0
         )
 
+        pools_reaped = qu.count()
         self.log.info(
-            "Reaping %s license pools for collection %s." % (qu.count(), self.collection.name)
+            "Reaping %s license pools for collection %s." % (pools_reaped, self.collection.name)
         )
 
         for pool in qu:
             pool.licenses_available = 0
             pool.licenses_owned = 0
         self._db.commit()
+        achievements = "License pools removed: %d." % pools_reaped
+        return TimestampData(achievements=achievements)
 
 class MockOPDSForDistributorsAPI(OPDSForDistributorsAPI):
 

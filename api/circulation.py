@@ -26,11 +26,13 @@ from core.model import (
     LicensePool,
     Loan,
     Hold,
+    Patron,
     RightsStatus,
     Session,
 )
 from util.patron import PatronUtility
 from config import Configuration
+import sys
 
 class CirculationInfo(object):
 
@@ -39,19 +41,23 @@ class CirculationInfo(object):
         """A loan, hold, or whatever.
 
         :param collection: The Collection that gives us the right to
-        borrow this title. This does not have to be specified in the
-        constructor (the code that instantiates CirculationInfo may
-        not have access to a database connection), but it needs to be
-        present by the time the LoanInfo is connected to a
-        LicensePool.
+        borrow this title, or the numeric database ID of the
+        same. This does not have to be specified in the constructor --
+        the code that instantiates CirculationInfo may not have
+        access to a database connection -- but it needs to be present
+        by the time the LoanInfo is connected to a LicensePool.
 
         :param data_source_name: The name of the data source that provides
             the LicencePool.
         :param identifier_type: The type of the Identifier associated
             with the LicensePool.
         :param identifier: The string identifying the LicensePool.
+
         """
-        self.collection_id = collection.id
+        if isinstance(collection, int):
+            self.collection_id = collection
+        else:
+            self.collection_id = collection.id
         self.data_source_name = data_source_name
         self.identifier_type = identifier_type
         self.identifier = identifier
@@ -425,7 +431,7 @@ class CirculationAPI(object):
         from rbdigital import RBDigitalAPI
         from enki import EnkiAPI
         from opds_for_distributors import OPDSForDistributorsAPI
-        from odl import ODLWithConsolidatedCopiesAPI, SharedODLAPI
+        from odl import ODLAPI, SharedODLAPI
         return {
             ExternalIntegration.OVERDRIVE : OverdriveAPI,
             ExternalIntegration.ODILO : OdiloAPI,
@@ -434,7 +440,7 @@ class CirculationAPI(object):
             ExternalIntegration.ONE_CLICK : RBDigitalAPI,
             EnkiAPI.ENKI_EXTERNAL : EnkiAPI,
             OPDSForDistributorsAPI.NAME: OPDSForDistributorsAPI,
-            ODLWithConsolidatedCopiesAPI.NAME: ODLWithConsolidatedCopiesAPI,
+            ODLAPI.NAME: ODLAPI,
             SharedODLAPI.NAME: SharedODLAPI,
         }
 
@@ -714,7 +720,7 @@ class CirculationAPI(object):
             return False
         return api.can_fulfill_without_loan(patron, pool, lpdm)
 
-    def fulfill(self, patron, pin, licensepool, delivery_mechanism, sync_on_failure=True):
+    def fulfill(self, patron, pin, licensepool, delivery_mechanism, part=None, fulfill_part_url=None, sync_on_failure=True):
         """Fulfil a book that a patron has previously checked out.
 
         :param delivery_mechanism: A LicensePoolDeliveryMechanism
@@ -723,7 +729,16 @@ class CirculationAPI(object):
         mechanism, this parameter is ignored and the previously used
         mechanism takes precedence.
 
+        :param part: A vendor-specific identifier indicating that the
+        patron wants to fulfill one specific part of the book
+        (e.g. one chapter of an audiobook), not the whole thing.
+
+        :param fulfill_part_url: A function that takes one argument (a
+        vendor-specific part identifier) and returns the URL to use
+        when fulfilling that part.
+
         :return: A FulfillmentInfo object.
+
         """
         fulfillment = None
         loan = get_one(
@@ -741,6 +756,7 @@ class CirculationAPI(object):
                 return self.fulfill(
                     patron, pin, licensepool=licensepool,
                     delivery_mechanism=delivery_mechanism,
+                    part=part, fulfill_part_url=fulfill_part_url,
                     sync_on_failure=False
                 )
             else:
@@ -753,17 +769,26 @@ class CirculationAPI(object):
             )
 
         if licensepool.open_access:
+            # We ignore the vendor-specific arguments when doing
+            # open-access fulfillment, because we just don't support
+            # partial fulfillment of open-access content.
             fulfillment = self.fulfill_open_access(
-                licensepool, delivery_mechanism.delivery_mechanism
+                licensepool, delivery_mechanism.delivery_mechanism,
             )
         else:
             api = self.api_for_license_pool(licensepool)
             internal_format = api.internal_format(delivery_mechanism)
+
+            # Here we _do_ pass in the vendor-specific arguments, but
+            # we pass them in as keyword arguments, to minimize the
+            # impact on implementation signatures. Most vendor APIs
+            # will ignore one or more of these arguments.
             fulfillment = api.fulfill(
-                patron, pin, licensepool, internal_format
+                patron, pin, licensepool, internal_format=internal_format,
+                part=part, fulfill_part_url=fulfill_part_url
             )
             if not fulfillment or not (
-                    fulfillment.content_link or fulfillment.content
+                fulfillment.content_link or fulfillment.content
             ):
                 raise NoAcceptableFormat()
 
@@ -787,6 +812,7 @@ class CirculationAPI(object):
             __transaction = self._db.begin_nested()
             loan.fulfillment = delivery_mechanism
             __transaction.commit()
+
         return fulfillment
 
     def fulfill_open_access(self, licensepool, delivery_mechanism):
@@ -914,6 +940,7 @@ class CirculationAPI(object):
                 self.pin = pin
                 self.activity = None
                 self.exception = None
+                self.trace = None
                 super(PatronActivityThread, self).__init__()
 
             def run(self):
@@ -923,6 +950,7 @@ class CirculationAPI(object):
                         self.patron, self.pin)
                 except Exception, e:
                     self.exception = e
+                    self.trace = sys.exc_info()
                 after = time.time()
                 log.debug(
                     "Synced %s in %.2f sec", self.api.__class__.__name__,
@@ -949,7 +977,7 @@ class CirculationAPI(object):
                 self.log.error(
                     "%s errored out: %s", thread.api.__class__.__name__,
                     thread.exception,
-                    exc_info=thread.exception
+                    exc_info=thread.trace
                 )
             if thread.activity:
                 for i in thread.activity:
@@ -1127,7 +1155,7 @@ class BaseCirculationAPI(object):
         "key" : Collection.EBOOK_LOAN_DURATION_KEY,
         "label": _("Ebook Loan Duration (in Days)"),
         "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
-        "format": "number",
+        "type": "number",
         "description": _("When a patron uses SimplyE to borrow an ebook from this collection, SimplyE will ask for a loan that lasts this number of days. This must be equal to or less than the maximum loan duration negotiated with the distributor.")
     }
 
@@ -1138,7 +1166,7 @@ class BaseCirculationAPI(object):
         "key" : Collection.AUDIOBOOK_LOAN_DURATION_KEY,
         "label": _("Audiobook Loan Duration (in Days)"),
         "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
-        "format": "number",
+        "type": "number",
         "description": _("When a patron uses SimplyE to borrow an audiobook from this collection, SimplyE will ask for a loan that lasts this number of days. This must be equal to or less than the maximum loan duration negotiated with the distributor.")
     }
 
@@ -1150,7 +1178,7 @@ class BaseCirculationAPI(object):
         "key": Collection.EBOOK_LOAN_DURATION_KEY,
         "label": _("Default Loan Period (in Days)"),
         "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
-        "format": "number",
+        "type": "number",
         "description": _("Until it hears otherwise from the distributor, this server will assume that any given loan for this library from this collection will last this number of days. This number is usually a negotiated value between the library and the distributor. This only affects estimates&mdash;it cannot affect the actual length of loans.")
     }
 
@@ -1200,13 +1228,59 @@ class BaseCirculationAPI(object):
             )
         return internal_format
 
-    def default_notification_email_address(self, patron, pin):
-        """What email address should be used to notify this patron
-        of changes?
+    @classmethod
+    def default_notification_email_address(self, library_or_patron, pin):
+        """What email address should be used to notify this library's
+        patrons of changes?
+
+        :param library_or_patron: A Library or a Patron.
         """
+        if isinstance(library_or_patron, Patron):
+            library_or_patron = library_or_patron.library
         return ConfigurationSetting.for_library(
-            Configuration.DEFAULT_NOTIFICATION_EMAIL_ADDRESS, patron.library
+            Configuration.DEFAULT_NOTIFICATION_EMAIL_ADDRESS,
+            library_or_patron
         ).value
+
+    @classmethod
+    def _library_authenticator(self, library):
+        """Create a LibraryAuthenticator for the given library."""
+        from authenticator import LibraryAuthenticator
+        _db = Session.object_session(library)
+        return LibraryAuthenticator.from_config(_db, library)
+
+    def patron_email_address(self, patron, library_authenticator=None):
+        """Look up the email address that the given Patron shared
+        with their library.
+
+        We do not store this information, but some API integrations
+        need it, so we give the ability to look it up as needed.
+
+        :param patron: A Patron.
+        :return: The patron's email address. None if the patron never
+            shared their email address with their library, or if the
+            authentication technique will not share that information
+            with us.
+        """
+        # LibraryAuthenticator knows about all authentication techniques
+        # used to identify patrons of this library.
+        if not library_authenticator:
+            library_authenticator = self._library_authenticator(patron.library)
+        authorization_identifier = patron.authorization_identifier
+
+        # remote_patron_lookup will try to get information about the
+        # patron through each authentication technique in turn.
+        # As soon as one of these techniques gives us an email
+        # address, we're done.
+        email_address = None
+        for authenticator in library_authenticator.providers:
+            try:
+                patrondata = authenticator.remote_patron_lookup(patron)
+            except NotImplementedError, e:
+                continue
+            if patrondata and patrondata.email_address:
+                email_address = patrondata.email_address
+        return email_address
 
     def checkin(self, patron, pin, licensepool):
         """  Return a book early.
@@ -1236,9 +1310,26 @@ class BaseCirculationAPI(object):
         """In general, you can't fulfill a book without a loan."""
         return False
 
-    def fulfill(self, patron, pin, licensepool, internal_format):
+    def fulfill(self, patron, pin, licensepool, internal_format=None,
+                part=None, fulfill_part_url=None):
         """ Get the actual resource file to the patron.
-        :return a FulfillmentInfo object.
+
+        Implementations are encouraged to define **kwargs as a container
+        for vendor-specific arguments, so that they don't have to change
+        as new arguments are added.
+
+        :param internal_format: A vendor-specific name indicating
+        the format requested by the patron.
+
+        :param part: A vendor-specific identifier indicating that the
+        patron wants to fulfill one specific part of the book
+        (e.g. one chapter of an audiobook), not the whole thing.
+
+        :param fulfill_part_url: A function that takes one argument (a
+        vendor-specific part identifier) and returns the URL to use
+        when fulfilling that part.
+
+        :return: a FulfillmentInfo object.
         """
         raise NotImplementedError()
 

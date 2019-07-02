@@ -120,7 +120,7 @@ from api.adobe_vendor_id import (
     AuthdataUtility,
     DeviceManagementProtocolController,
 )
-from api.odl import MockODLWithConsolidatedCopiesAPI
+from api.odl import MockODLAPI
 from api.shared_collection import SharedCollectionAPI
 import base64
 import feedparser
@@ -430,6 +430,12 @@ class TestCirculationManager(CirculationControllerTest):
         # Controllers that don't depend on site configuration
         # have not been reloaded.
         eq_(index_controller, manager.index_controller)
+
+        # The sitewide patron web domain can also be set to *.
+        ConfigurationSetting.sitewide(
+            self._db, Configuration.PATRON_WEB_CLIENT_URL).value = "*"
+        self.manager.load_settings()
+        eq_(set(["*", "http://registration"]), manager.patron_web_domains)
 
         # Restore the CustomIndexView.for_library implementation
         CustomIndexView.for_library = old_for_library
@@ -1490,6 +1496,54 @@ class TestLoanController(CirculationControllerTest):
                 self.identifier.type, self.identifier.identifier)
 
             eq_(ALREADY_CHECKED_OUT, response)
+
+    def test_fulfill(self):
+        # Verify that arguments to the fulfill() method are propagated
+        # correctly to the CirculationAPI.
+        class MockCirculationAPI(object):
+            def fulfill(self, patron, credential, requested_license_pool,
+                        mechanism, part, fulfill_part_url):
+                self.called_with = (
+                    patron, credential, requested_license_pool,
+                    mechanism, part, fulfill_part_url
+                )
+                raise CannotFulfill()
+
+        controller = self.manager.loans
+        mock = MockCirculationAPI()
+        controller.manager.circulation_apis[self._default_library.id] = mock
+
+        with self.request_context_with_library(
+            "/", headers=dict(Authorization=self.valid_auth)
+        ):
+            authenticated = controller.authenticated_patron_from_request()
+            loan, ignore = self.pool.loan_to(authenticated)
+
+            # Try to fulfill a certain part of the loan.
+            part = "part 1 million"
+            controller.fulfill(
+                self.pool.id, self.mech2.delivery_mechanism.id, part
+            )
+
+            # Verify that the right arguments were passed into
+            # CirculationAPI.
+            (patron, credential, pool, mechanism, part,
+             fulfill_part_url) = mock.called_with
+            eq_(authenticated, patron)
+            eq_(self.valid_credentials['password'], credential)
+            eq_(self.pool, pool)
+            eq_(self.mech2, mechanism)
+            eq_("part 1 million", part)
+
+            # The last argument is complicated -- it's a function for
+            # generating partial fulfillment URLs. Let's try it out
+            # and make sure it gives the result we expect.
+            expect = url_for(
+                "fulfill", license_pool_id=self.pool.id,
+                mechanism_id=mechanism.delivery_mechanism.id, part=part,
+                _external=True
+            )
+            eq_(expect, fulfill_part_url(part))
 
     def test_fulfill_without_active_loan(self):
 
@@ -2770,7 +2824,7 @@ class TestFeedController(CirculationControllerTest):
                 eq_(Hyperlink.OPEN_ACCESS_DOWNLOAD, links[0].get("rel"))
 
             # Shared collection with two books.
-            collection = MockODLWithConsolidatedCopiesAPI.mock_collection(self._db)
+            collection = MockODLAPI.mock_collection(self._db)
             self.english_2.license_pools[0].collection = collection
             work = self._work(title="A", with_license_pool=True, collection=collection)
             self._db.flush()
@@ -2984,6 +3038,24 @@ class TestFeedController(CirculationControllerTest):
 
         AcquisitionFeed.search = old_search
 
+    def test_misconfigured_search(self):
+
+        class BadSearch(CirculationManager):
+
+            @property
+            def setup_search(self):
+                raise CannotLoadConfiguration("doomed!")
+
+        circulation = BadSearch(self._db, testing=True)
+
+        # An attempt to call FeedController.search() will return a
+        # problem detail.
+        with self.request_context_with_library("/?q=t"):
+            problem = circulation.opds_feeds.search(None)
+            eq_(REMOTE_INTEGRATION_FAILED.uri, problem.uri)
+            eq_(u'The search index for this site is not properly configured.',
+                problem.detail)
+
 
 class TestMARCRecordController(CirculationControllerTest):
     def test_download_page_with_exporter_and_files(self):
@@ -3005,7 +3077,7 @@ class TestMARCRecordController(CirculationControllerTest):
         cache1, ignore = create(
             self._db, CachedMARCFile,
             library=self._default_library, lane=None,
-            representation=rep1)
+            representation=rep1, end_time=now)
 
         rep2, ignore = create(
             self._db, Representation, 
@@ -3015,16 +3087,33 @@ class TestMARCRecordController(CirculationControllerTest):
         cache2, ignore = create(
             self._db, CachedMARCFile,
             library=self._default_library, lane=lane,
-            representation=rep2)
+            representation=rep2, end_time=yesterday)
+
+        rep3, ignore = create(
+            self._db, Representation, 
+            url="http://mirror3", mirror_url="http://mirror3",
+            media_type=Representation.MARC_MEDIA_TYPE,
+            mirrored_at=now)
+        cache3, ignore = create(
+            self._db, CachedMARCFile,
+            library=self._default_library, lane=None,
+            representation=rep3, end_time=now,
+            start_time=yesterday)
+
 
         with self.request_context_with_library("/"):
             response = self.manager.marc_records.download_page()
             eq_(200, response.status_code)
             html = response.data
             assert ("Download MARC files for %s" % library.name) in html
-            assert '<a href="http://mirror1">All Books</a>' in html
-            assert '<a href="http://mirror2">Test Lane</a>' in html
-            assert ("Last update: %s" % now.strftime("%B %-d, %Y")) in html
+
+            assert "<h3>All Books</h3>" in html
+            assert '<a href="http://mirror1">Full file - last updated %s</a>' % now.strftime("%B %-d, %Y") in html
+            assert "<h4>Update-only files</h4>" in html
+            assert '<a href="http://mirror3">Updates from %s to %s</a>' % (yesterday.strftime("%B %-d, %Y"), now.strftime("%B %-d, %Y")) in html
+
+            assert '<h3>Test Lane</h3>' in html
+            assert '<a href="http://mirror2">Full file - last updated %s</a>' % yesterday.strftime("%B %-d, %Y") in html
 
     def test_download_page_with_exporter_but_no_files(self):
         now = datetime.datetime.now()
@@ -3064,7 +3153,7 @@ class TestMARCRecordController(CirculationControllerTest):
         cache, ignore = create(
             self._db, CachedMARCFile,
             library=self._default_library, lane=None,
-            representation=rep)
+            representation=rep, end_time=now)
 
         with self.request_context_with_library("/"):
             response = self.manager.marc_records.download_page()
@@ -3072,8 +3161,8 @@ class TestMARCRecordController(CirculationControllerTest):
             html = response.data
             assert ("Download MARC files for %s" % library.name) in html
             assert "No MARC exporter is currently configured" in html
-            assert '<a href="http://mirror1">All Books</a>' in html
-            assert ("Last update: %s" % now.strftime("%B %-d, %Y")) in html
+            assert '<h3>All Books</h3>' in html
+            assert '<a href="http://mirror1">Full file - last updated %s</a>' % now.strftime("%B %-d, %Y") in html
 
 
 class TestAnalyticsController(CirculationControllerTest):
@@ -3280,7 +3369,7 @@ class TestODLNotificationController(ControllerTest):
     when a loan's status changes."""
 
     def test_notify_success(self):
-        collection = MockODLWithConsolidatedCopiesAPI.mock_collection(self._db)
+        collection = MockODLAPI.mock_collection(self._db)
         patron = self._patron()
         pool = self._licensepool(None, collection=collection)
         pool.licenses_owned = 10
@@ -3323,8 +3412,8 @@ class TestSharedCollectionController(ControllerTest):
 
     def setup(self):
         super(TestSharedCollectionController, self).setup(set_up_circulation_manager=False)
-        from api.odl import ODLWithConsolidatedCopiesAPI
-        self.collection = self._collection(protocol=ODLWithConsolidatedCopiesAPI.NAME)
+        from api.odl import ODLAPI
+        self.collection = self._collection(protocol=ODLAPI.NAME)
         self._default_library.collections = [self.collection]
         self.client, ignore = IntegrationClient.register(self._db, "http://library.org")
         self.app.manager = self.circulation_manager_setup(self._db)

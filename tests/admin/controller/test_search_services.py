@@ -37,6 +37,7 @@ class TestSearchServices(SettingsControllerTest):
         )
         search_service.url = "search url"
         search_service.setting(ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY).value = "works-index-prefix"
+        search_service.setting(ExternalSearchIndex.TEST_SEARCH_TERM_KEY).value = "search-term-for-self-tests"
 
         with self.request_context_with_admin("/"):
             response = self.manager.admin_search_services_controller.process_services()
@@ -46,6 +47,7 @@ class TestSearchServices(SettingsControllerTest):
             eq_(search_service.protocol, service.get("protocol"))
             eq_("search url", service.get("settings").get(ExternalIntegration.URL))
             eq_("works-index-prefix", service.get("settings").get(ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY))
+            eq_("search-term-for-self-tests", service.get("settings").get(ExternalSearchIndex.TEST_SEARCH_TERM_KEY))
 
     def test_search_services_post_errors(self):
         controller = self.manager.admin_search_services_controller
@@ -116,17 +118,6 @@ class TestSearchServices(SettingsControllerTest):
             response = controller.process_services()
             eq_(response.uri, INCOMPLETE_CONFIGURATION.uri)
 
-        with self.request_context_with_admin("/", method="POST"):
-            flask.request.form = MultiDict([
-                ("name", "Name"),
-                ("protocol", ExternalIntegration.ELASTICSEARCH),
-                (ExternalIntegration.URL, "bad_url"),
-                (ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY, "works-index-prefix"),
-            ])
-            response = self.manager.admin_search_services_controller.process_services()
-            eq_(response.uri, INVALID_URL.uri)
-            assert "bad_url" in response.detail
-
         self.admin.remove_role(AdminRole.SYSTEM_ADMIN)
         with self.request_context_with_admin("/", method="POST"):
             flask.request.form = MultiDict([
@@ -144,6 +135,7 @@ class TestSearchServices(SettingsControllerTest):
                 ("protocol", ExternalIntegration.ELASTICSEARCH),
                 (ExternalIntegration.URL, "http://search_url"),
                 (ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY, "works-index-prefix"),
+                (ExternalSearchIndex.TEST_SEARCH_TERM_KEY, "sample-search-term")
             ])
             response = self.manager.admin_search_services_controller.process_services()
             eq_(response.status_code, 201)
@@ -153,6 +145,7 @@ class TestSearchServices(SettingsControllerTest):
         eq_(ExternalIntegration.ELASTICSEARCH, service.protocol)
         eq_("http://search_url", service.url)
         eq_("works-index-prefix", service.setting(ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY).value)
+        eq_("sample-search-term", service.setting(ExternalSearchIndex.TEST_SEARCH_TERM_KEY).value)
 
     def test_search_services_post_edit(self):
         search_service, ignore = create(
@@ -162,6 +155,7 @@ class TestSearchServices(SettingsControllerTest):
         )
         search_service.url = "search url"
         search_service.setting(ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY).value = "works-index-prefix"
+        search_service.setting(ExternalSearchIndex.TEST_SEARCH_TERM_KEY).value = "sample-search-term"
 
         with self.request_context_with_admin("/", method="POST"):
             flask.request.form = MultiDict([
@@ -169,7 +163,8 @@ class TestSearchServices(SettingsControllerTest):
                 ("id", search_service.id),
                 ("protocol", ExternalIntegration.ELASTICSEARCH),
                 (ExternalIntegration.URL, "http://new_search_url"),
-                (ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY, "new-works-index-prefix")
+                (ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY, "new-works-index-prefix"),
+                (ExternalSearchIndex.TEST_SEARCH_TERM_KEY, "new-sample-search-term")
             ])
             response = self.manager.admin_search_services_controller.process_services()
             eq_(response.status_code, 200)
@@ -178,6 +173,7 @@ class TestSearchServices(SettingsControllerTest):
         eq_(ExternalIntegration.ELASTICSEARCH, search_service.protocol)
         eq_("http://new_search_url", search_service.url)
         eq_("new-works-index-prefix", search_service.setting(ExternalSearchIndex.WORKS_INDEX_PREFIX_KEY).value)
+        eq_("new-sample-search-term", search_service.setting(ExternalSearchIndex.TEST_SEARCH_TERM_KEY).value)
 
     def test_search_service_delete(self):
         search_service, ignore = create(

@@ -1,5 +1,6 @@
 from nose.tools import set_trace
 from functools import wraps, update_wrapper
+import logging
 import os
 
 import flask
@@ -25,13 +26,6 @@ from controller import CirculationManager
 from problem_details import REMOTE_INTEGRATION_FAILED
 from flask_babel import lazy_gettext as _
 
-# TODO: Without the monkeypatch below, Flask continues to process
-# requests while before_first_request is running. Those requests will
-# fail, since the app isn't completely set up yet.
-#
-# This is fixed in Flask 0.10.2, which is currently unreleased:
-#  https://github.com/pallets/flask/issues/879
-#
 @app.before_first_request
 def initialize_circulation_manager():
     if os.environ.get('AUTOINITIALIZE') == "False":
@@ -40,30 +34,16 @@ def initialize_circulation_manager():
         pass
     else:
         if getattr(app, 'manager', None) is None:
-            app.manager = CirculationManager(app._db)
+            try:
+                app.manager = CirculationManager(app._db)
+            except Exception, e:
+                logging.error(
+                    "Error instantiating circulation manager!", exc_info=e
+                )
+                raise e
             # Make sure that any changes to the database (as might happen
             # on initial setup) are committed before continuing.
             app.manager._db.commit()
-
-# Monkeypatch in a Flask fix that will be released in 0.10.2
-def monkeypatch_try_trigger_before_first_request_functions(self):
-    """Called before each request and will ensure that it triggers
-    the :attr:`before_first_request_funcs` and only exactly once per
-    application instance (which means process usually).
-
-    :internal:
-    """
-    if self._got_first_request:
-        return
-    with self._before_request_lock:
-        if self._got_first_request:
-            return
-        for func in self.before_first_request_funcs:
-            func()
-        self._got_first_request = True
-
-from flask import Flask
-Flask.try_trigger_before_first_request_functions = monkeypatch_try_trigger_before_first_request_functions
 
 @babel.localeselector
 def get_locale():
@@ -364,11 +344,12 @@ def borrow(identifier_type, identifier, mechanism_id=None):
 
 @library_route('/works/<license_pool_id>/fulfill')
 @library_route('/works/<license_pool_id>/fulfill/<mechanism_id>')
+@library_route('/works/<license_pool_id>/fulfill/<mechanism_id>/<part>')
 @has_library
 @allows_patron_web
 @returns_problem_detail
-def fulfill(license_pool_id, mechanism_id=None):
-    return app.manager.loans.fulfill(license_pool_id, mechanism_id)
+def fulfill(license_pool_id, mechanism_id=None, part=None):
+    return app.manager.loans.fulfill(license_pool_id, mechanism_id, part)
 
 @library_route('/loans/<license_pool_id>/revoke', methods=['GET', 'PUT'])
 @has_library

@@ -45,6 +45,7 @@ from core.model import (
 from core.monitor import (
     CollectionMonitor,
     IdentifierSweepMonitor,
+    TimelineMonitor,
 )
 from core.util.http import HTTP
 from core.metadata_layer import ReplacementPolicy
@@ -431,7 +432,14 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI, HasSelfTests):
         self.raise_exception_on_error(data)
         return data
 
-    def fulfill(self, patron, pin, licensepool, internal_format):
+    def fulfill(self, patron, pin, licensepool, internal_format, **kwargs):
+        """Get the actual resource file to the patron.
+
+        :param kwargs: A container for arguments to fulfill()
+           which are not relevant to this vendor.
+
+        :return: a FulfillmentInfo object.
+        """
         try:
             url, media_type = self.get_fulfillment_link(
                 patron, pin, licensepool.identifier.identifier, internal_format)
@@ -812,23 +820,22 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI, HasSelfTests):
 
     def update_formats(self, licensepool):
         """Update the format information for a single book.
+
+        Incidentally updates the metadata, just in case Overdrive has
+        changed it.
         """
         info = self.metadata_lookup(licensepool.identifier)
 
         metadata = OverdriveRepresentationExtractor.book_info_to_metadata(
-            info, include_bibliographic=False, include_formats=True)
+            info, include_bibliographic=True, include_formats=True)
         if not metadata:
             # No work to be done.
             return
-        circulation_data = metadata.circulation
 
-        # The identifier in the CirculationData needs to match the
-        # identifier associated with the LicensePool -- otherwise
-        # a new LicensePool will be created.
-        circulation_data._primary_identifier.identifier = licensepool.identifier.identifier
-        replace = ReplacementPolicy(formats=True)
-        _db = Session.object_session(licensepool)
-        circulation_data.apply(_db, licensepool.collection, replace)
+        edition, ignore = self._edition(licensepool)
+
+        replace = ReplacementPolicy.from_license_source(self._db)
+        metadata.apply(edition, self.collection, replace=replace)
 
     def update_licensepool(self, book_id):
         """Update availability information for a single book.
@@ -886,6 +893,15 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI, HasSelfTests):
     def update_availability(self, licensepool):
         return self.update_licensepool(licensepool.identifier.identifier)
 
+    def _edition(self, licensepool):
+        """Find or create the Edition that would be used to contain
+        Overdrive metadata for the given LicensePool.
+        """
+        return Edition.for_foreign_id(
+            self._db, self.source, licensepool.identifier.type,
+            licensepool.identifier.identifier
+        )
+
     def update_licensepool_with_book_info(self, book, license_pool, is_new_pool):
         """Update a book's LicensePool with information from a JSON
         representation of its circulation info.
@@ -902,15 +918,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI, HasSelfTests):
             self._db, license_pool.collection
         )
 
-        edition, is_new_edition = Edition.for_foreign_id(
-            self._db, self.source, license_pool.identifier.type,
-            license_pool.identifier.identifier)
-
-        # If the pool does not already have a presentation edition,
-        # and if this edition is newly made, then associate pool and edition
-        # as presentation_edition
-        if ((not license_pool.presentation_edition) and is_new_edition):
-            edition_changed = license_pool.set_presentation_edition()
+        edition, is_new_edition = self._edition(license_pool)
 
         if is_new_pool:
             license_pool.open_access = False
@@ -993,13 +1001,13 @@ class MockOverdriveAPI(BaseMockOverdriveAPI, OverdriveAPI):
         return response
 
 
-class OverdriveCirculationMonitor(CollectionMonitor):
+class OverdriveCirculationMonitor(CollectionMonitor, TimelineMonitor):
     """Maintain LicensePools for recently changed Overdrive titles. Create
     basic Editions for any new LicensePools that show up.
     """
     SERVICE_NAME = "Overdrive Circulation Monitor"
-    INTERVAL_SECONDS = 500
     PROTOCOL = ExternalIntegration.OVERDRIVE
+    OVERLAP = datetime.timedelta(minutes=1)
 
     # Report successful completion upon finding this number of
     # consecutive books in the Overdrive results whose LicensePools
@@ -1020,7 +1028,12 @@ class OverdriveCirculationMonitor(CollectionMonitor):
     def recently_changed_ids(self, start, cutoff):
         return self.api.recently_changed_ids(start, cutoff)
 
-    def run_once(self, start, cutoff):
+    def catch_up_from(self, start, cutoff, progress):
+        """Find Overdrive books that changed recently.
+
+        :progress: A TimestampData representing the time previously
+        covered by this Monitor.
+        """
         _db = self._db
         added_books = 0
         overdrive_data_source = DataSource.lookup(
@@ -1028,6 +1041,9 @@ class OverdriveCirculationMonitor(CollectionMonitor):
 
         total_books = 0
         consecutive_unchanged_books = 0
+
+        # Ask for changes between the last time covered by the Monitor
+        # and the current time.
         for i, book in enumerate(self.recently_changed_ids(start, cutoff)):
             total_books += 1
             if not total_books % 100:
@@ -1058,8 +1074,7 @@ class OverdriveCirculationMonitor(CollectionMonitor):
                                   consecutive_unchanged_books)
                     break
 
-        if total_books:
-            self.log.info("Processed %d books total.", total_books)
+        progress.achievements = "Books processed: %d." % total_books
 
 
 class FullOverdriveCollectionMonitor(OverdriveCirculationMonitor):
@@ -1069,7 +1084,6 @@ class FullOverdriveCollectionMonitor(OverdriveCirculationMonitor):
     are not found in our collection.
     """
     SERVICE_NAME = "Overdrive Collection Overview"
-    INTERVAL_SECONDS = 3600*4
 
     def recently_changed_ids(self, start, cutoff):
         """Ignore the dates and return all IDs."""
@@ -1081,7 +1095,6 @@ class OverdriveCollectionReaper(IdentifierSweepMonitor):
     Overdrive collection.
     """
     SERVICE_NAME = "Overdrive Collection Reaper"
-    INTERVAL_SECONDS = 3600*4
     PROTOCOL = ExternalIntegration.OVERDRIVE
 
     def __init__(self, _db, collection, api_class=OverdriveAPI):
@@ -1096,7 +1109,6 @@ class RecentOverdriveCollectionMonitor(OverdriveCirculationMonitor):
     """Monitor recently changed books in the Overdrive collection."""
 
     SERVICE_NAME = "Reverse Chronological Overdrive Collection Monitor"
-    INTERVAL_SECONDS = 60
     MAXIMUM_CONSECUTIVE_UNCHANGED_BOOKS=100
 
 

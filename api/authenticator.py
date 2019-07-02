@@ -1,4 +1,5 @@
 from nose.tools import set_trace
+from api.opds import LibraryAnnotator
 from config import (
     Configuration,
     CannotLoadConfiguration,
@@ -36,7 +37,6 @@ from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.sql.expression import or_
 from problem_details import *
 from util.patron import PatronUtility
-from api.opds import LibraryAnnotator
 from api.custom_patron_catalog import CustomPatronCatalog
 from api.adobe_vendor_id import AuthdataUtility
 
@@ -431,6 +431,8 @@ class CirculationPatronProfileStorage(PatronProfileStorage):
     def profile_document(self):
         doc = super(CirculationPatronProfileStorage, self).profile_document
         drm = []
+        links = []
+        device_link = {}
         authdata = AuthdataUtility.from_config(self.patron.library)
         if authdata:
             vendor_id, token = authdata.short_client_token_for_patron(self.patron)
@@ -439,8 +441,16 @@ class CirculationPatronProfileStorage(PatronProfileStorage):
             adobe_drm['drm:clientToken'] = token
             adobe_drm['drm:scheme'] = "http://librarysimplified.org/terms/drm/scheme/ACS"
             drm.append(adobe_drm)
+
+            device_link['rel'] = 'http://librarysimplified.org/terms/drm/rel/devices'
+            device_link['href'] = self.url_for(
+                "adobe_drm_devices", library_short_name=self.patron.library.short_name, _external=True
+            )
+            links.append(device_link)
+            doc['links'] = links
         if drm:
             doc['drm'] = drm
+
         return doc
 
 class Authenticator(object):
@@ -912,6 +922,12 @@ class LibraryAuthenticator(object):
             Configuration.LOGO, library).value
         if logo:
             links.append(dict(rel="logo", type="image/png", href=logo))
+
+        # Add the library's custom CSS file, if it has one.
+        css_file = ConfigurationSetting.for_library(
+            Configuration.WEB_CSS_FILE, library).value
+        if css_file:
+            links.append(dict(rel="stylesheet", type="text/css", href=css_file))
 
         library_name = self.library_name or unicode(_("Library"))
         auth_doc_url = self.authentication_document_url(library)
@@ -1588,11 +1604,11 @@ class BasicAuthenticationProvider(AuthenticationProvider, HasSelfTests):
         },
         { "key": IDENTIFIER_MAXIMUM_LENGTH,
           "label": _("Maximum identifier length"),
-          "format": "number",
+          "type": "number",
         },
         { "key": PASSWORD_MAXIMUM_LENGTH,
           "label": _("Maximum password length"),
-          "format": "number",
+          "type": "number",
         },
         { "key": IDENTIFIER_LABEL,
           "label": _("Label for identifier entry"),
@@ -1772,20 +1788,34 @@ class BasicAuthenticationProvider(AuthenticationProvider, HasSelfTests):
 
         # First, try to look up the Patron object in our database.
         patron = self.local_patron_lookup(_db, username, patrondata)
-        if patron:
-            # We found them! Make sure their data is up to date
-            # with whatever we just got from remote.
+        if patron and (
+            patrondata.complete or not PatronUtility.needs_external_sync(patron)
+        ):
+            # We found them! And there is no need to do a separate
+            # lookup for purposes of external sync -- either because
+            # they don't need to be synced or because we got a
+            # complete PatronData as a side effect of the authentication
+            # check.
+            #
+            # Just make sure our local data is up to date with
+            # whatever we just got from remote.
             self.apply_patrondata(patrondata, patron)
             return patron
 
-        # We didn't find them. Now the question is: _why_ didn't the
-        # patron show up locally? Have we never seen them before or
-        # has their authorization identifier changed?
+        # At this point there are two possibilities:
         #
-        # Look up the patron's account remotely to get that
-        # information.  In some providers this step may be a no-op
-        # because we may have gotten patron account information as a
-        # side effect of remote validation.
+        # 1. We didn't find them. Now the question is: _why_ didn't
+        # the patron show up locally? Have we never seen them before
+        # or has their authorization identifier changed?
+        #
+        # 2. We found them, they need an external sync, and we found
+        # them in a way that didn't provide that information.
+        #
+        # In both cases, the next step is to look up the patron's
+        # account details remotely. In some providers this step may
+        # be a no-op. But we have to try it, because if the patron's
+        # account details are out of sync, the rest of the request (the
+        # thing they're actually trying to do) might fail.
         patrondata = self.remote_patron_lookup(patrondata)
         if not patrondata or isinstance(patrondata, ProblemDetail):
             # Either there was a problem looking up the patron data, or
@@ -1800,9 +1830,9 @@ class BasicAuthenticationProvider(AuthenticationProvider, HasSelfTests):
             # use that Patron object.
             return patrondata
 
-        # At this point we have an updated PatronData object which
-        # we know represents an existing patron on the remote
-        # side. Try the local lookup again.
+        # At this point we have a _complete_ PatronData object which we
+        # know represents an existing patron on the remote side. Try
+        # the local lookup again.
         patron = self.local_patron_lookup(_db, username, patrondata)
 
         if not patron:
@@ -1814,9 +1844,10 @@ class BasicAuthenticationProvider(AuthenticationProvider, HasSelfTests):
 
         # The lookup failed in the first place either because the
         # Patron did not exist on the local side, or because one of
-        # the patron's identifiers changed. Either way, we need to
-        # update the Patron record with the account information we
-        # just got from the source of truth.
+        # the patron's identifiers changed; or, the lookup succeeded
+        # but we needed to do a separate validation step. Either way,
+        # we now need to update the Patron record with the account
+        # information we just got from the source of truth.
         self.apply_patrondata(patrondata, patron)
         return patron
 
@@ -2057,7 +2088,7 @@ class OAuthAuthenticationProvider(AuthenticationProvider):
     DEFAULT_TOKEN_EXPIRATION_DAYS = 42
 
     SETTINGS = [
-        { "key": OAUTH_TOKEN_EXPIRATION_DAYS, "label": _("Days until OAuth token expires") },
+        { "key": OAUTH_TOKEN_EXPIRATION_DAYS, "type": "number", "label": _("Days until OAuth token expires") },
     ] + AuthenticationProvider.SETTINGS
 
     # Name of the site-wide ConfigurationSetting containing the secret

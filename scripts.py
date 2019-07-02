@@ -36,6 +36,7 @@ from core.metadata_layer import (
     LinkData,
 )
 from core.model import (
+    CachedMARCFile,
     CirculationEvent,
     Collection,
     ConfigurationSetting,
@@ -56,6 +57,7 @@ from core.model import (
     Loan,
     Representation,
     RightsStatus,
+    SessionManager,
     Subject,
     Timestamp,
     Work,
@@ -70,6 +72,7 @@ from core.scripts import (
     LibraryInputScript,
     PatronInputScript,
     RunMonitorScript,
+    TimestampScript,
 )
 from core.lane import (
     Pagination,
@@ -117,8 +120,8 @@ from api.opds_for_distributors import (
     OPDSForDistributorsReaperMonitor,
 )
 from api.odl import (
-    ODLBibliographicImporter,
-    ODLBibliographicImportMonitor,
+    ODLImporter,
+    ODLImportMonitor,
     SharedODLImporter,
     SharedODLImportMonitor,
 )
@@ -312,7 +315,7 @@ class UpdateStaffPicksScript(Script):
         return StringIO(representation.content)
 
 
-class CacheRepresentationPerLane(LaneSweeperScript):
+class CacheRepresentationPerLane(TimestampScript, LaneSweeperScript):
 
     name = "Cache one representation per lane"
 
@@ -482,7 +485,7 @@ class CacheRepresentationPerLane(LaneSweeperScript):
 class CacheFacetListsPerLane(CacheRepresentationPerLane):
     """Cache the first two pages of every relevant facet list for this lane."""
 
-    name = "Cache OPDS feeds"
+    name = "Cache paginated OPDS feed for each lane"
 
     @classmethod
     def arg_parser(cls, _db):
@@ -645,7 +648,7 @@ class CacheFacetListsPerLane(CacheRepresentationPerLane):
 
 class CacheOPDSGroupFeedPerLane(CacheRepresentationPerLane):
 
-    name = "Cache OPDS group feed for each lane"
+    name = "Cache OPDS grouped feed for each lane"
 
     def should_process_lane(self, lane):
         # OPDS group feeds are only generated for lanes that have sublanes.
@@ -698,6 +701,9 @@ class CacheOPDSGroupFeedPerLane(CacheRepresentationPerLane):
 
 class CacheMARCFiles(LaneSweeperScript):
     """Generate and cache MARC files for each input library."""
+
+    name = "Cache MARC files"
+
     @classmethod
     def arg_parser(cls, _db):
         parser = LaneSweeperScript.arg_parser(_db)
@@ -706,6 +712,11 @@ class CacheMARCFiles(LaneSweeperScript):
             help='Stop processing lanes once you reach this depth.',
             type=int,
             default=0,
+        )
+        parser.add_argument(
+            '--force',
+            help="Generate new MARC files even if MARC files have already been generated recently enough",
+            dest='force', action='store_true',
         )
         return parser
 
@@ -717,6 +728,7 @@ class CacheMARCFiles(LaneSweeperScript):
         parser = self.arg_parser(self._db)
         parsed = parser.parse_args(cmd_args)
         self.max_depth = parsed.max_depth
+        self.force = parsed.force
         return parsed
 
     def should_process_library(self, library):
@@ -739,17 +751,49 @@ class CacheMARCFiles(LaneSweeperScript):
         return True
 
     def process_lane(self, lane, exporter=None):
-        # Generate a MARC file for this lane.
+        # Generate a MARC file for this lane, if one has not been generated recently enough.
         if isinstance(lane, Lane):
             library = lane.library
         else:
             library = lane.get_library(self._db)
-        
+
         annotator = MARCLibraryAnnotator(library)
         exporter = exporter or MARCExporter.from_config(library)
+
+        update_frequency = ConfigurationSetting.for_library_and_externalintegration(
+            self._db, MARCExporter.UPDATE_FREQUENCY, library, exporter.integration
+        ).int_value
+        if update_frequency is None:
+            update_frequency = MARCExporter.DEFAULT_UPDATE_FREQUENCY
+
+        last_update = None
+        files_q = self._db.query(CachedMARCFile).filter(
+            CachedMARCFile.library==library
+        ).filter(
+            CachedMARCFile.lane==(lane if isinstance(lane, Lane) else None),
+        ).order_by(CachedMARCFile.end_time.desc())
+
+        if files_q.count() > 0:
+            last_update = files_q.first().end_time
+        if not self.force and last_update and (last_update > datetime.utcnow() - timedelta(days=update_frequency)):
+            self.log.info("Skipping lane %s because last update was less than %d days ago" % (lane.display_name, update_frequency))
+            return
+
+        # First update the file with ALL the records.
         records = exporter.records(
             lane, annotator=annotator,
         )
+
+        # Then create a new file with changes since the last update.
+        start_time = None
+        if last_update:
+            # Allow one day of overlap to ensure we don't miss anything due to script timing.
+            start_time = last_update - timedelta(days=1)
+
+            records = exporter.records(
+                lane, annotator=annotator, start_time=start_time,
+            )
+
 
 class AdobeAccountIDResetScript(PatronInputScript):
 
@@ -887,7 +931,7 @@ class CompileTranslationsScript(Script):
         os.system("pybabel compile -f -d translations")
 
 
-class InstanceInitializationScript(Script):
+class InstanceInitializationScript(TimestampScript):
     """An idempotent script to initialize an instance of the Circulation Manager.
 
     This script is intended for use in servers, Docker containers, etc,
@@ -897,6 +941,45 @@ class InstanceInitializationScript(Script):
     Because it's currently run every time a container is started, it must
     remain idempotent.
     """
+
+    name = "Instance initialization"
+
+    TEST_SQL = "select * from timestamps limit 1"
+
+    def run(self, *args, **kwargs):
+        # Create a special database session that doesn't initialize
+        # the ORM -- this could be fatal if there are migration
+        # scripts that haven't run yet.
+        #
+        # In fact, we don't even initialize the database schema,
+        # because that's the thing we're trying to check for.
+        url = Configuration.database_url()
+        _db = SessionManager.session(
+            url, initialize_data=False, initialize_schema=False
+        )
+
+        results = None
+        try:
+            # We need to check for the existence of a known table --
+            # this will demonstrate that this script has been run before --
+            # but we don't need to actually look at what we get from the
+            # database.
+            #
+            # Basically, if this succeeds, we can bail out and not run
+            # the rest of the script.
+            results = list(_db.execute(self.TEST_SQL))
+        except Exception, e:
+            # This did _not_ succeed, so the schema is probably not
+            # initialized and we do need to run this script.. This
+            # database session is useless now, but we'll create a new
+            # one during the super() call, and use that one to do the
+            # work.
+            _db.close()
+
+        if results is None:
+            super(InstanceInitializationScript, self).run(*args, **kwargs)
+        else:
+            self.log.error("I think this site has already been initialized; doing nothing.")
 
     def do_run(self, ignore_search=False):
         # Creates a "-current" alias on the Elasticsearch client.
@@ -909,7 +992,10 @@ class InstanceInitializationScript(Script):
 
         # Set a timestamp that represents the new database's version.
         db_init_script = DatabaseMigrationInitializationScript(_db=self._db)
-        existing = get_one(self._db, Timestamp, service=db_init_script.name)
+        existing = get_one(
+            self._db, Timestamp, service=db_init_script.name,
+            service_type=Timestamp.SCRIPT_TYPE
+        )
         if existing:
             # No need to run the script. We already have a timestamp.
             return
@@ -919,7 +1005,7 @@ class InstanceInitializationScript(Script):
         ConfigurationSetting.sitewide_secret(self._db, Configuration.SECRET_KEY)
 
 
-class LoanReaperScript(Script):
+class LoanReaperScript(TimestampScript):
     """Remove expired loans and holds whose owners have not yet synced
     with the loan providers.
 
@@ -929,6 +1015,9 @@ class LoanReaperScript(Script):
     If a loan or (more likely) hold is removed incorrectly, it will be
     restored the next time the patron syncs their loans feed.
     """
+
+    name = "Remove expired loans and holds from local database"
+
     def do_run(self):
         now = datetime.utcnow()
 
@@ -1108,7 +1197,9 @@ class DisappearingBookReportScript(Script):
         print "\t".join([unicode(x).encode("utf8") for x in data])
 
 
-class NYTBestSellerListsScript(Script):
+class NYTBestSellerListsScript(TimestampScript):
+
+    name = "Update New York Times best-seller lists"
 
     def __init__(self, include_history=False):
         super(NYTBestSellerListsScript, self).__init__()
@@ -1153,10 +1244,12 @@ class OPDSForDistributorsReaperScript(OPDSImportScript):
     PROTOCOL = OPDSForDistributorsImporter.NAME
 
 
-class DirectoryImportScript(Script):
+class DirectoryImportScript(TimestampScript):
     """Import some books into a collection, based on a file containing
     metadata and directories containing ebook and cover files.
     """
+
+    name = "Import new titles from a directory on disk"
 
     @classmethod
     def arg_parser(cls, _db):
@@ -1233,6 +1326,7 @@ class DirectoryImportScript(Script):
         collection, mirror = self.load_collection(
             collection_name, data_source_name
         )
+        self.timestamp_collection = collection
 
         if dry_run:
             mirror = None
@@ -1302,6 +1396,7 @@ class DirectoryImportScript(Script):
                     collection.name
                 )
         mirror = MirrorUploader.for_collection(collection)
+
         return collection, mirror
 
     def load_metadata(self, metadata_file, metadata_format, data_source_name):
@@ -1580,27 +1675,32 @@ You'll get another chance to back out before the database session is committed."
     def process_library(self, library):
         create_default_lanes(self._db, library)
 
-class NovelistSnapshotScript(LibraryInputScript):
+class NovelistSnapshotScript(TimestampScript, LibraryInputScript):
 
     def do_run(self, output=sys.stdout, *args, **kwargs):
         parsed = self.parse_command_line(self._db, *args, **kwargs)
-        api = NoveListAPI.from_config(parsed.libraries[0])
-        if (api):
-            response = api.put_items_novelist(parsed.libraries[0])
+        for library in parsed.libraries:
+            try:
+                api = NoveListAPI.from_config(library)
+            except CannotLoadConfiguration as e:
+                self.log.info(e.message)
+                continue
+            if (api):
+                response = api.put_items_novelist(library)
 
-            if (response):
-                result = "NoveList API Response\n"
-                result += str(response)
+                if (response):
+                    result = "NoveList API Response\n"
+                    result += str(response)
 
-                output.write(result)
+                    output.write(result)
 
-class ODLBibliographicImportScript(OPDSImportScript):
-    """Import bibliographic information from the feed associated
+class ODLImportScript(OPDSImportScript):
+    """Import information from the feed associated
     with an ODL collection."""
 
-    IMPORTER_CLASS = ODLBibliographicImporter
-    MONITOR_CLASS = ODLBibliographicImportMonitor
-    PROTOCOL = ODLBibliographicImporter.NAME
+    IMPORTER_CLASS = ODLImporter
+    MONITOR_CLASS = ODLImportMonitor
+    PROTOCOL = ODLImporter.NAME
 
 class SharedODLImportScript(OPDSImportScript):
     IMPORTER_CLASS = SharedODLImporter

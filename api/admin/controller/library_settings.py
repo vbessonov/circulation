@@ -3,7 +3,11 @@ import flask
 from flask import Response
 from flask_babel import lazy_gettext as _
 import json
+from pypostalcode import PostalCodeDatabase
+import re
 from StringIO import StringIO
+import urllib
+import uszipcode
 import uuid
 import wcag_contrast_ratio
 
@@ -13,15 +17,20 @@ from api.lanes import create_default_lanes
 from core.model import (
     ConfigurationSetting,
     create,
+    ExternalIntegration,
     get_one,
     Library,
     Representation,
 )
+from core.util.http import HTTP
 from PIL import Image
 from api.admin.exceptions import *
 from api.admin.problem_details import *
+from api.admin.geographic_validator import GeographicValidator
 from core.util.problem_detail import ProblemDetail
+from core.util import LanguageCodes
 from nose.tools import set_trace
+from api.registry import RemoteRegistry
 
 class LibrarySettingsController(SettingsController):
 
@@ -36,10 +45,15 @@ class LibrarySettingsController(SettingsController):
             for setting in Configuration.LIBRARY_SETTINGS:
                 if setting.get("type") == "list":
                     value = ConfigurationSetting.for_library(setting.get("key"), library).json_value
+                    if value and setting.get("format") == "geographic":
+                        value = self.get_extra_geographic_information(value)
+
                 else:
-                    value = ConfigurationSetting.for_library(setting.get("key"), library).value
+                    value = self.current_value(setting, library)
+
                 if value:
                     settings[setting.get("key")] = value
+
             libraries += [dict(
                 uuid=library.uuid,
                 name=library.name,
@@ -48,11 +62,12 @@ class LibrarySettingsController(SettingsController):
             )]
         return dict(libraries=libraries, settings=Configuration.LIBRARY_SETTINGS)
 
-    def process_post(self):
+    def process_post(self, validator=None):
         self.require_system_admin()
 
         library = None
         is_new = False
+        validator = validator or GeographicValidator()
 
         library_uuid = flask.request.form.get("uuid")
         library = self.get_library_from_uuid(library_uuid)
@@ -79,7 +94,10 @@ class LibrarySettingsController(SettingsController):
         if short_name:
             library.short_name = short_name
 
-        self.library_configuration_settings(library)
+        configuration_settings = self.library_configuration_settings(library, validator)
+        if isinstance(configuration_settings, ProblemDetail):
+            return configuration_settings
+
         if is_new:
             # Now that the configuration settings are in place, create
             # a default set of lanes.
@@ -107,14 +125,13 @@ class LibrarySettingsController(SettingsController):
         settings = Configuration.LIBRARY_SETTINGS
         validations = [
             self.check_for_missing_fields,
-            self.check_input_type,
             self.check_web_color_contrast,
             self.check_header_links,
-            self.validate_formats,
+            self.validate_formats
         ]
         for validation in validations:
             result = validation(settings)
-            if result is not None:
+            if isinstance(result, ProblemDetail):
                 return result
 
     def check_for_missing_fields(self, settings):
@@ -133,11 +150,6 @@ class LibrarySettingsController(SettingsController):
                 _("The configuration is missing a required setting: %(setting)s",
                 setting=missing[0].get("label"))
             )
-
-    def check_input_type(self, settings):
-        for setting in settings:
-            if setting.get("type") == "image":
-                return self.check_image_type(setting)
 
     def check_web_color_contrast(self, settings):
         """Verify that the web background color and web foreground
@@ -182,24 +194,33 @@ class LibrarySettingsController(SettingsController):
             if library_with_short_name:
                 return LIBRARY_SHORT_NAME_ALREADY_IN_USE
 
-    def check_image_type(self, setting):
-        allowed_types = [Representation.JPEG_MEDIA_TYPE, Representation.PNG_MEDIA_TYPE, Representation.GIF_MEDIA_TYPE]
-        image_file = flask.request.files.get(setting.get("key"))
-        if image_file:
-            image_type = image_file.headers.get("Content-Type")
-            if image_type not in allowed_types:
-                return INVALID_CONFIGURATION_OPTION.detailed(_(
-                    "Upload for %(setting)s must be in GIF, PNG, or JPG format. (Upload was %(format)s.)",
-                    setting=setting.get("label"),
-                    format=image_type))
-
-
 # Configuration settings:
 
-    def library_configuration_settings(self, library):
+    def get_extra_geographic_information(self, value):
+        validator = GeographicValidator()
+
+        for country in value:
+            zips = [x for x in value[country] if validator.is_zip(x, country)]
+            other = [x for x in value[country] if not x in zips]
+            zips_with_extra_info = []
+            for zip in zips:
+                info = validator.look_up_zip(zip, country, formatted=True)
+                zips_with_extra_info.append(info)
+            value[country] = zips_with_extra_info + other
+
+        return value
+
+    def library_configuration_settings(self, library, validator):
         for setting in Configuration.LIBRARY_SETTINGS:
-            if setting.get("type") == "list":
+            if setting.get("format") == "geographic":
+                locations = validator.validate_geographic_areas(self.list_setting(setting), self._db)
+                if isinstance(locations, ProblemDetail):
+                    return locations
+                value = locations or self.current_value(setting, library)
+            elif setting.get("type") == "list":
                 value = self.list_setting(setting) or self.current_value(setting, library)
+                if setting.get("format") == "language-code":
+                    value = json.dumps([LanguageCodes.string_to_alpha_3(language) for language in json.loads(value)])
             elif setting.get("type") == "image":
                 value = self.image_setting(setting) or self.current_value(setting, library)
             else:
@@ -220,9 +241,12 @@ class LibrarySettingsController(SettingsController):
                     value += [option["key"]]
         else:
             # Allow any entered values.
-            value = [item for item in flask.request.form.getlist(setting.get('key')) if item]
+            value = []
+            inputs = flask.request.form.getlist(setting.get("key"))
+            for i in inputs:
+                value.extend(i) if isinstance(i, list) else value.append(i)
 
-        return json.dumps(value)
+        return json.dumps(filter(None, value))
 
     def image_setting(self, setting):
         image_file = flask.request.files.get(setting.get("key"))

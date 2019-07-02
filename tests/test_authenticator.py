@@ -18,8 +18,7 @@ import re
 import urllib
 import urlparse
 import flask
-from flask import url_for
-
+from flask import url_for, Flask
 from core.opds import OPDSFeed
 from core.user_profile import ProfileController
 from core.model import (
@@ -420,20 +419,26 @@ class TestPatronData(AuthenticatorTest):
         params = self.data.to_response_parameters
         eq_(dict(name="4"), params)
 
-class TestCirculationPatronProfileStorage(VendorIDTest):
+class TestCirculationPatronProfileStorage(ControllerTest):
 
     def test_profile_document(self):
+        def mock_url_for(endpoint, library_short_name, _external=True):
+            return "http://host/" + endpoint + "?" + "library_short_name=" + library_short_name
+
         patron = self._patron()
-        storage = CirculationPatronProfileStorage(patron)
+        storage = CirculationPatronProfileStorage(patron, mock_url_for)
         doc = storage.profile_document
         assert 'settings' in doc
         #Since there's no authdata configured, the DRM fields are not present
         assert 'drm:vendor' not in doc
         assert 'drm:clientToken' not in doc
         assert 'drm:scheme' not in doc
+        assert 'links' not in doc
+
         #Now there's authdata configured, and the DRM fields are populated with
         #the vendor ID and a short client token
         self.initialize_adobe(patron.library)
+
         doc = storage.profile_document
         [adobe] = doc['drm']
         eq_(adobe["drm:vendor"], "vendor id")
@@ -441,6 +446,10 @@ class TestCirculationPatronProfileStorage(VendorIDTest):
             patron.library.short_name.upper() + "TOKEN"
         )
         eq_(adobe["drm:scheme"], "http://librarysimplified.org/terms/drm/scheme/ACS")
+
+        [links] = doc['links']
+        eq_(links['rel'], "http://librarysimplified.org/terms/drm/rel/devices")
+        eq_(links['href'], "http://host/adobe_drm_devices?library_short_name=default")
 
 class MockAuthenticator(Authenticator):
     """Allows testing Authenticator methods outside of a request context."""
@@ -1151,6 +1160,7 @@ class TestLibraryAuthenticator(AuthenticatorTest):
             LibraryAnnotator.LICENSE: "http://license/",
             LibraryAnnotator.REGISTER: "custom-registration-hook://library/",
             Configuration.LOGO: "image data",
+            Configuration.WEB_CSS_FILE: "http://style.css",
         }
 
         for rel, value in link_config.iteritems():
@@ -1224,7 +1234,7 @@ class TestLibraryAuthenticator(AuthenticatorTest):
             # from the configuration.
             (about, alternate, copyright, help_uri, help_web, help_email,
              copyright_agent, profile, loans, license, logo, privacy_policy, register, start,
-             terms_of_service) = sorted(
+             stylesheet, terms_of_service) = sorted(
                  doc['links'], key=lambda x: (x['rel'], x['href'])
              )
             eq_("http://terms", terms_of_service['href'])
@@ -1233,6 +1243,7 @@ class TestLibraryAuthenticator(AuthenticatorTest):
             eq_("http://about", about['href'])
             eq_("http://license/", license['href'])
             eq_("image data", logo['href'])
+            eq_("http://style.css", stylesheet['href'])
 
             assert ("/loans" in loans['href'])
             eq_("http://opds-spec.org/shelf", loans['rel'])
@@ -2126,6 +2137,91 @@ class TestBasicAuthenticationProviderAuthenticate(AuthenticatorTest):
         # All the different ways the database lookup might go are covered in
         # test_local_patron_lookup. This test only covers the case where
         # the server sends back the permanent ID of the patron.
+
+    def _inactive_patron(self):
+        """Simulate a patron who has not logged in for a really long time.
+
+        :return: A 2-tuple (Patron, PatronData). The Patron contains
+        'out-of-date' data and the PatronData containing 'up-to-date'
+        data.
+        """
+        now = datetime.datetime.utcnow()
+        long_ago = now - datetime.timedelta(hours=10000)
+        patron = self._patron()
+        patron.last_external_sync = long_ago
+
+        # All of their authorization information has changed in the
+        # meantime, but -- crucially -- their permanent ID has not.
+        patron.authorization_identifier = "old auth id"
+        patron.username = "old username"
+
+        # Here is the up-to-date information about this patron,
+        # as found in the 'ILS'.
+        patrondata = PatronData(
+            permanent_id=patron.external_identifier,
+            username="new username",
+            authorization_identifier = "new authorization identifier",
+            complete=True
+        )
+
+        return patron, patrondata
+
+    def test_success_but_local_patron_needs_sync(self):
+        # This patron has not logged on in a really long time.
+        patron, complete_patrondata = self._inactive_patron()
+
+        # The 'ILS' will respond to an authentication request with a minimal
+        # set of information.
+        #
+        # It will respond to a patron lookup request with more detailed
+        # information.
+        minimal_patrondata = PatronData(
+            permanent_id=patron.external_identifier,
+            complete=False
+        )
+        provider = self.mock_basic(
+            patrondata=minimal_patrondata,
+            remote_patron_lookup_patrondata=complete_patrondata,
+        )
+
+        # The patron can be authenticated.
+        eq_(patron, provider.authenticate(self._db, self.credentials))
+
+        # The Authenticator noticed that the patron's account was out
+        # of sync, and since the authentication response did not
+        # provide a complete set of patron information, the
+        # Authenticator performed a more detailed lookup to make sure
+        # that the patron's details were correct going forward.
+        eq_("new username", patron.username)
+        eq_("new authorization identifier", patron.authorization_identifier)
+        assert (
+            datetime.datetime.utcnow()-patron.last_external_sync
+        ).total_seconds() < 10
+
+    def test_success_with_immediate_patron_sync(self):
+        # This patron has not logged on in a really long time.
+        patron, complete_patrondata = self._inactive_patron()
+
+        # The 'ILS' will respond to an authentication request with a complete
+        # set of information. If a remote patron lookup were to happen,
+        # it would explode.
+        provider = self.mock_basic(
+            patrondata=complete_patrondata,
+            remote_patron_lookup_patrondata=object()
+        )
+
+        # The patron can be authenticated.
+        eq_(patron, provider.authenticate(self._db, self.credentials))
+
+        # Since the authentication response provided a complete
+        # overview of the patron, the Authenticator was able to sync
+        # the account immediately, without doing a separate remote
+        # patron lookup.
+        eq_("new username", patron.username)
+        eq_("new authorization identifier", patron.authorization_identifier)
+        assert (
+            datetime.datetime.utcnow()-patron.last_external_sync
+        ).total_seconds() < 10
 
     def test_failure_when_remote_authentication_returns_problemdetail(self):
         patron = self._patron()

@@ -121,6 +121,13 @@ UNKNOWN_LANGUAGE = pd(
     detail=_("The submitted language is not one of the known languages."),
 )
 
+UNKNOWN_LOCATION = pd(
+    "http://librarysimplified.org/terms/problem/unknown-location",
+    status_code=400,
+    title=_("Unknown location."),
+    detail=_("The submitted geographic location cannot be found.")
+)
+
 UNKNOWN_ROLE = pd(
     "http://librarysimplified.org/terms/problem/unknown-role",
     status_code=400,
@@ -189,13 +196,6 @@ COLLECTION_NAME_ALREADY_IN_USE = pd(
     status_code=400,
     title=_("Collection name already in use"),
     detail=_("The collection name must be unique, and there's already a collection with the specified name."),
-)
-
-MISSING_COLLECTION_IDENTIFIER = pd(
-    "http://librarysimplified.org/terms/problem/missing-collection-identifier",
-    status_code=400,
-    title=_("Missing collection identifier"),
-    detail=_("No collection identifier was used."),
 )
 
 CANNOT_DELETE_COLLECTION_WITH_CHILDREN = pd(
@@ -460,6 +460,13 @@ COLLECTION_DOES_NOT_SUPPORT_REGISTRATION = pd(
 FAILED_TO_RUN_SELF_TESTS = pd(
     "http://librarysimplified.org/terms/problem/failed-to-run-self-tests",
     status_code=400,
-    title=_("Failed to run self tests for collection."),
-    detail=_("Failed to run self tests for collection.")
+    title=_("Failed to run self tests."),
+    detail=_("Failed to run self tests.")
+)
+
+MISSING_IDENTIFIER = pd(
+    "http://librarysimplified.org/terms/problem/missing-identifier",
+    status_code=400,
+    title=_("Missing identifier"),
+    detail=_("No identifier was used.")
 )

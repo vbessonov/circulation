@@ -77,7 +77,9 @@ class Configuration(CoreConfiguration):
     SMALL_COLLECTION_LANGUAGES = "small_collections"
     TINY_COLLECTION_LANGUAGES = "tiny_collections"
 
-    LANGUAGE_DESCRIPTION = _('Each value must be an <a href="https://www.loc.gov/standards/iso639-2/php/code_list.php" target="_blank">ISO-639-2</a> language code.')
+    LANGUAGE_DESCRIPTION = _('Each value can be either the full name of a language or an <a href="https://www.loc.gov/standards/iso639-2/php/code_list.php" target="_blank">ISO-639-2</a> language code.')
+
+    HIDDEN_CONTENT_TYPES = "hidden_content_types"
 
     # The color scheme for native mobile applications to use for this library.
     COLOR_SCHEME = "color_scheme"
@@ -88,6 +90,9 @@ class Configuration(CoreConfiguration):
     WEB_FOREGROUND_COLOR = "web-foreground-color"
     DEFAULT_WEB_BACKGROUND_COLOR = "#000000"
     DEFAULT_WEB_FOREGROUND_COLOR = "#ffffff"
+
+    # A link to a CSS file for customizing the catalog display in web applications.
+    WEB_CSS_FILE = "web-css-file"
 
     # Header links and labels for web applications to display for this library.
     # TODO: It's very awkward to have these as separate settings, and separate
@@ -101,6 +106,16 @@ class Configuration(CoreConfiguration):
     # Settings for geographic areas associated with the library.
     LIBRARY_FOCUS_AREA = "focus_area"
     LIBRARY_SERVICE_AREA = "service_area"
+    AREA_INPUT_INSTRUCTIONS = _(
+        """<ol>Accepted formats:
+            <li>US zipcode or Canadian FSA</li>
+            <li>Two-letter US state abbreviation</li>
+            <li>City, US state abbreviation<i>e.g. "Boston, MA"</i></li>
+            <li>County, US state abbreviation<i>e.g. "Litchfield County, CT"</i></li>
+            <li>Canadian province name or two-letter abbreviation</li>
+            <li>City, Canadian province name/abbreviation<i>e.g. "Stratford, Ontario"/"Stratford, ON"</i></li>
+        </ol>"""
+    )
 
     # Names of the library-wide link settings.
     TERMS_OF_SERVICE = 'terms-of-service'
@@ -156,10 +171,12 @@ class Configuration(CoreConfiguration):
             "label": _("URL of the web catalog for patrons"),
             "required": True,
             "format": "url",
+            "allowed": ["*"],
+            "description": _("You can set this to '*' in development, but you must use a real URL in production in order to prevent unauthorized CORS requests.")
         },
         {
             "key": STATIC_FILE_CACHE_TIME,
-            "label": _("Cache time for static images and JS and CSS files"),
+            "label": _("Cache time for static images and JS and CSS files (in seconds)"),
             "required": True,
             "type": "number",
         },
@@ -168,16 +185,16 @@ class Configuration(CoreConfiguration):
     LIBRARY_SETTINGS = CoreConfiguration.LIBRARY_SETTINGS + [
         {
             "key": LIBRARY_DESCRIPTION,
-            "label": _("A short description of this library."),
+            "label": _("A short description of this library"),
             "description": _("This will be shown to people who aren't sure they've chosen the right library."),
-            "category": "Additional Information",
+            "category": "Basic Information",
         },
         {
             "key": HELP_EMAIL,
             "label": _("Patron support email address"),
             "description": _("An email address a patron can use if they need help, e.g. 'simplyehelp@yourlibrary.org'."),
             "required": True,
-            "format": "email"
+            "format": "email",
         },
         {
             "key": HELP_WEB,
@@ -201,7 +218,7 @@ class Configuration(CoreConfiguration):
         },
         {
             "key": CONFIGURATION_CONTACT_EMAIL,
-            "label": _("A point of contact for the organization reponsible for configuring this library."),
+            "label": _("A point of contact for the organization reponsible for configuring this library"),
             "description": _("This email address will be shared as part of integrations that you set up through this interface. It will not be shared with the general public. This gives the administrator of the remote integration a way to contact you about problems with this library's use of that integration.<br/>If no value is specified here, the general patron support address will be used."),
             "format": "email",
             "category": "Patron Support",
@@ -257,6 +274,13 @@ class Configuration(CoreConfiguration):
             "category": "Client Interface Customization",
         },
         {
+            "key": WEB_CSS_FILE,
+            "label": _("Custom CSS file for web"),
+            "description": _("Give web applications a CSS file to customize the catalog display."),
+            "format": "url",
+            "category": "Client Interface Customization",
+        },
+        {
             "key": WEB_HEADER_LINKS,
             "label": _("Web header links"),
             "description": _("This gives web applications a list of links to display in the header. Specify labels for each link in the same order under 'Web header labels'."),
@@ -278,37 +302,48 @@ class Configuration(CoreConfiguration):
             "category": "Client Interface Customization",
         },
         {
+            "key": HIDDEN_CONTENT_TYPES,
+            "label": _("Hidden content types"),
+            "type": "text",
+            "description": _('A list of content types to hide from all clients, e.g. <code>["application/pdf"]</code>. This can be left blank except to solve specific problems.'),
+            "category": "Client Interface Customization",
+        },
+        {
             "key": LIBRARY_FOCUS_AREA,
             "label": _("Focus area"),
-            "type": "text",
+            "type": "list",
             "description": _("The library focuses on serving patrons in this geographic area. In most cases this will be a city name like <code>Springfield, OR</code>."),
-            "category": "Additional Information",
+            "category": "Geographic Areas",
+            "format": "geographic",
+            "instructions": AREA_INPUT_INSTRUCTIONS
         },
         {
             "key": LIBRARY_SERVICE_AREA,
             "label": _("Service area"),
-            "type": "text",
+            "type": "list",
             "description": _("The full geographic area served by this library. In most cases this is the same as the focus area and can be left blank, but it may be a larger area such as a US state (which should be indicated by its abbreviation, like <code>OR</code>)."),
-            "category": "Additional Information",
+            "category": "Geographic Areas",
+            "format": "geographic",
+            "instructions": AREA_INPUT_INSTRUCTIONS
         },
         {
             "key": MAX_OUTSTANDING_FINES,
-            "label": _("Maximum amount of fines a patron can have before losing lending privileges"),
-            "format": "number",
+            "label": _("Maximum amount in fines a patron can have before losing lending privileges"),
+            "type": "number",
             "category": "Loans, Holds, & Fines",
         },
         {
             "key": LOAN_LIMIT,
             "label": _("Maximum number of books a patron can have on loan at once"),
             "description": _("(Note: depending on distributor settings, a patron may be able to exceed the limit by checking out books directly from a distributor's app. They may also get a limit exceeded error before they reach these limits if a distributor has a smaller limit.)"),
-            "format": "number",
+            "type": "number",
             "category": "Loans, Holds, & Fines",
         },
         {
             "key": HOLD_LIMIT,
             "label": _("Maximum number of books a patron can have on hold at once"),
             "description": _("(Note: depending on distributor settings, a patron may be able to exceed the limit by checking out books directly from a distributor's app. They may also get a limit exceeded error before they reach these limits if a distributor has a smaller limit.)"),
-            "format": "number",
+            "type": "number",
             "category": "Loans, Holds, & Fines",
         },
         {

@@ -417,6 +417,13 @@ def patron_auth_services():
 def patron_auth_service(service_id):
     return app.manager.admin_patron_auth_services_controller.process_delete(service_id)
 
+@app.route("/admin/patron_authentication_service_self_tests/<identifier>", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def patron_auth_self_tests(identifier):
+    return app.manager.admin_patron_auth_service_self_tests_controller.process_patron_auth_service_self_tests(identifier)
+
 @library_route("/admin/manage_patrons", methods=['POST'])
 @has_library
 @returns_json_or_response_or_problem_detail
@@ -467,6 +474,13 @@ def analytics_service(service_id):
 @requires_csrf_token
 def cdn_services():
     return app.manager.admin_cdn_services_controller.process_cdn_services()
+
+@app.route("/admin/search_service_self_tests/<identifier>", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def search_service_self_tests(identifier):
+    return app.manager.admin_search_service_self_tests_controller.process_search_service_self_tests(identifier)
 
 @app.route("/admin/cdn_service/<service_id>", methods=["DELETE"])
 @returns_json_or_response_or_problem_detail
@@ -625,12 +639,19 @@ def lane_hide(lane_identifier):
 def reset_lanes():
     return app.manager.admin_lanes_controller.reset()
 
-@app.route('/admin/sitewide_registration', methods=['POST'])
+@library_route("/admin/lanes/change_order", methods=["POST"])
+@has_library
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
-def sitewide_registration():
-    return app.manager.admin_sitewide_registration_controller.process_sitewide_registration()
+def change_lane_order():
+    return app.manager.admin_lanes_controller.change_order()
+
+@app.route("/admin/diagnostics")
+@requires_admin
+@returns_json_or_response_or_problem_detail
+def diagnostics():
+    return app.manager.timestamps_controller.diagnostics()
 
 @app.route('/admin/sign_in_again')
 def admin_sign_in_again():

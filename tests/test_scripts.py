@@ -49,6 +49,7 @@ from core.metadata_layer import (
 
 from core.model import (
     CachedFeed,
+    CachedMARCFile,
     ConfigurationSetting,
     create,
     Credential,
@@ -572,23 +573,133 @@ class TestCacheMARCFiles(TestLaneScript):
 
     def test_process_lane(self):
         lane = self._lane(genres=["Science Fiction"])
-        
+        integration = self._external_integration(
+            ExternalIntegration.MARC_EXPORT, ExternalIntegration.CATALOG_GOAL)
+
         class MockMARCExporter(MARCExporter):
-            called_with = None
+            called_with = []
 
-            def records(self, lane, annotator):
-                self.called_with = [lane, annotator]
+            def records(self, lane, annotator, start_time=None):
+                self.called_with += [(lane, annotator, start_time)]
 
-        exporter = MockMARCExporter(None, None, None)
+        exporter = MockMARCExporter(None, None, integration)
         script = CacheMARCFiles(self._db, cmd_args=[])
         script.process_lane(lane, exporter)
-        eq_(lane, exporter.called_with[0])
-        assert isinstance(exporter.called_with[1], MARCLibraryAnnotator)
+
+        # If the script has never been run before, it runs the exporter once
+        # to create a file with all records.
+        eq_(1, len(exporter.called_with))
+
+        eq_(lane, exporter.called_with[0][0])
+        assert isinstance(exporter.called_with[0][1], MARCLibraryAnnotator)
+        eq_(None, exporter.called_with[0][2])
+
+        # If we have a cached file already, and it's old enough, the script will
+        # run the exporter twice, first to update that file and second to create
+        # a file with changes since that first file was originally created.
+        exporter.called_with = []
+        now = datetime.datetime.utcnow()
+        yesterday = now - datetime.timedelta(days=1)
+        last_week = now - datetime.timedelta(days=7)
+        ConfigurationSetting.for_library_and_externalintegration(
+            self._db, MARCExporter.UPDATE_FREQUENCY, self._default_library,
+            integration).value = 3
+        representation, ignore = self._representation()
+        cached, ignore = create(
+            self._db, CachedMARCFile, library=self._default_library,
+            lane=lane, representation=representation, end_time=last_week)
+
+        script.process_lane(lane, exporter)
+
+        eq_(2, len(exporter.called_with))
+
+        eq_(lane, exporter.called_with[0][0])
+        assert isinstance(exporter.called_with[0][1], MARCLibraryAnnotator)
+        eq_(None, exporter.called_with[0][2])
+
+        eq_(lane, exporter.called_with[1][0])
+        assert isinstance(exporter.called_with[1][1], MARCLibraryAnnotator)
+        assert exporter.called_with[1][2] < last_week
+
+        # If we already have a recent cached file, the script won't do anything.
+        cached.end_time = yesterday
+        exporter.called_with = []
+        script.process_lane(lane, exporter)
+        eq_([], exporter.called_with)
+
+        # But we can force it to run anyway.
+        script = CacheMARCFiles(self._db, cmd_args=["--force"])
+        script.process_lane(lane, exporter)
+
+        eq_(2, len(exporter.called_with))
+
+        eq_(lane, exporter.called_with[0][0])
+        assert isinstance(exporter.called_with[0][1], MARCLibraryAnnotator)
+        eq_(None, exporter.called_with[0][2])
+
+        eq_(lane, exporter.called_with[1][0])
+        assert isinstance(exporter.called_with[1][1], MARCLibraryAnnotator)
+        assert exporter.called_with[1][2] < yesterday
+        assert exporter.called_with[1][2] > last_week
+
+        # The update frequency can also be 0, in which case it will always run.
+        ConfigurationSetting.for_library_and_externalintegration(
+            self._db, MARCExporter.UPDATE_FREQUENCY, self._default_library,
+            integration).value = 0
+        exporter.called_with = []
+        script = CacheMARCFiles(self._db, cmd_args=[])
+        script.process_lane(lane, exporter)
+
+        eq_(2, len(exporter.called_with))
+
+        eq_(lane, exporter.called_with[0][0])
+        assert isinstance(exporter.called_with[0][1], MARCLibraryAnnotator)
+        eq_(None, exporter.called_with[0][2])
+
+        eq_(lane, exporter.called_with[1][0])
+        assert isinstance(exporter.called_with[1][1], MARCLibraryAnnotator)
+        assert exporter.called_with[1][2] < yesterday
+        assert exporter.called_with[1][2] > last_week
+
+
 
 class TestInstanceInitializationScript(DatabaseTest):
 
     def test_run(self):
-        timestamp = get_one(self._db, Timestamp, service=u"Database Migration")
+
+        # If the database has been initialized -- which happened
+        # during the test suite setup -- run() will bail out and never
+        # call do_run().
+        class Mock(InstanceInitializationScript):
+            def do_run(self):
+                raise Exception("I'll never be called.")
+        Mock().run()
+
+        # If the database has not been initialized, run() will detect
+        # this and call do_run().
+
+        # Simulate an uninitialized database by changing the test SQL
+        # to refer to a nonexistent table. Since this 'known' table
+        # doesn't exist, we must not have initialized the site,
+        # and do_run() will be called.
+        class Mock(InstanceInitializationScript):
+            TEST_SQL = "select * from nosuchtable"
+            def do_run(self, *args, **kwargs):
+                self.was_run = True
+
+        script = Mock()
+        script.run()
+        eq_(True, script.was_run)
+
+
+    def test_do_run(self):
+        # Normally, do_run is only called by run() if the database has
+        # not yet meen initialized. But we can test it by calling it
+        # directly.
+        timestamp = get_one(
+            self._db, Timestamp, service=u"Database Migration",
+            service_type=Timestamp.SCRIPT_TYPE
+        )
         eq_(None, timestamp)
 
         # Remove all secret keys, should they exist, before running the
@@ -601,7 +712,10 @@ class TestInstanceInitializationScript(DatabaseTest):
         script.do_run(ignore_search=True)
 
         # It initializes the database.
-        timestamp = get_one(self._db, Timestamp, service=u"Database Migration")
+        timestamp = get_one(
+            self._db, Timestamp, service=u"Database Migration",
+            service_type=Timestamp.SCRIPT_TYPE
+        )
         assert timestamp
 
         # It creates a secret key.
@@ -816,6 +930,10 @@ class TestDirectoryImportScript(DatabaseTest):
          (coll1, o2, policy2, c2, e2, r2)] = script.work_from_metadata_calls
         for policy in policy1, policy2:
             eq_(mirror, policy.mirror)
+
+        # timestamp_collection has been set to the Collection that will be
+        # used when a Timestamp is created for this script.
+        eq_(self._default_collection, script.timestamp_collection)
 
     def test_load_collection_no_site_wide_mirror(self):
         # Calling load_collection creates a new collection with

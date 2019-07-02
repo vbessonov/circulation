@@ -9,6 +9,7 @@ import base64
 from wsgiref.handlers import format_date_time
 from time import mktime
 import os
+from collections import defaultdict
 
 from lxml import etree
 from sqlalchemy.orm import eagerload
@@ -56,6 +57,7 @@ from core.model import (
     Admin,
     Annotation,
     CachedFeed,
+    CachedMARCFile,
     CirculationEvent,
     Collection,
     Complaint,
@@ -141,7 +143,7 @@ from adobe_vendor_id import (
 )
 from circulation import CirculationAPI
 from shared_collection import SharedCollectionAPI
-from odl import ODLWithConsolidatedCopiesAPI
+from odl import ODLAPI
 from novelist import (
     NoveListAPI,
     MockNoveListAPI,
@@ -242,6 +244,8 @@ class CirculationManager(object):
         patron_web_domains = set()
 
         def get_domain(url):
+            if url == "*":
+                return url
             scheme, netloc, path, parameters, query, fragment = urlparse.urlparse(url)
             return scheme + "://" + netloc
 
@@ -772,7 +776,7 @@ class OPDSFeedController(CirculationManagerController):
             collection_name=collection.name
         )
         lane = CrawlableCollectionBasedLane(None, [collection])
-        if collection.protocol in [ODLWithConsolidatedCopiesAPI.NAME]:
+        if collection.protocol in [ODLAPI.NAME]:
             annotator = SharedCollectionAnnotator(collection, lane)
         else:
             annotator = CirculationManagerAnnotator(lane)
@@ -864,13 +868,17 @@ class OPDSFeedController(CirculationManagerController):
 
         annotator = self.manager.annotator(lane, facets)
         info = OpenSearchDocument.search_info(lane)
+        search_engine = self.manager.external_search
+        if not search_engine:
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _("The search index for this site is not properly configured.")
+            )
         opds_feed = AcquisitionFeed.search(
             _db=self._db, title=info['name'],
-            url=this_url, lane=lane, search_engine=self.manager.external_search,
+            url=this_url, lane=lane, search_engine=search_engine,
             query=query, annotator=annotator, pagination=pagination,
             facets=facets,
         )
-
         return feed_response(opds_feed)
 
 class MARCRecordController(CirculationManagerController):
@@ -884,8 +892,8 @@ class MARCRecordController(CirculationManagerController):
 
     def download_page(self):
         library = flask.request.library
-        last_update = None
         body = "<h2>Download MARC files for %s</h2>" % library.name
+        time_format = "%B %-d, %Y"
 
         # Check if a MARC exporter is configured so we can show a
         # message if it's not.
@@ -898,15 +906,44 @@ class MARCRecordController(CirculationManagerController):
         if len(library.cachedmarcfiles) < 1 and exporter:
             body += "<p>" + _("MARC files aren't ready to download yet.") + "</p>"
 
-        if library.cachedmarcfiles:
-            body += "<ul>"
-            for file in library.cachedmarcfiles:
-                if last_update is None or file.representation.mirrored_at > last_update:
-                    last_update = file.representation.mirrored_at
-                body += '<li><a href="%s">%s</a></li>' % (file.representation.mirror_url, file.lane.display_name if file.lane else "All Books")
-            body += "</ul>"
-        if last_update:
-            body += "<p>Last update: %s</p>" % last_update.strftime("%B %-d, %Y")
+        files_by_lane = defaultdict(dict)
+        for file in library.cachedmarcfiles:
+            if file.start_time == None:
+                files_by_lane[file.lane]["full"] = file
+            else:
+                if not files_by_lane[file.lane].get("updates"):
+                    files_by_lane[file.lane]["updates"] = []
+                files_by_lane[file.lane]["updates"].append(file)
+
+        # TODO: By default the MARC script only caches one level of lanes,
+        # so sorting by priority is good enough.
+        lanes = sorted(files_by_lane.keys(), key=lambda x: x.priority if x else -1)
+
+        for lane in lanes:
+            files = files_by_lane[lane]
+            body += "<section>"
+            body += "<h3>%s</h3>" % (lane.display_name if lane else _("All Books"))
+            if files.get("full"):
+                file = files.get("full")
+                full_url = file.representation.mirror_url
+                full_label = _("Full file - last updated %(update_time)s", update_time=file.end_time.strftime(time_format))
+                body += '<a href="%s">%s</a>' % (files.get("full").representation.mirror_url, full_label)
+
+                if files.get("updates"):
+                    body += "<h4>%s</h4>" % _("Update-only files")
+                    body += "<ul>"
+                    files.get("updates").sort(key=lambda x: x.end_time)
+                    for update in files.get("updates"):
+                        update_url = update.representation.mirror_url
+                        update_label = _("Updates from %(start_time)s to %(end_time)s",
+                                         start_time=update.start_time.strftime(time_format),
+                                         end_time=update.end_time.strftime(time_format))
+                        body += '<li><a href="%s">%s</a></li>' % (update_url, update_label)
+                    body += "</ul>"
+
+            body += "</section>"
+            body += "<br />"
+
         html = self.DOWNLOAD_TEMPLATE % dict(body=body)
         headers = dict()
         headers['Content-Type'] = "text/html"
@@ -1117,7 +1154,7 @@ class LoanController(CirculationManagerController):
             return problem_doc
         return best, mechanism
 
-    def fulfill(self, license_pool_id, mechanism_id=None, do_get=None):
+    def fulfill(self, license_pool_id, mechanism_id=None, part=None, do_get=None):
         """Fulfill a book that has already been checked out,
         or which can be fulfilled with no active loan.
 
@@ -1125,6 +1162,13 @@ class LoanController(CirculationManagerController):
         of the book, a key (such as a DRM license file or bearer
         token) which can be used to get the book, or an OPDS entry
         containing a link to the book.
+
+        :param license_pool_id: Database ID of a LicensePool.
+        :param mechanism_id: Database ID of a DeliveryMechanism.
+
+        :param part: Vendor-specific identifier used when fulfilling a
+           specific part of a book rather than the whole thing (e.g. a
+           single chapter of an audiobook).
         """
         do_get = do_get or Representation.simple_http_get
 
@@ -1196,9 +1240,19 @@ class LoanController(CirculationManagerController):
                     _("You must specify a delivery mechanism to fulfill this loan.")
                 )
 
+        # Define a function that, given a part identifier, will create
+        # an appropriate link to this controller.
+        def fulfill_part_url(part):
+            return url_for(
+                "fulfill", license_pool_id=requested_license_pool.id,
+                mechanism_id=mechanism.delivery_mechanism.id,
+                part=unicode(part), _external=True
+            )
+
         try:
             fulfillment = self.circulation.fulfill(
-                patron, credential, requested_license_pool, mechanism
+                patron, credential, requested_license_pool, mechanism,
+                part=part, fulfill_part_url=fulfill_part_url
             )
         except DeliveryMechanismConflict, e:
             return DELIVERY_CONFLICT.detailed(e.message)
@@ -1565,7 +1619,7 @@ class WorkController(CirculationManagerController):
             lane = RecommendationLane(
                 library, work, lane_name, novelist_api=novelist_api
             )
-        except ValueError, e:
+        except CannotLoadConfiguration, e:
             # NoveList isn't configured.
             return NO_SUCH_LANE.detailed(_("Recommendations not available"))
 
@@ -1665,7 +1719,7 @@ class ProfileController(CirculationManagerController):
         """Instantiate a CoreProfileController that actually does the work.
         """
         patron = self.authenticated_patron_from_request()
-        storage = CirculationPatronProfileStorage(patron)
+        storage = CirculationPatronProfileStorage(patron, flask.url_for)
         return CoreProfileController(storage)
 
     def protocol(self):
@@ -1730,7 +1784,7 @@ class ODLNotificationController(CirculationManagerController):
             return NO_ACTIVE_LOAN.detailed(_("No loan was found for this identifier."))
 
         collection = loan.license_pool.collection
-        if collection.protocol != ODLWithConsolidatedCopiesAPI.NAME:
+        if collection.protocol != ODLAPI.NAME:
             return INVALID_LOAN_FOR_ODL_NOTIFICATION
 
         api = self.manager.circulation_apis[library.id].api_for_license_pool(loan.license_pool)

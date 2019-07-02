@@ -25,7 +25,7 @@ class FirstBookAuthenticationAPI(BasicAuthenticationProvider):
 
     DESCRIPTION = _("""
         An authentication service for Open eBooks that authenticates
-        using access codes and PINs.""")
+        using access codes and PINs. (This is the old version.)""")
 
     DISPLAY_NAME = NAME
     DEFAULT_IDENTIFIER_LABEL = _("Access Code")
@@ -42,7 +42,7 @@ class FirstBookAuthenticationAPI(BasicAuthenticationProvider):
     DEFAULT_PASSWORD_REGULAR_EXPRESSION = '^[0-9]+$'
 
     SETTINGS = [
-        { "key": ExternalIntegration.URL, "label": _("URL"), "required": True },
+        { "key": ExternalIntegration.URL, "format": "url", "label": _("URL"), "required": True },
         { "key": ExternalIntegration.PASSWORD, "label": _("Key"), "required": True },
     ] + BasicAuthenticationProvider.SETTINGS
 

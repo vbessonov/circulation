@@ -1,6 +1,7 @@
 import datetime
 import random
 from nose.tools import (
+    assert_raises_regexp,
     set_trace,
     eq_,
 )
@@ -10,6 +11,7 @@ from . import (
     sample_data,
 )
 
+from core.metadata_layer import TimestampData
 from core.model import (
     Annotation,
     Collection,
@@ -17,6 +19,7 @@ from core.model import (
     DataSource,
     ExternalIntegration,
     Identifier,
+    Timestamp,
 )
 from core.opds_import import MockMetadataWranglerOPDSLookup
 from core.testing import (
@@ -35,7 +38,7 @@ from api.monitor import (
 )
 
 from api.odl import (
-    ODLWithConsolidatedCopiesAPI,
+    ODLAPI,
     SharedODLAPI,
 )
 
@@ -52,7 +55,18 @@ class InstrumentedMWCollectionUpdateMonitor(MWCollectionUpdateMonitor):
                      self).import_one_feed(timestamp, url)
 
 
-class TestMWCollectionUpdateMonitor(DatabaseTest):
+class MonitorTest(DatabaseTest):
+
+    @property
+    def ts(self):
+        """Make the timestamp used by run() when calling run_once().
+
+        This makes it easier to test run_once() in isolation.
+        """
+        return self.monitor.timestamp().to_data()
+
+
+class TestMWCollectionUpdateMonitor(MonitorTest):
 
     def setup(self):
         super(TestMWCollectionUpdateMonitor, self).setup()
@@ -72,6 +86,15 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
 
         self.monitor = InstrumentedMWCollectionUpdateMonitor(
             self._db, self.collection, self.lookup
+        )
+
+    def test_monitor_requires_authentication(self):
+        class Mock(object):
+            authenticated = False
+        self.monitor.lookup = Mock()
+        assert_raises_regexp(
+            Exception, "no authentication credentials",
+            self.monitor.run_once, self.ts
         )
 
     def test_import_one_feed(self):
@@ -97,21 +120,21 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
         eq_(datetime.datetime(2016, 9, 20, 19, 37, 2), timestamp)
 
     def test_empty_feed_stops_import(self):
-        """We don't follow the 'next' link of an empty feed."""
+        # We don't follow the 'next' link of an empty feed.
         data = sample_data('metadata_updates_empty_response.opds', 'opds')
         self.lookup.queue_response(
             200, {'content-type' : OPDSFeed.ACQUISITION_FEED_TYPE}, data
         )
 
-        new_timestamp = self.monitor.run_once(None, None)
+        new_timestamp = self.monitor.run()
 
         # We could have followed the 'next' link, but we chose not to.
         eq_([(None, None)], self.monitor.imports)
         eq_(1, len(self.lookup.requests))
 
-        # The timestamp was not updated because nothing was in the feed.
-        eq_(None, new_timestamp)
-        eq_(None, self.monitor.timestamp().timestamp)
+        # The timestamp's finish date was not updated because nothing
+        # was in the feed.
+        eq_(None, self.monitor.timestamp().finish)
 
     def test_run_once(self):
         # Setup authentication and Metadata Wrangler details.
@@ -138,17 +161,19 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
                 200, {'content-type' : OPDSFeed.ACQUISITION_FEED_TYPE}, data
             )
 
-        new_timestamp = self.monitor.run_once(None, None)
+        timestamp = self.ts
+        new_timestamp = self.monitor.run_once(timestamp)
 
         # We have a new value to use for the Monitor's timestamp -- the
         # earliest date seen in the last OPDS feed that contained
         # any entries.
-        eq_(datetime.datetime(2016, 9, 20, 19, 37, 2), new_timestamp)
+        eq_(datetime.datetime(2016, 9, 20, 19, 37, 2), new_timestamp.finish)
+        eq_("Editions processed: 1", new_timestamp.achievements)
 
         # Normally run_once() doesn't update the monitor's timestamp,
         # but this implementation does, so that work isn't redone if
         # run_once() crashes or the monitor is killed.
-        eq_(new_timestamp, self.monitor.timestamp().timestamp)
+        eq_(new_timestamp.finish, self.monitor.timestamp().finish)
 
         # The original Identifier has information from the
         # mock Metadata Wrangler.
@@ -172,7 +197,7 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
 
     def test_no_changes_means_no_timestamp_update(self):
         before = datetime.datetime.utcnow()
-        self.monitor.timestamp().timestamp = before
+        self.monitor.timestamp().finish = before
 
         # We're going to ask the metadata wrangler for updates, but
         # there will be none.
@@ -180,12 +205,23 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
         self.lookup.queue_response(
             200, {'content-type' : OPDSFeed.ACQUISITION_FEED_TYPE}, data
         )
-        new_timestamp = self.monitor.run_once(None, None)
+        new_timestamp = self.monitor.run_once(self.ts)
 
-        # run_once() returned the original timestamp, and the
-        # Timestamp object was not updated.
-        eq_(before, new_timestamp)
-        eq_(before, self.monitor.timestamp().timestamp)
+        # run_once() returned a TimestampData referencing the original
+        # timestamp, and the Timestamp object was not updated.
+        eq_(before, new_timestamp.finish)
+        eq_(before, self.monitor.timestamp().finish)
+
+        # If timestamp.finish is None before the update is run, and
+        # there are no updates, the default rules about updating
+        # Timestamp.finish will not apply -- it will be explicitly set
+        # to None.
+        self.monitor.timestamp().finish = None
+        self.lookup.queue_response(
+            200, {'content-type' : OPDSFeed.ACQUISITION_FEED_TYPE}, data
+        )
+        new_timestamp = self.monitor.run_once(self.ts)
+        eq_(Timestamp.CLEAR_VALUE, new_timestamp.finish)
 
     def test_no_import_loop(self):
         """We stop processing a feed's 'next' link if it links to a URL we've
@@ -206,7 +242,7 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
         self.lookup.queue_response(
             200, {'content-type' : OPDSFeed.ACQUISITION_FEED_TYPE}, data
         )
-        new_timestamp = self.monitor.run_once(None, None)
+        new_timestamp = self.monitor.run_once(self.ts)
 
         # Even though all these pages had the same content, we kept
         # processing them until we encountered a 'next' link we had
@@ -216,7 +252,7 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
         eq_((None, u'http://next-link/'), second)
         eq_((None, u'http://different-link/'), third)
 
-        eq_(datetime.datetime(2016, 9, 20, 19, 37, 2), new_timestamp)
+        eq_(datetime.datetime(2016, 9, 20, 19, 37, 2), new_timestamp.finish)
 
     def test_get_response(self):
 
@@ -261,7 +297,7 @@ class TestMWCollectionUpdateMonitor(DatabaseTest):
         eq_(['http://now used/'], lookup.urls)
 
 
-class TestMWAuxiliaryMetadataMonitor(DatabaseTest):
+class TestMWAuxiliaryMetadataMonitor(MonitorTest):
 
     def setup(self):
         super(TestMWAuxiliaryMetadataMonitor, self).setup()
@@ -284,6 +320,15 @@ class TestMWAuxiliaryMetadataMonitor(DatabaseTest):
 
         self.monitor = MWAuxiliaryMetadataMonitor(
             self._db, self.collection, lookup=self.lookup, provider=provider
+        )
+
+    def test_monitor_requires_authentication(self):
+        class Mock(object):
+            authenticated = False
+        self.monitor.lookup = Mock()
+        assert_raises_regexp(
+            Exception, "no authentication credentials",
+            self.monitor.run_once, self.ts
         )
 
     def prep_feed_identifiers(self):
@@ -354,9 +399,16 @@ class TestMWAuxiliaryMetadataMonitor(DatabaseTest):
                 200, {'content-type' : OPDSFeed.ACQUISITION_FEED_TYPE}, feed
             )
 
-        self.monitor.run_once(None, None)
+        progress = self.monitor.run_once(self.ts)
 
         # Only the identifier with a work has been given coverage.
+        eq_("Identifiers processed: 1", progress.achievements)
+
+        # The TimestampData returned by run_once() does not include
+        # any timing information -- that will be applied by run().
+        eq_(None, progress.start)
+        eq_(None, progress.finish)
+
         record = CoverageRecord.lookup(
             overdrive, self.monitor.provider.data_source,
             operation=self.monitor.provider.operation
@@ -379,7 +431,7 @@ class TestLoanlikeReaperMonitor(DatabaseTest):
         will be exempt from the reaper.
         """
         for i in (
-                ODLWithConsolidatedCopiesAPI.NAME,
+                ODLAPI.NAME,
                 SharedODLAPI.NAME,
                 ExternalIntegration.OPDS_FOR_DISTRIBUTORS,
         ):

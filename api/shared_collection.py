@@ -65,9 +65,9 @@ class SharedCollectionAPI(object):
         """When you see a Collection that implements protocol X, instantiate
         API class Y to handle that collection.
         """
-        from odl import ODLWithConsolidatedCopiesAPI
+        from odl import ODLAPI
         return {
-            ODLWithConsolidatedCopiesAPI.NAME: ODLWithConsolidatedCopiesAPI,
+            ODLAPI.NAME: ODLAPI,
         }
 
     def api_for_licensepool(self, pool):
@@ -208,7 +208,7 @@ class BaseSharedCollectionAPI(object):
             "label": _("Ebook Loan Duration for libraries on other circulation managers (in Days)"),
             "default": Collection.STANDARD_DEFAULT_LOAN_PERIOD,
             "description": _("When a patron from another library borrows an ebook from this collection, the circulation manager will ask for a loan that lasts this number of days. This must be equal to or less than the maximum loan duration negotiated with the distributor."),
-            "format": "number",
+            "type": "number",
         }
     ]
 

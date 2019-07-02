@@ -7,9 +7,11 @@ import json
 import logging
 from nose.tools import set_trace
 import os
+import random
 import re
 import requests
 from sqlalchemy.orm.session import Session
+import string
 import uuid
 
 from circulation import (
@@ -42,6 +44,7 @@ from core.metadata_layer import (
     Metadata,
     ReplacementPolicy,
     SubjectData,
+    TimestampData,
 )
 
 from core.model import (
@@ -114,7 +117,7 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
 
     SETTINGS = [
         { "key": ExternalIntegration.PASSWORD, "label": _("Basic Token"), "required": True },
-        { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID"), "required": True, "format": "number"},
+        { "key": Collection.EXTERNAL_ACCOUNT_ID_KEY, "label": _("Library ID (numeric)"), "required": True, "type": "number"},
         { "key": ExternalIntegration.URL, "label": _("URL"), "default": PRODUCTION_BASE_URL, "required": True, "format": "url" },
     ] + BASE_SETTINGS
 
@@ -286,7 +289,6 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
             allowed_response_codes=allowed_response_codes,
             disallowed_response_codes=disallowed_response_codes
         )
-
         if (response.content
             and 'Invalid Basic Token or permission denied' in response.content):
             raise BadResponseException(
@@ -296,20 +298,6 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
             )
 
         return response
-
-    def remote_email_address(self, patron):
-        """The fake email address to send to RBdigital when
-        signing up this patron.
-        """
-        default = self.default_notification_email_address(patron, None)
-        if not default:
-            raise RemotePatronCreationFailedException(
-                _("Cannot create remote account for patron because library's default notification address is not set.")
-            )
-        patron_identifier = patron.identifier_to_remote_service(
-            DataSource.RB_DIGITAL
-        )
-        return default.replace('@', '+rbdigital-%s@' % patron_identifier, 1)
 
     def checkin(self, patron, pin, licensepool):
         """
@@ -437,15 +425,29 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
 
         return resp_obj
 
-    def fulfill(self, patron, pin, licensepool, internal_format):
-        """ Get the actual resource file to the patron.
+    def fulfill(
+        self, patron, pin, licensepool, internal_format, part=None,
+        fulfill_part_url=None
+    ):
+        """Get an actual resource file to the patron. This may
+        represent the entire book or only one part of it.
+
+        :param part: When the patron wants to fulfill a specific part
+        of the book, rather than the title as a whole, this will be
+        set to a string representation of the numeric position of the
+        desired part.
+
+        :param fulfill_part_url: When the book can be fulfilled in
+        parts, this function will take a part number and generate the
+        URL to fulfill that specific part.
+
         :return a FulfillmentInfo object.
         """
 
         patron_rbdigital_id = self.patron_remote_identifier(patron)
         (item_rbdigital_id, item_media) = self.validate_item(licensepool)
 
-        checkouts_list = self.get_patron_checkouts(patron_id=patron_rbdigital_id)
+        checkouts_list = self.get_patron_checkouts(patron_id=patron_rbdigital_id, fulfill_part_url=fulfill_part_url)
 
         # find this licensepool in patron's checkouts
         found_checkout = None
@@ -461,7 +463,13 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
                 )
             )
 
-        return found_checkout.fulfillment_info
+        fulfillment = found_checkout.fulfillment_info
+        if part is None:
+            # They want the whole thing.
+            return fulfillment
+
+        # They want only one part of the book.
+        return fulfillment.fulfill_part(part)
 
     def place_hold(self, patron, pin, licensepool, notification_email_address):
         """Place a book on hold.
@@ -616,8 +624,6 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
             # Also, their DRM usage may change in the future.
             drm_scheme = DeliveryMechanism.ADOBE_DRM
         elif medium == 'eaudio':
-            # TODO: we can't deliver on this promise yet, but this is
-            # how we will be delivering audiobook manifests.
             delivery_type = Representation.AUDIOBOOK_MANIFEST_MEDIA_TYPE
 
         if delivery_type:
@@ -663,56 +669,134 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
 
         The identifier is cached in a persistent Credential object.
 
-        :return: The remote identifier for this patron, taken from
-        the corresponding Credential.
-        """
-        def refresher(credential):
-            remote_identifier = self.patron_remote_identifier_lookup(patron)
-            if not remote_identifier:
-                remote_identifier = self.create_patron(patron)
-            credential.credential = remote_identifier
-            credential.expires = None
+        The logic is complicated and spread out over multiple methods,
+        so here it is all in one place:
 
+        If an already-cached identifier is present, we use it.
+
+        Otherwise, we look up the patron's barcode on RBdigital to try
+        to find their existing RBdigital account.
+
+        If we find an existing RBdigital account, we cache the
+        identifier associated with that account.
+
+        Otherwise, we need to create an RBdigital account for this patron:
+
+        If the ILS provides access to the patron's email address, we
+        create an account using the patron's actual barcode and email
+        address. This will let them use the 'recover password' feature
+        if they want to use the RBdigital web site.
+
+        If the ILS does not provide access to the patron's email
+        address, we create an account using the patron's actual
+        barcode but with six random characters appended. This will let
+        the patron create a new RBdigital account using their actual
+        barcode, if they want to use the web site.
+
+        :param patron: A Patron.
+        :return: The identifier associated with the patron's (possibly
+            newly created) RBdigital account. This is an
+            RBdigital-internal identifier with no connection to any
+            identifier used by the patron, the circulation manager,
+            and the ILS.
+        """
+
+        # Set up a refresher method that takes no arguments except the
+        # credential -- this is what lookup() expects.
+        def refresh_credential(credential):
+            try:
+                remote_identifier = self._find_or_create_remote_account(
+                    patron
+                )
+                credential.credential = remote_identifier
+                credential.expires = None
+            except CirculationException:
+                # If an exception was thrown by _find_or_create_remote_account
+                # delete the credential so we don't create a credential with
+                # None stored in credential.credential, then continue to raise
+                # the exception.
+                _db = Session.object_session(credential)
+                _db.delete(credential)
+                raise
+            return credential
+
+        # Find or create the credential.
+        # We use the DB session from the passed in patron object here
+        # because in the case we are in a thread the self._db session may be
+        # different from the session used for patron. By using the session
+        # from patron we make sure all the DB objects interacting with each
+        # other are from the same session.
         _db = Session.object_session(patron)
+        collection = Collection.by_id(_db, id=self.collection_id)
         credential = Credential.lookup(
             _db, DataSource.RB_DIGITAL,
             Credential.IDENTIFIER_FROM_REMOTE_SERVICE,
-            patron, refresher_method=refresher,
-            allow_persistent_token=True
+            patron, refresh_credential,
+            collection=collection, allow_persistent_token=True
         )
-        if not credential.credential:
-            refresher(credential)
         return credential.credential
 
-    def create_patron(self, patron):
+    def _find_or_create_remote_account(self, patron):
+        """Look up a patron on RBdigital, creating an account if necessary.
+
+        :param patron: A Patron.
+        :return: The identifier associated with the (possibly newly
+            created) RBdigital account. This is an RBdigital-internal
+            patron ID and has no connection to any identifier used
+            by the patron, the circulation manager, and the ILS.
+        """
+
+        # Try the easy case -- the patron already set up an RBdigital
+        # account using their authorization identifier.
+        remote_identifier = self.patron_remote_identifier_lookup(
+            patron.authorization_identifier
+        )
+        if remote_identifier:
+            return remote_identifier
+
+        # There is no RBdigital account associated with the patron's
+        # authorization identifier. And there is no preexisting
+        # Credential representing a dummy account, or this method
+        # wouldn't have been called. We must create a new account.
+        try:
+            return self.create_patron(
+                patron.library, patron.authorization_identifier,
+                self.patron_email_address(patron)
+            )
+        except RemotePatronCreationFailedException:
+            # Its possible to get a RemotePatronCreationFailedException if an account
+            # was already created for this patron, but never put in the DB due to an
+            # error. Here we try to recover that account using its email address.
+            remote_identifier = self.patron_remote_identifier_lookup(
+                self.patron_email_address(patron)
+            )
+            if remote_identifier:
+                return remote_identifier
+            else:
+                raise
+
+
+    def create_patron(self, library, authorization_identifier, email_address):
         """Ask RBdigital to create a new patron record.
 
-        :param patron: the Patron that needs a new RBdigital account.
+        :param library: Library for the patron that needs a new RBdigital
+            account. This has no necessary connection to the 'library_id'
+            associated with the RBDigitalAPI, since multiple circulation
+            manager libraries may share an RBdigital account.
+        :param authorization_identifier: The identifier the patron uses
+            to authenticate with their library.
+        :param email_address: The email address, if any, which the patron
+            has shared with their library.
 
         :return The internal RBdigital identifier for this patron.
         """
 
-        url = "%s/libraries/%s/patrons/" % (self.base_url, str(self.library_id))
+        url = "%s/libraries/%s/patrons/" % (self.base_url, self.library_id)
         action="create_patron"
 
-        patron_identifier = patron.identifier_to_remote_service(
-            DataSource.RB_DIGITAL
+        post_args = self._create_patron_body(
+            library, authorization_identifier, email_address
         )
-
-        post_args = dict()
-        post_args['libraryId'] = self.library_id
-        post_args['libraryCardNumber'] = patron_identifier
-
-        # Generate meaningless values for account fields that are not
-        # relevant to our usage of the API.
-        post_args['userName'] = 'username' + patron_identifier.replace("-", "")
-        post_args['email'] = self.remote_email_address(patron)
-        post_args['firstName'] = 'Patron'
-        post_args['lastName'] = 'Reader'
-
-        # The patron will not be logging in to this RBdigital account,
-        # so set their password to a secure value and forget it.
-        post_args['password'] = os.urandom(8).encode('hex')
 
         resp_dict = {}
         message = None
@@ -740,20 +824,108 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
                 ": http=" + str(response.status_code) + ", response=" + response.text)
         return patron_rbdigital_id
 
-    def patron_remote_identifier_lookup(self, patron):
-        """Look up a patron's RBdigital account based on a unique ID
-        assigned to them for this purpose.
+    def _create_patron_body(self, library, authorization_identifier,
+                            email_address):
+        """Make the entity-body for a patron creation request.
 
-        :return: The RBdigital patron ID for the patron, or None
-        if the patron currently has no RBdigital account.
+        :param library: Library for the patron that needs a new RBdigital
+            account.
+        :param authorization_identifier: The identifier the patron uses
+            to authenticate with their library.
+        :param email_address: The email address, if any, which the patron
+            has shared with their library.
+
+        :return: A dictionary of key-value pairs to go along with an
+        HTTP POST request.
         """
-        patron_identifier = patron.identifier_to_remote_service(
-            DataSource.RB_DIGITAL
-        )
+        if email_address:
+            # We know the patron's email address. We can create an
+            # account they can also use in other contexts.
+            patron_identifier = authorization_identifier
+            email_address = email_address
+        else:
+            # We don't know the patron's email address. We will create
+            # a dummy account to avoid locking them out of the ability
+            # to use an RBdigital account in other contexts.
+            patron_identifier = self.dummy_patron_identifier(
+                authorization_identifier
+            )
+            email_address = self.dummy_email_address(
+                library, authorization_identifier
+            )
 
+        # If we are using the patron's actual authorization identifier,
+        # then our best guess at a username is that same identifier.
+        #
+        # If we're making up a dummy authorization identifier, then
+        # using that as the username will minimize the risk of taking
+        # someone's username.
+        #
+        # Either way:
+        username = patron_identifier
+
+        post_args = dict()
+        post_args['libraryId'] = self.library_id
+        post_args['libraryCard'] = patron_identifier
+        post_args['userName'] = username
+        post_args['email'] = email_address
+        post_args['firstName'] = 'Library'
+        post_args['lastName'] = 'Simplified'
+        post_args['postalCode'] = '11111'
+
+        # We have no way of communicating the password to this patron.
+        # Set it to a random value and forget it. If we're creating an
+        # account with the patron's email address, they'll be able to
+        # recover their password. If not, at least we didn't claim
+        # their barcode, and they can make a new account if they want.
+        post_args['password'] = os.urandom(8).encode('hex')
+        return post_args
+
+    def dummy_patron_identifier(self, authorization_identifier):
+        """Add six random alphanumeric characters to the end of
+        the given `authorization_identifier`.
+
+        :return: A random identifier based on the input identifier.
+        """
+        alphabet = string.digits + string.uppercase
+        addendum = "".join(random.choice(alphabet) for x in range(6))
+        return authorization_identifier + addendum
+
+    def dummy_email_address(self, library, authorization_identifier):
+        """The fake email address to send to RBdigital when
+        creating an account for the given patron.
+
+        :param library: A Library.
+        :param authorization_identifier: A patron's authorization identifier.
+        :return: An email address unique to this patron which will
+            bounce or reject all mail sent to it.
+        """
+        default = self.default_notification_email_address(library, None)
+        if not default:
+            raise RemotePatronCreationFailedException(
+                _("Cannot create remote account for patron because library's default notification address is not set.")
+            )
+        # notifications@library.org
+        #   =>
+        # notifications+rbdigital-1234567890@library.org
+        replace_with = '+rbdigital-%s@' % authorization_identifier
+        return default.replace('@', replace_with, 1)
+
+    def patron_remote_identifier_lookup(self, remote_identifier):
+        """Look up a patron's RBdigital account based on an identifier
+        associated with their circulation manager account.
+
+        :param remote_identifier: Depending on the context, this may
+        be the patron's actual barcode, or a random string _based_ on
+        their barcode.
+
+        :return: The internal RBdigital patron ID for the given
+        identifier, or None if there is no corresponding RBdigital
+        account.
+        """
         action="patron_id"
         url = "%s/rpc/libraries/%s/patrons/%s" % (
-            self.base_url, self.library_id, patron_identifier
+            self.base_url, self.library_id, remote_identifier
         )
 
         response = self.request(url)
@@ -769,7 +941,7 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
         internal_patron_id = resp_dict.get('patronId', None)
         return internal_patron_id
 
-    def get_patron_checkouts(self, patron_id):
+    def get_patron_checkouts(self, patron_id, fulfill_part_url=None):
         """
         Gets the books and audio the patron currently has checked out.
         Obtains fulfillment info for each item -- the way to fulfill a book
@@ -777,6 +949,9 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
         fulfillment endpoints on the individual items.
 
         :param patron_id RBDigital internal id for the patron.
+
+        :param fulfill_part_url: A function that generates circulation
+           manager fulfillment URLs for individual parts of a book.
         """
         url = "%s/libraries/%s/patrons/%s/checkouts/" % (self.base_url, str(self.library_id), patron_id)
         action="patron_checkouts"
@@ -801,14 +976,19 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
 
         # by now we can assume response is either empty or a list
         for item in resp_obj:
-            loan_info = self._make_loan_info(item)
+            loan_info = self._make_loan_info(
+                item, fulfill_part_url=fulfill_part_url
+            )
             if loan_info:
                 loans.append(loan_info)
         return loans
 
-    def _make_loan_info(self, item, fulfill=False):
+    def _make_loan_info(self, item, fulfill_part_url=None):
         """Convert one of the items returned by a request to /checkouts into a
         LoanInfo with an RBFulfillmentInfo.
+
+        :param fulfill_part_url: A function that generates circulation
+           manager fulfillment URLs for individual parts of a book.
         """
 
         media_type = item.get('mediaType', 'eBook')
@@ -832,6 +1012,7 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
             return None
 
         fulfillment_info = RBFulfillmentInfo(
+            fulfill_part_url,
             self,
             DataSource.RB_DIGITAL,
             identifier.type,
@@ -905,31 +1086,6 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
 
         return holds
 
-    def get_patron_information(self, patron_id):
-        """
-        Retrieves patron's name, email, library card number from RBDigital.
-
-        :param patron_id RBDigital's internal id for the patron.
-        """
-        if not patron_id:
-            raise InvalidInputException("Need patron RBDigital id.")
-
-        url = "%s/libraries/%s/patrons/%s" % (self.base_url, str(self.library_id), patron_id)
-        action="patron_info"
-
-        try:
-            response = self.request(url)
-        except Exception, e:
-            self.log.error("Patron info call failed: %r", e, exc_info=e)
-            raise RemoteInitiatedServerError(e.message, action)
-
-        resp_dict = response.json()
-        message = resp_dict.get('message', None)
-        self.validate_response(response, message, action=action)
-
-        # If needed, will put info into PatronData subclass.  For now, OK to return a dictionary.
-        return resp_dict
-
     def patron_activity(self, patron, pin):
         """ Get a patron's current checkouts and holds.
 
@@ -975,7 +1131,7 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
         if response.status_code not in [200, 201]:
             if not message:
                 message = response.text
-            self.log.warning("%s call failed: %s ", action, message)
+            self.log.info("%s call failed: %s ", action, message)
 
             if response.status_code == 500:
                 # yes, it could be a server error, but it can also be a malformed value in the request
@@ -1283,9 +1439,9 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
         delta = self.get_delta(from_date=(today - time_ago), to_date=today)
         if not delta or len(delta) < 1:
             return None, None
-
-        items_added = delta[0].get("addedTitles", 0)
-        items_removed = delta[0].get("removedTitles", 0)
+        [delta] = delta
+        items_added = delta.get("addedTitles", [])
+        items_removed = delta.get("removedTitles", [])
         items_transmitted = len(items_added) + len(items_removed)
         items_updated = 0
         coverage_provider = RBDigitalBibliographicCoverageProvider(
@@ -1296,6 +1452,11 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
             if not isinstance(result, CoverageFailure):
                 items_updated += 1
 
+                # NOTE: To be consistent with populate_all_catalog, we
+                # should start off assuming that this title is owned
+                # and lendable. In practice, this isn't a big deal,
+                # because process_availability() will give us the
+                # right answer soon enough.
                 if isinstance(result, Identifier):
                     # calls work.set_presentation_ready() for us
                     coverage_provider.handle_success(result)
@@ -1383,6 +1544,7 @@ class RBDigitalAPI(BaseCirculationAPI, HasSelfTests):
         response = self.request(url, params=args, verbosity=verbosity)
         return response
 
+
 class RBFulfillmentInfo(APIAwareFulfillmentInfo):
     """An RBdigital-specific FulfillmentInfo implementation.
 
@@ -1390,6 +1552,47 @@ class RBFulfillmentInfo(APIAwareFulfillmentInfo):
     generating a FulfillmentInfo object may require an extra HTTP request,
     and there's often no need to make that request.
     """
+
+    def __init__(self, fulfill_part_url, *args, **kwargs):
+        super(RBFulfillmentInfo, self).__init__(*args, **kwargs)
+        self.fulfill_part_url = fulfill_part_url
+
+    def fulfill_part(self, part):
+        """Fulfill a specific part of this book.
+
+        This will navigate the access document and find a link to
+        the actual MP3 file so that a client doesn't know how to
+        parse access documents.
+
+        :return: A FulfillmentInfo if the part could be fulfilled;
+        a ProblemDetail otherwise.
+        """
+        if self.content_type != Representation.AUDIOBOOK_MANIFEST_MEDIA_TYPE:
+            raise CannotPartiallyFulfill(
+                _("This work does not support partial fulfillment.")
+            )
+
+        try:
+            part = int(part)
+        except ValueError, e:
+            raise CannotPartiallyFulfill(
+                _('"%(part)s" is not a valid part number', part=part),
+            )
+
+        order = self.manifest.readingOrder
+        if part < 0 or len(order) <= part:
+            raise CannotPartiallyFulfill(
+                _("Could not locate part number %(part)s", part=part),
+            )
+        part_url = order[part]['href']
+        content_type, content_link, content_expires = (
+            self.fetch_access_document(part_url)
+        )
+        return FulfillmentInfo(
+            self.collection_id, self.data_source_name,
+            self.identifier_type, self.identifier, content_link,
+            content_type, None, content_expires
+        )
 
     def do_fetch(self):
         # Get a list of files associated with this loan.
@@ -1415,29 +1618,36 @@ class RBFulfillmentInfo(APIAwareFulfillmentInfo):
             individual_download_url = file.get('downloadUrl', None)
 
         if self._content_type == Representation.AUDIOBOOK_MANIFEST_MEDIA_TYPE:
-            # We have an audiobook.
-            self._content = self.process_audiobook_manifest(self.key)
-        else:
-            # We have some other kind of file. Follow the download
-            # link, which will return a JSON-based access document
-            # pointing to the 'real' download link.
-            #
-            # We don't send our normal RBdigital credentials with this
-            # request because it's going to a different, publicly
-            # accessible server.
-            access_document = self.api._make_request(
-                individual_download_url, 'GET', {}
+            # We have an audiobook. Convert it from the
+            # proprietary format to the standard format.
+            self.manifest = AudiobookManifest(
+                self.key, self.fulfill_part_url
             )
-            self._content_type, self._content_link, self._content_expires = self.process_access_document(
-                access_document
+            self._content = unicode(self.manifest)
+        else:
+            # We have some other kind of file. The download link
+            # points to an access document for that file.
+            self._content_type, self._content_link, self._content_expires = (
+                self.fetch_access_document(individual_download_url)
             )
 
-    @classmethod
-    def process_audiobook_manifest(self, rb_data):
-        """Convert RBdigital's proprietary manifest format
-        into a standard Audiobook Manifest document.
+    def fetch_access_document(self, url):
+        """Retrieve an access document from RBdigital and process it.
+
+        An access document is a small JSON document containing a link
+        to the URL we actually want to deliver.
         """
-        return unicode(AudiobookManifest(rb_data))
+        access_document = self._raw_request(url)
+        return self.process_access_document(access_document)
+
+    def _raw_request(self, url):
+        """Make a request without using our normal RBdigital credentials.
+
+        We do this when we need to access a different, publicly
+        accessible server. Basically this only happens when we are
+        retrieving access documents.
+        """
+        return self.api._make_request(url, 'GET', {})
 
     @classmethod
     def process_access_document(self, access_document):
@@ -1863,13 +2073,24 @@ class RBDigitalSyncMonitor(CollectionMonitor):
                  api_class_kwargs={}):
         """Constructor."""
         super(RBDigitalSyncMonitor, self).__init__(_db, collection)
-        self.api = api_class(_db, collection, **api_class_kwargs)
+        if not isinstance(api_class, RBDigitalAPI):
+            api_class = api_class(_db, collection, **api_class_kwargs)
+        self.api = api_class
 
-    def run_once(self, start, cutoff):
+    def run_once(self, progress):
+        """Find books in the RBdigital collection that changed recently.
+
+        :param progress: A TimestampData, ignored.
+        :return: A TimestampData describing what was accomplished.
+        """
         items_transmitted, items_created = self.invoke()
         self._db.commit()
-        result_string = "%s items transmitted, %s items saved to DB" % (items_transmitted, items_created)
-        self.log.info(result_string)
+        achievements = (
+            "Records received from vendor: %d. Records written to database: %d" % (
+                items_transmitted, items_created
+            )
+        )
+        return TimestampData(achievements=achievements)
 
     def invoke(self):
         raise NotImplementedError()
@@ -1910,7 +2131,6 @@ class RBDigitalCirculationMonitor(CollectionMonitor):
     """
     SERVICE_NAME = "RBDigital CirculationMonitor"
     DEFAULT_START_TIME = datetime.datetime(1970, 1, 1)
-    INTERVAL_SECONDS = 1200
     DEFAULT_BATCH_SIZE = 50
 
     PROTOCOL = ExternalIntegration.RB_DIGITAL
@@ -1954,14 +2174,20 @@ class RBDigitalCirculationMonitor(CollectionMonitor):
 
         return item_count
 
-    def run(self):
-        super(RBDigitalCirculationMonitor, self).run()
+    def run_once(self, progress):
+        """Update the availability information of all titles in the
+        RBdigital collection.
 
-    def run_once(self, start, cutoff):
+        :param progress: A TimestampData, ignored.
+        :return: A TimestampData describing what was accomplished.
+        """
         ebook_count = self.process_availability(media_type='eBook')
         eaudio_count = self.process_availability(media_type='eAudio')
 
-        self.log.info("Processed %d ebooks and %d audiobooks.", ebook_count, eaudio_count)
+        message = "Ebooks processed: %d. Audiobooks processed: %d." % (
+            ebook_count, eaudio_count
+        )
+        return TimestampData(achievements=message)
 
 class AudiobookManifest(CoreAudiobookManifest):
     """A standard AudiobookManifest derived from an RBdigital audiobook
@@ -1981,7 +2207,25 @@ class AudiobookManifest(CoreAudiobookManifest):
     # "patronId": 111,
     # "libraryId": 222
 
-    def __init__(self, content_dict, **kwargs):
+    # RBdigital audiobook manifests contain links to JSON documents
+    # that contain links to MP3 files. This is a media type we
+    # invented for these hypermedia documents, so that a client
+    # examining a manifest can distinguish them from random JSON
+    # files.
+    #
+    # Internally to the circulation manager, these documents can be processed
+    # with RBFulfillmentInfo.process_access_document.
+    INTERMEDIATE_LINK_MEDIA_TYPE = "vnd.librarysimplified/rbdigital-access-document+json"
+
+    def __init__(self, content_dict, fulfill_part_url=None, **kwargs):
+        """Create an audiobook manifest from the information provided
+        by RBdigital.
+
+        :param content_dict: A dictionary of data from RBdigital.
+        :param fulfill_part_url: A function that takes a part number
+            and returns a URL for fulfilling that part number on this
+            circulation manager.
+        """
         super(AudiobookManifest, self).__init__(**kwargs)
         self.raw = content_dict
 
@@ -2002,8 +2246,11 @@ class AudiobookManifest(CoreAudiobookManifest):
         self.import_metadata('encryptionKey', 'rbdigital:encryptionKey')
 
         # Spine items.
-        for file_data in self.raw.get('files', []):
-            self.import_spine(file_data)
+        for part_number, file_data in enumerate(self.raw.get('files', [])):
+            alternate_url = None
+            if fulfill_part_url:
+                alternate_url = fulfill_part_url(part_number)
+            self.import_spine(file_data, alternate_url)
 
         # Links.
         download_url = self.raw.get('downloadUrl')
@@ -2051,9 +2298,17 @@ class AudiobookManifest(CoreAudiobookManifest):
             value = transform(value)
         self.metadata[standard_field] = value
 
-    def import_spine(self, file_data):
+    def import_spine(self, file_data, alternate_url=None):
         """Import an RBdigital spine item as a Web Publication Manifest
         spine item.
+
+        :param file_data: A dictionary of information about this spine
+        item, obtained from RBdigital.
+
+        :param alternate_url: A URL generated by the circulation manager
+        (as opposed to being generated by RBdigital) for fulfilling this
+        spine item as an audio file (as opposed to a JSON document that
+        links to an audio file).
         """
         href = file_data.get('downloadUrl')
         duration = file_data.get('minutes') * 60
@@ -2062,9 +2317,16 @@ class AudiobookManifest(CoreAudiobookManifest):
         id = file_data.get('id')
         size = file_data.get('size')
         filename = file_data.get('filename')
-        type = Representation.guess_media_type(filename)
+        type = self.INTERMEDIATE_LINK_MEDIA_TYPE
 
         extra = {}
+        if alternate_url:
+            alternate_link = dict(
+                href=alternate_url,
+                type=Representation.guess_media_type(filename)
+            )
+            extra['alternates'] = [alternate_link]
+
         for k, v, transform in (
                 ('id', 'rbdigital:id', str),
                 ('size', 'schema:contentSize', lambda x: x),

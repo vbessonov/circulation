@@ -5,6 +5,7 @@ import os
 import base64
 import random
 import json
+import jwt
 import re
 import urllib
 import urlparse
@@ -22,6 +23,8 @@ from api.authenticator import (
     CannotCreateLocalPatron,
     PatronData,
 )
+from api.admin.validator import Validator
+from core.external_search import ExternalSearchIndex
 from core.model import (
     create,
     get_one,
@@ -53,6 +56,7 @@ from core.model import (
     RightsStatus,
     Session,
     Subject,
+    Timestamp,
     Work,
     WorkGenre,
 )
@@ -111,7 +115,7 @@ from api.bibliotheca import BibliothecaAPI
 from api.axis import Axis360API
 from api.rbdigital import RBDigitalAPI
 from api.enki import EnkiAPI
-from api.odl import ODLWithConsolidatedCopiesAPI, SharedODLAPI
+from api.odl import ODLAPI, SharedODLAPI
 from core.local_analytics_provider import LocalAnalyticsProvider
 
 from api.adobe_vendor_id import AuthdataUtility
@@ -130,6 +134,8 @@ def setup_admin_controllers(manager):
 
     manager.admin_view_controller = ViewController(manager)
     manager.admin_sign_in_controller = SignInController(manager)
+    manager.timestamps_controller = TimestampsController(manager)
+    from api.admin.controller.work_editor import WorkController
     manager.admin_work_controller = WorkController(manager)
     manager.admin_feed_controller = FeedController(manager)
     manager.admin_custom_lists_controller = CustomListsController(manager)
@@ -137,6 +143,8 @@ def setup_admin_controllers(manager):
     manager.admin_dashboard_controller = DashboardController(manager)
     manager.admin_settings_controller = SettingsController(manager)
     manager.admin_patron_controller = PatronController(manager)
+    from api.admin.controller.self_tests import SelfTestsController
+    manager.admin_self_tests_controller = SelfTestsController(manager)
     from api.admin.controller.discovery_services import DiscoveryServicesController
     manager.admin_discovery_services_controller = DiscoveryServicesController(manager)
     from api.admin.controller.discovery_service_library_registrations import DiscoveryServiceLibraryRegistrationsController
@@ -149,6 +157,8 @@ def setup_admin_controllers(manager):
     manager.admin_metadata_services_controller = MetadataServicesController(manager)
     from api.admin.controller.patron_auth_services import PatronAuthServicesController
     manager.admin_patron_auth_services_controller = PatronAuthServicesController(manager)
+    from api.admin.controller.patron_auth_service_self_tests import PatronAuthServiceSelfTestsController
+    manager.admin_patron_auth_service_self_tests_controller = PatronAuthServiceSelfTestsController(manager)
     from api.admin.controller.admin_auth_services import AdminAuthServicesController
     manager.admin_auth_services_controller = AdminAuthServicesController(manager)
     from api.admin.controller.collection_settings import CollectionSettingsController
@@ -163,16 +173,15 @@ def setup_admin_controllers(manager):
     manager.admin_library_settings_controller = LibrarySettingsController(manager)
     from api.admin.controller.individual_admin_settings import IndividualAdminSettingsController
     manager.admin_individual_admin_settings_controller = IndividualAdminSettingsController(manager)
-    from api.admin.controller.sitewide_registration import SitewideRegistrationController
-    manager.admin_sitewide_registration_controller = SitewideRegistrationController(manager)
     from api.admin.controller.sitewide_services import *
     manager.admin_sitewide_services_controller = SitewideServicesController(manager)
     manager.admin_logging_services_controller = LoggingServicesController(manager)
+    from api.admin.controller.search_service_self_tests import SearchServiceSelfTestsController
+    manager.admin_search_service_self_tests_controller = SearchServiceSelfTestsController(manager)
     manager.admin_search_services_controller = SearchServicesController(manager)
     manager.admin_storage_services_controller = StorageServicesController(manager)
     from api.admin.controller.catalog_services import *
     manager.admin_catalog_services_controller = CatalogServicesController(manager)
-
 
 class AdminController(object):
 
@@ -373,16 +382,84 @@ class ViewController(AdminController):
         response.set_cookie("csrf_token", csrf_token, httponly=True)
         return response
 
+class TimestampsController(AdminCirculationManagerController):
+    """Returns a dict: each key is a type of service (script, monitor, or coverage provider);
+    each value is a nested dict in which timestamps are organized by service name and then by collection ID."""
+
+    def diagnostics(self):
+        self.require_system_admin()
+        timestamps = self._db.query(Timestamp).order_by(Timestamp.start)
+        sorted = self._sort_by_type(timestamps)
+        for type, services in sorted.items():
+            for service in services:
+                by_collection = self._sort_by_collection(sorted[type][service])
+                sorted[type][service] = by_collection
+        return sorted
+
+    def _sort_by_type(self, timestamps):
+        """Takes a list of Timestamp objects.  Returns a dict: each key is a type of service
+        (script, monitor, or coverage provider); each value is a dict in which the keys are the names
+        of services and the values are lists of timestamps."""
+
+        result = {}
+        for ts in timestamps:
+            info = self._extract_info(ts)
+            result.setdefault((ts.service_type or "other"), []).append(info)
+
+        for type, data in result.items():
+            result[type] = self._sort_by_service(data)
+
+        return result
+
+    def _sort_by_service(self, timestamps):
+        """Returns a dict: each key is the name of a service; each value is a list of timestamps."""
+
+        result = {}
+        for timestamp in timestamps:
+            result.setdefault(timestamp.get("service"), []).append(timestamp)
+        return result
+
+    def _sort_by_collection(self, timestamps):
+        """Takes a list of timestamps; turns it into a dict in which each key is a
+        collection ID and each value is a list of the timestamps associated with that collection."""
+
+        result = {}
+        for timestamp in timestamps:
+            result.setdefault(timestamp.get("collection_name"), []).append(timestamp)
+        return result
+
+    def _extract_info(self, timestamp):
+        """Takes a Timestamp object and returns a dict"""
+
+        duration = None
+        if timestamp.start and timestamp.finish:
+            duration = (timestamp.finish - timestamp.start).total_seconds()
+
+        collection_name = "No associated collection"
+        if timestamp.collection:
+            collection_name = timestamp.collection.name
+
+        return dict(
+            id=timestamp.id,
+            start=timestamp.start,
+            duration=duration,
+            exception=timestamp.exception,
+            service=timestamp.service,
+            collection_name=collection_name,
+            achievements=timestamp.achievements
+        )
 
 class SignInController(AdminController):
 
     ERROR_RESPONSE_TEMPLATE = """<!DOCTYPE HTML>
 <html lang="en">
 <head><meta charset="utf8"></head>
-<body>
+<body style="{error}">
 <p><strong>%(status_code)d ERROR:</strong> %(message)s</p>
+<hr style="{hr}">
+<a href="/admin/sign_in" style="{link}">Try again</a>
 </body>
-</html>"""
+</html>""".format(error=error_style, hr=hr_style, link=small_link_style)
 
     SIGN_IN_TEMPLATE = """<!DOCTYPE HTML>
 <html lang="en">
@@ -472,901 +549,6 @@ class SignInController(AdminController):
             message=problem_detail.detail
         )
         return Response(html, problem_detail.status_code)
-
-class WorkController(AdminCirculationManagerController):
-
-    STAFF_WEIGHT = 1000
-
-    def details(self, identifier_type, identifier):
-        """Return an OPDS entry with detailed information for admins.
-
-        This includes relevant links for editing the book.
-        """
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        annotator = AdminAnnotator(self.circulation, flask.request.library)
-        # Don't cache these OPDS entries - they should update immediately
-        # in the admin interface when an admin makes a change.
-        return entry_response(
-            AcquisitionFeed.single_entry(self._db, work, annotator), cache_for=0,
-        )
-
-    def complaints(self, identifier_type, identifier):
-        """Return detailed complaint information for admins."""
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        counter = self._count_complaints_for_work(work)
-        response = dict({
-            "book": {
-                "identifier_type": identifier_type,
-                "identifier": identifier
-            },
-            "complaints": counter
-        })
-
-        return response
-
-    def roles(self):
-        """Return a mapping from MARC codes to contributor roles."""
-        # TODO: The admin interface only allows a subset of the roles
-        # listed in model.py since it uses the OPDS representation of
-        # the data, and some of the roles map to the same MARC code.
-        CODES = Contributor.MARC_ROLE_CODES
-        marc_to_role = dict()
-        for role in [
-            Contributor.ACTOR_ROLE,
-            Contributor.ADAPTER_ROLE,
-            Contributor.AFTERWORD_ROLE,
-            Contributor.ARTIST_ROLE,
-            Contributor.ASSOCIATED_ROLE,
-            Contributor.AUTHOR_ROLE,
-            Contributor.COMPILER_ROLE,
-            Contributor.COMPOSER_ROLE,
-            Contributor.CONTRIBUTOR_ROLE,
-            Contributor.COPYRIGHT_HOLDER_ROLE,
-            Contributor.DESIGNER_ROLE,
-            Contributor.DIRECTOR_ROLE,
-            Contributor.EDITOR_ROLE,
-            Contributor.ENGINEER_ROLE,
-            Contributor.FOREWORD_ROLE,
-            Contributor.ILLUSTRATOR_ROLE,
-            Contributor.INTRODUCTION_ROLE,
-            Contributor.LYRICIST_ROLE,
-            Contributor.MUSICIAN_ROLE,
-            Contributor.NARRATOR_ROLE,
-            Contributor.PERFORMER_ROLE,
-            Contributor.PHOTOGRAPHER_ROLE,
-            Contributor.PRODUCER_ROLE,
-            Contributor.TRANSCRIBER_ROLE,
-            Contributor.TRANSLATOR_ROLE,
-            ]:
-            marc_to_role[CODES[role]] = role
-        return marc_to_role
-
-    def languages(self):
-        """Return the supported language codes and their English names."""
-        return LanguageCodes.english_names
-
-    def media(self):
-        """Return the supported media types for a work and their schema.org values."""
-        return Edition.additional_type_to_medium
-
-    def rights_status(self):
-        """Return the supported rights status values with their names and whether
-        they are open access."""
-        return {uri: dict(name=name,
-                          open_access=(uri in RightsStatus.OPEN_ACCESS),
-                          allows_derivatives=(uri in RightsStatus.ALLOWS_DERIVATIVES))
-                for uri, name in RightsStatus.NAMES.iteritems()}
-
-    def edit(self, identifier_type, identifier):
-        """Edit a work's metadata."""
-        self.require_librarian(flask.request.library)
-
-        # TODO: It would be nice to use the metadata layer for this, but
-        # this code handles empty values differently than other metadata
-        # sources. When a staff member deletes a value, that indicates
-        # they think it should be empty. This needs to be indicated in the
-        # db so that it can overrule other data sources that set a value,
-        # unlike other sources which set empty fields to None.
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        changed = False
-
-        staff_data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
-        primary_identifier = work.presentation_edition.primary_identifier
-        staff_edition, is_new = get_one_or_create(
-            self._db, Edition,
-            primary_identifier_id=primary_identifier.id,
-            data_source_id=staff_data_source.id
-        )
-        self._db.expire(primary_identifier)
-
-        new_title = flask.request.form.get("title")
-        if new_title and work.title != new_title:
-            staff_edition.title = unicode(new_title)
-            changed = True
-
-        new_subtitle = flask.request.form.get("subtitle")
-        if work.subtitle != new_subtitle:
-            if work.subtitle and not new_subtitle:
-                new_subtitle = NO_VALUE
-            staff_edition.subtitle = unicode(new_subtitle)
-            changed = True
-
-        # The form data includes roles and names for contributors in the same order.
-        new_contributor_roles = flask.request.form.getlist("contributor-role")
-        new_contributor_names = [unicode(n) for n in flask.request.form.getlist("contributor-name")]
-        # The first author in the form is considered the primary author, even
-        # though there's no separate MARC code for that.
-        for i, role in enumerate(new_contributor_roles):
-            if role == Contributor.AUTHOR_ROLE:
-                new_contributor_roles[i] = Contributor.PRIMARY_AUTHOR_ROLE
-                break
-        roles_and_names = zip(new_contributor_roles, new_contributor_names)
-
-        # Remove any contributions that weren't in the form, and remove contributions
-        # that already exist from the list so they won't be added again.
-        deleted_contributions = False
-        for contribution in staff_edition.contributions:
-            if (contribution.role, contribution.contributor.display_name) not in roles_and_names:
-                self._db.delete(contribution)
-                deleted_contributions = True
-                changed = True
-            else:
-                roles_and_names.remove((contribution.role, contribution.contributor.display_name))
-        if deleted_contributions:
-            # Ensure the staff edition's contributions are up-to-date when
-            # calculating the presentation edition later.
-            self._db.refresh(staff_edition)
-
-        # Any remaining roles and names are new contributions.
-        for role, name in roles_and_names:
-            # There may be one extra role at the end from the input for
-            # adding a contributor, in which case it will have no
-            # corresponding name and can be ignored.
-            if name:
-                if role not in Contributor.MARC_ROLE_CODES.keys():
-                    self._db.rollback()
-                    return UNKNOWN_ROLE.detailed(
-                        _("Role %(role)s is not one of the known contributor roles.",
-                          role=role))
-                contributor = staff_edition.add_contributor(name=name, roles=[role])
-                contributor.display_name = name
-                changed = True
-
-        new_series = flask.request.form.get("series")
-        if work.series != new_series:
-            if work.series and not new_series:
-                new_series = NO_VALUE
-            staff_edition.series = unicode(new_series)
-            changed = True
-
-        new_series_position = flask.request.form.get("series_position")
-        if new_series_position != None and new_series_position != '':
-            try:
-                new_series_position = int(new_series_position)
-            except ValueError:
-                self._db.rollback()
-                return INVALID_SERIES_POSITION
-        else:
-            new_series_position = None
-        if work.series_position != new_series_position:
-            if work.series_position and new_series_position == None:
-                new_series_position = NO_NUMBER
-            staff_edition.series_position = new_series_position
-            changed = True
-
-        new_medium = flask.request.form.get("medium")
-        if new_medium:
-            if new_medium not in Edition.medium_to_additional_type.keys():
-                self._db.rollback()
-                return UNKNOWN_MEDIUM.detailed(
-                    _("Medium %(medium)s is not one of the known media.",
-                      medium=new_medium))
-            staff_edition.medium = new_medium
-            changed = True
-
-        new_language = flask.request.form.get("language")
-        if new_language != None and new_language != '':
-            new_language = LanguageCodes.string_to_alpha_3(new_language)
-            if not new_language:
-                self._db.rollback()
-                return UNKNOWN_LANGUAGE
-        else:
-            new_language = None
-        if new_language != staff_edition.language:
-            staff_edition.language = new_language
-            changed = True
-
-        new_publisher = flask.request.form.get("publisher")
-        if new_publisher != staff_edition.publisher:
-            if staff_edition.publisher and not new_publisher:
-                new_publisher = NO_VALUE
-            staff_edition.publisher = unicode(new_publisher)
-            changed = True
-
-        new_imprint = flask.request.form.get("imprint")
-        if new_imprint != staff_edition.imprint:
-            if staff_edition.imprint and not new_imprint:
-                new_imprint = NO_VALUE
-            staff_edition.imprint = unicode(new_imprint)
-            changed = True
-
-        new_issued = flask.request.form.get("issued")
-        if new_issued != None and new_issued != '':
-            try:
-                new_issued = datetime.strptime(new_issued, '%Y-%m-%d')
-            except ValueError:
-                self._db.rollback()
-                return INVALID_DATE_FORMAT
-        else:
-            new_issued = None
-        if new_issued != staff_edition.issued:
-            staff_edition.issued = new_issued
-            changed = True
-
-        # TODO: This lets library staff add a 1-5 rating, which is used in the
-        # quality calculation. However, this doesn't work well if there are any
-        # other measurements that contribute to the quality. The form will show
-        # the calculated quality rather than the staff rating, which will be
-        # confusing. It might also be useful to make it more clear how this
-        # relates to the quality threshold in the library settings.
-        changed_rating = False
-        new_rating = flask.request.form.get("rating")
-        if new_rating != None and new_rating != '':
-            try:
-                new_rating = float(new_rating)
-            except ValueError:
-                self._db.rollback()
-                return INVALID_RATING
-            scale = Measurement.RATING_SCALES[DataSource.LIBRARY_STAFF]
-            if new_rating < scale[0] or new_rating > scale[1]:
-                self._db.rollback()
-                return INVALID_RATING.detailed(
-                    _("The rating must be a number between %(low)s and %(high)s.",
-                      low=scale[0], high=scale[1]))
-            if (new_rating - scale[0]) / (scale[1] - scale[0]) != work.quality:
-                primary_identifier.add_measurement(staff_data_source, Measurement.RATING, new_rating, weight=WorkController.STAFF_WEIGHT)
-                changed = True
-                changed_rating = True
-
-        changed_summary = False
-        new_summary = flask.request.form.get("summary") or ""
-        if new_summary != work.summary_text:
-            old_summary = None
-            if work.summary and work.summary.data_source == staff_data_source:
-                old_summary = work.summary
-
-            work.presentation_edition.primary_identifier.add_link(
-                Hyperlink.DESCRIPTION, None,
-                staff_data_source, content=new_summary)
-
-            # Delete previous staff summary
-            if old_summary:
-                for link in old_summary.links:
-                    self._db.delete(link)
-                self._db.delete(old_summary)
-
-            changed = True
-            changed_summary = True
-
-        if changed:
-            # Even if the presentation doesn't visibly change, we want
-            # to regenerate the OPDS entries and update the search
-            # index for the work, because that might be the 'real'
-            # problem the user is trying to fix.
-            policy = PresentationCalculationPolicy(
-                classify=True,
-                regenerate_opds_entries=True,
-                regenerate_marc_record=True,
-                update_search_index=True,
-                calculate_quality=changed_rating,
-                choose_summary=changed_summary,
-            )
-            work.calculate_presentation(policy=policy)
-
-        return Response("", 200)
-
-    def suppress(self, identifier_type, identifier):
-        """Suppress the license pool associated with a book."""
-        self.require_librarian(flask.request.library)
-
-        # Turn source + identifier into a LicensePool
-        pools = self.load_licensepools(flask.request.library, identifier_type, identifier)
-        if isinstance(pools, ProblemDetail):
-            # Something went wrong.
-            return pools
-
-        # Assume that the Work is being suppressed from the catalog, and
-        # not just the LicensePool.
-        # TODO: Suppress individual LicensePools when it's not that deep.
-        for pool in pools:
-            pool.suppressed = True
-        return Response("", 200)
-
-    def unsuppress(self, identifier_type, identifier):
-        """Unsuppress all license pools associated with a book.
-
-        TODO: This will need to be revisited when we distinguish
-        between complaints about a work and complaints about a
-        LicensePoool.
-        """
-        self.require_librarian(flask.request.library)
-
-        # Turn source + identifier into a group of LicensePools
-        pools = self.load_licensepools(flask.request.library, identifier_type, identifier)
-        if isinstance(pools, ProblemDetail):
-            # Something went wrong.
-            return pools
-
-        # Unsuppress each pool.
-        for pool in pools:
-            pool.suppressed = False
-        return Response("", 200)
-
-    def refresh_metadata(self, identifier_type, identifier, provider=None):
-        """Refresh the metadata for a book from the content server"""
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        if not provider and work.license_pools:
-            provider = MetadataWranglerCollectionRegistrar(work.license_pools[0].collection)
-
-        if not provider:
-            return METADATA_REFRESH_FAILURE
-
-        identifier = work.presentation_edition.primary_identifier
-        try:
-            record = provider.ensure_coverage(identifier, force=True)
-        except Exception:
-            # The coverage provider may raise an HTTPIntegrationException.
-            return REMOTE_INTEGRATION_FAILED
-
-        if record.exception:
-            # There was a coverage failure.
-            if (str(record.exception).startswith("201") or
-                str(record.exception).startswith("202")):
-                # A 201/202 error means it's never looked up this work before
-                # so it's started the resolution process or looking for sources.
-                return METADATA_REFRESH_PENDING
-            # Otherwise, it just doesn't know anything.
-            return METADATA_REFRESH_FAILURE
-
-        return Response("", 200)
-
-    def resolve_complaints(self, identifier_type, identifier):
-        """Resolve all complaints for a particular license pool and complaint type."""
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        resolved = False
-        found = False
-
-        requested_type = flask.request.form.get("type")
-        if requested_type:
-            for complaint in work.complaints:
-                if complaint.type == requested_type:
-                    found = True
-                    if complaint.resolved == None:
-                        complaint.resolve()
-                        resolved = True
-
-        if not found:
-            return UNRECOGNIZED_COMPLAINT
-        elif not resolved:
-            return COMPLAINT_ALREADY_RESOLVED
-        return Response("", 200)
-
-    def classifications(self, identifier_type, identifier):
-        """Return list of this work's classifications."""
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        identifier_id = work.presentation_edition.primary_identifier.id
-        results = self._db \
-            .query(Classification) \
-            .join(Subject) \
-            .join(DataSource) \
-            .filter(Classification.identifier_id == identifier_id) \
-            .order_by(Classification.weight.desc()) \
-            .all()
-
-        data = []
-        for result in results:
-            data.append(dict({
-                "type": result.subject.type,
-                "name": result.subject.identifier,
-                "source": result.data_source.name,
-                "weight": result.weight
-            }))
-
-        return dict({
-            "book": {
-                "identifier_type": identifier_type,
-                "identifier": identifier
-            },
-            "classifications": data
-        })
-
-    def edit_classifications(self, identifier_type, identifier):
-        """Edit a work's audience, target age, fiction status, and genres."""
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        staff_data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
-
-        # Previous staff classifications
-        primary_identifier = work.presentation_edition.primary_identifier
-        old_classifications = self._db \
-            .query(Classification) \
-            .join(Subject) \
-            .filter(
-                Classification.identifier == primary_identifier,
-                Classification.data_source == staff_data_source
-            )
-        old_genre_classifications = old_classifications \
-            .filter(Subject.genre_id != None)
-        old_staff_genres = [
-            c.subject.genre.name
-            for c in old_genre_classifications
-            if c.subject.genre
-        ]
-        old_computed_genres = [
-            work_genre.genre.name
-            for work_genre in work.work_genres
-        ]
-
-        # New genres should be compared to previously computed genres
-        new_genres = flask.request.form.getlist("genres")
-        genres_changed = sorted(new_genres) != sorted(old_computed_genres)
-
-        # Update audience
-        new_audience = flask.request.form.get("audience")
-        if new_audience != work.audience:
-            # Delete all previous staff audience classifications
-            for c in old_classifications:
-                if c.subject.type == Subject.FREEFORM_AUDIENCE:
-                    self._db.delete(c)
-
-            # Create a new classification with a high weight
-            primary_identifier.classify(
-                data_source=staff_data_source,
-                subject_type=Subject.FREEFORM_AUDIENCE,
-                subject_identifier=new_audience,
-                weight=WorkController.STAFF_WEIGHT,
-            )
-
-        # Update target age if present
-        new_target_age_min = flask.request.form.get("target_age_min")
-        new_target_age_min = int(new_target_age_min) if new_target_age_min else None
-        new_target_age_max = flask.request.form.get("target_age_max")
-        new_target_age_max = int(new_target_age_max) if new_target_age_max else None
-        if new_target_age_max < new_target_age_min:
-            return INVALID_EDIT.detailed(_("Minimum target age must be less than maximum target age."))
-
-        if work.target_age:
-            old_target_age_min = work.target_age.lower
-            old_target_age_max = work.target_age.upper
-        else:
-            old_target_age_min = None
-            old_target_age_max = None
-        if new_target_age_min != old_target_age_min or new_target_age_max != old_target_age_max:
-            # Delete all previous staff target age classifications
-            for c in old_classifications:
-                if c.subject.type == Subject.AGE_RANGE:
-                    self._db.delete(c)
-
-            # Create a new classification with a high weight - higher than audience
-            if new_target_age_min and new_target_age_max:
-                age_range_identifier = "%s-%s" % (new_target_age_min, new_target_age_max)
-                primary_identifier.classify(
-                    data_source=staff_data_source,
-                    subject_type=Subject.AGE_RANGE,
-                    subject_identifier=age_range_identifier,
-                    weight=WorkController.STAFF_WEIGHT * 100,
-                )
-
-        # Update fiction status
-        # If fiction status hasn't changed but genres have changed,
-        # we still want to ensure that there's a staff classification
-        new_fiction = True if flask.request.form.get("fiction") == "fiction" else False
-        if new_fiction != work.fiction or genres_changed:
-            # Delete previous staff fiction classifications
-            for c in old_classifications:
-                if c.subject.type == Subject.SIMPLIFIED_FICTION_STATUS:
-                    self._db.delete(c)
-
-            # Create a new classification with a high weight (higher than genre)
-            fiction_term = "Fiction" if new_fiction else "Nonfiction"
-            classification = primary_identifier.classify(
-                data_source=staff_data_source,
-                subject_type=Subject.SIMPLIFIED_FICTION_STATUS,
-                subject_identifier=fiction_term,
-                weight=WorkController.STAFF_WEIGHT,
-            )
-            classification.subject.fiction = new_fiction
-
-        # Update genres
-        # make sure all new genres are legit
-        for name in new_genres:
-            genre, is_new = Genre.lookup(self._db, name)
-            if not isinstance(genre, Genre):
-                return GENRE_NOT_FOUND
-            if genres[name].is_fiction is not None and genres[name].is_fiction != new_fiction:
-                return INCOMPATIBLE_GENRE
-            if name == "Erotica" and new_audience != "Adults Only":
-                return EROTICA_FOR_ADULTS_ONLY
-
-        if genres_changed:
-            # delete existing staff classifications for genres that aren't being kept
-            for c in old_genre_classifications:
-                if c.subject.genre.name not in new_genres:
-                    self._db.delete(c)
-
-            # add new staff classifications for new genres
-            for genre in new_genres:
-                if genre not in old_staff_genres:
-                    classification = primary_identifier.classify(
-                        data_source=staff_data_source,
-                        subject_type=Subject.SIMPLIFIED_GENRE,
-                        subject_identifier=genre,
-                        weight=WorkController.STAFF_WEIGHT
-                    )
-
-            # add NONE genre classification if we aren't keeping any genres
-            if len(new_genres) == 0:
-                primary_identifier.classify(
-                    data_source=staff_data_source,
-                    subject_type=Subject.SIMPLIFIED_GENRE,
-                    subject_identifier=SimplifiedGenreClassifier.NONE,
-                    weight=WorkController.STAFF_WEIGHT
-                )
-            else:
-                # otherwise delete existing NONE genre classification
-                none_classifications = self._db \
-                    .query(Classification) \
-                    .join(Subject) \
-                    .filter(
-                        Classification.identifier == primary_identifier,
-                        Subject.identifier == SimplifiedGenreClassifier.NONE
-                    ) \
-                    .all()
-                for c in none_classifications:
-                    self._db.delete(c)
-
-        # Update presentation
-        policy = PresentationCalculationPolicy(
-            classify=True,
-            regenerate_opds_entries=True,
-            regenerate_marc_record=True,
-            update_search_index=True
-        )
-        work.calculate_presentation(policy=policy)
-
-        return Response("", 200)
-
-    MINIMUM_COVER_WIDTH = 600
-    MINIMUM_COVER_HEIGHT = 900
-    TOP = 'top'
-    CENTER = 'center'
-    BOTTOM = 'bottom'
-    TITLE_POSITIONS = [TOP, CENTER, BOTTOM]
-
-    def _validate_cover_image(self, image):
-        image_width, image_height = image.size
-        if image_width < self.MINIMUM_COVER_WIDTH or image_height < self.MINIMUM_COVER_HEIGHT:
-           return INVALID_IMAGE.detailed(_("Cover image must be at least %(width)spx in width and %(height)spx in height.",
-                                                 width=self.MINIMUM_COVER_WIDTH, height=self.MINIMUM_COVER_HEIGHT))
-        return True
-
-    def _process_cover_image(self, work, image, title_position):
-        title = work.presentation_edition.title
-        author = work.presentation_edition.author
-        if author == Edition.UNKNOWN_AUTHOR:
-            author = ""
-
-        if title_position in self.TITLE_POSITIONS:
-            # Convert image to 'RGB' mode if it's not already, so drawing on it works.
-            if image.mode != 'RGB':
-                image = image.convert("RGB")
-
-            draw = ImageDraw.Draw(image)
-            image_width, image_height = image.size
-
-            admin_dir = os.path.dirname(os.path.split(__file__)[0])
-            package_dir = os.path.join(admin_dir, "../..")
-            bold_font_path = os.path.join(package_dir, "resources/OpenSans-Bold.ttf")
-            regular_font_path = os.path.join(package_dir, "resources/OpenSans-Regular.ttf")
-            font_size = image_width / 20
-            bold_font = ImageFont.truetype(bold_font_path, font_size)
-            regular_font = ImageFont.truetype(regular_font_path, font_size)
-
-            padding = image_width / 40
-
-            max_line_width = 0
-            bold_char_width = bold_font.getsize("n")[0]
-            bold_char_count = image_width / bold_char_width
-            regular_char_width = regular_font.getsize("n")[0]
-            regular_char_count = image_width / regular_char_width
-            title_lines = textwrap.wrap(title, bold_char_count)
-            author_lines = textwrap.wrap(author, regular_char_count)
-            for lines, font in [(title_lines, bold_font), (author_lines, regular_font)]:
-                for line in lines:
-                    line_width, ignore = font.getsize(line)
-                    if line_width > max_line_width:
-                        max_line_width = line_width
-
-            ascent, descent = bold_font.getmetrics()
-            line_height = ascent + descent
-
-            total_text_height = line_height * (len(title_lines) + len(author_lines))
-            rectangle_height = total_text_height + line_height
-
-            rectangle_width = max_line_width + 2 * padding
-
-            start_x = (image_width - rectangle_width) / 2
-            if title_position == self.BOTTOM:
-                start_y = image_height - rectangle_height - image_height / 14
-            elif title_position == self.CENTER:
-                start_y = (image_height - rectangle_height) / 2
-            else:
-                start_y = image_height / 14
-
-            draw.rectangle([(start_x, start_y),
-                            (start_x + rectangle_width, start_y + rectangle_height)],
-                           fill=(255,255,255,255))
-
-            current_y = start_y + line_height / 2
-            for lines, font in [(title_lines, bold_font), (author_lines, regular_font)]:
-                for line in lines:
-                    line_width, ignore = font.getsize(line)
-                    draw.text((start_x + (rectangle_width - line_width) / 2, current_y),
-                              line, font=font, fill=(0,0,0,255))
-                    current_y += line_height
-
-            del draw
-
-        return image
-
-    def preview_book_cover(self, identifier_type, identifier):
-        """Return a preview of the submitted cover image information."""
-        self.require_librarian(flask.request.library)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        image_file = flask.request.files.get("cover_file")
-        image_url = flask.request.form.get("cover_url")
-        if not image_file and not image_url:
-            return INVALID_IMAGE.detailed(_("Image file or image URL is required."))
-
-        title_position = flask.request.form.get("title_position")
-
-        if image_url and not image_file:
-            image_file = StringIO(urllib.urlopen(image_url).read())
-
-        image = Image.open(image_file)
-        result = self._validate_cover_image(image)
-        if isinstance(result, ProblemDetail):
-            return result
-        if title_position and title_position in self.TITLE_POSITIONS:
-            image = self._process_cover_image(work, image, title_position)
-
-        buffer = StringIO()
-        image.save(buffer, format="PNG")
-        b64 = base64.b64encode(buffer.getvalue())
-        value = "data:image/png;base64,%s" % b64
-
-        return Response(value, 200)
-
-    def change_book_cover(self, identifier_type, identifier, mirror=None):
-        """Save a new book cover based on the submitted form."""
-        self.require_librarian(flask.request.library)
-
-        data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
-
-        work = self.load_work(flask.request.library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        pools = self.load_licensepools(flask.request.library, identifier_type, identifier)
-        if isinstance(pools, ProblemDetail):
-            return pools
-
-        if not pools:
-            return NO_LICENSES
-
-        collection = pools[0].collection
-
-        image_file = flask.request.files.get("cover_file")
-        image_url = flask.request.form.get("cover_url")
-        if not image_file and not image_url:
-            return INVALID_IMAGE.detailed(_("Image file or image URL is required."))
-
-        title_position = flask.request.form.get("title_position")
-
-        rights_uri = flask.request.form.get("rights_status")
-        rights_explanation = flask.request.form.get("rights_explanation")
-
-        if not rights_uri:
-            return INVALID_IMAGE.detailed(_("You must specify the image's license."))
-
-        # Look for an appropriate mirror to store this cover image.
-        mirror = mirror or MirrorUploader.for_collection(collection, use_sitewide=True)
-        if not mirror:
-            return INVALID_CONFIGURATION_OPTION.detailed(_("Could not find a storage integration for uploading the cover."))
-
-        if image_url and not image_file:
-            image_file = StringIO(urllib.urlopen(image_url).read())
-
-        image = Image.open(image_file)
-        result = self._validate_cover_image(image)
-        if isinstance(result, ProblemDetail):
-            return result
-
-        cover_href = None
-        cover_rights_explanation = rights_explanation
-
-        if title_position in self.TITLE_POSITIONS:
-            original_href = image_url
-            original_buffer = StringIO()
-            image.save(original_buffer, format="PNG")
-            original_content = original_buffer.getvalue()
-            if not original_href:
-                original_href = Hyperlink.generic_uri(data_source, work.presentation_edition.primary_identifier, Hyperlink.IMAGE, content=original_content)
-
-            image = self._process_cover_image(work, image, title_position)
-
-            original_rights_explanation = None
-            if rights_uri != RightsStatus.IN_COPYRIGHT:
-                original_rights_explanation = rights_explanation
-            original = LinkData(
-                Hyperlink.IMAGE, original_href, rights_uri=rights_uri,
-                rights_explanation=original_rights_explanation, content=original_content,
-            )
-            derivation_settings = dict(title_position=title_position)
-            if rights_uri in RightsStatus.ALLOWS_DERIVATIVES:
-                cover_rights_explanation = "The original image license allows derivatives."
-        else:
-            original = None
-            derivation_settings = None
-            cover_href = image_url
-
-        buffer = StringIO()
-        image.save(buffer, format="PNG")
-        content = buffer.getvalue()
-
-        if not cover_href:
-            cover_href = Hyperlink.generic_uri(data_source, work.presentation_edition.primary_identifier, Hyperlink.IMAGE, content=content)
-
-        cover_data = LinkData(
-            Hyperlink.IMAGE, href=cover_href,
-            media_type=Representation.PNG_MEDIA_TYPE,
-            content=content, rights_uri=rights_uri,
-            rights_explanation=cover_rights_explanation,
-            original=original, transformation_settings=derivation_settings,
-        )
-
-        presentation_policy = PresentationCalculationPolicy(
-            choose_edition=False,
-            set_edition_metadata=False,
-            classify=False,
-            choose_summary=False,
-            calculate_quality=False,
-            choose_cover=True,
-            regenerate_opds_entries=True,
-            regenerate_marc_record=True,
-            update_search_index=False,
-        )
-
-        replacement_policy = ReplacementPolicy(
-            links=True,
-            # link_content is false because we already have the content.
-            # We don't want the metadata layer to try to fetch it again.
-            link_content=False,
-            mirror=mirror,
-            presentation_calculation_policy=presentation_policy,
-        )
-
-        metadata = Metadata(data_source, links=[cover_data])
-        metadata.apply(work.presentation_edition,
-                       collection,
-                       replace=replacement_policy)
-
-        # metadata.apply only updates the edition, so we also need
-        # to update the work.
-        work.calculate_presentation(policy=presentation_policy)
-
-        return Response(_("Success"), 200)
-
-    def _count_complaints_for_work(self, work):
-        complaint_types = [complaint.type for complaint in work.complaints if not complaint.resolved]
-        return Counter(complaint_types)
-
-    def custom_lists(self, identifier_type, identifier):
-        self.require_librarian(flask.request.library)
-
-        library = flask.request.library
-        work = self.load_work(library, identifier_type, identifier)
-        if isinstance(work, ProblemDetail):
-            return work
-
-        staff_data_source = DataSource.lookup(self._db, DataSource.LIBRARY_STAFF)
-
-        if flask.request.method == "GET":
-            lists = []
-            for entry in work.custom_list_entries:
-                list = entry.customlist
-                lists.append(dict(id=list.id, name=list.name))
-            return dict(custom_lists=lists)
-
-        if flask.request.method == "POST":
-            lists = flask.request.form.get("lists")
-            if lists:
-                lists = json.loads(lists)
-            else:
-                lists = []
-
-            affected_lanes = set()
-
-            # Remove entries for lists that were not in the submitted form.
-            submitted_ids = [l.get("id") for l in lists if l.get("id")]
-            for entry in work.custom_list_entries:
-                if entry.list_id not in submitted_ids:
-                    list = entry.customlist
-                    list.remove_entry(work)
-                    for lane in Lane.affected_by_customlist(list):
-                        affected_lanes.add(lane)
-
-            # Add entries for any new lists.
-            for list_info in lists:
-                id = list_info.get("id")
-                name = list_info.get("name")
-
-                if id:
-                    is_new = False
-                    list = get_one(self._db, CustomList, id=int(id), name=name, library=library, data_source=staff_data_source)
-                    if not list:
-                        self._db.rollback()
-                        return MISSING_CUSTOM_LIST.detailed(_("Could not find list \"%(list_name)s\"", list_name=name))
-                else:
-                    list, is_new = create(self._db, CustomList, name=name, data_source=staff_data_source, library=library)
-                    list.created = datetime.now()
-                entry, was_new = list.add_entry(work, featured=True)
-                if was_new:
-                    for lane in Lane.affected_by_customlist(list):
-                        affected_lanes.add(lane)
-
-            # If any list changes affected lanes, update their sizes.
-            for lane in affected_lanes:
-                lane.update_size(self._db)
-
-            return Response(unicode(_("Success")), 200)
 
 class PatronController(AdminCirculationManagerController):
 
@@ -1511,7 +693,7 @@ class CustomListsController(AdminCirculationManagerController):
                 collections = []
                 for collection in list.collections:
                     collections.append(dict(id=collection.id, name=collection.name, protocol=collection.protocol))
-                custom_lists.append(dict(id=list.id, name=list.name, collections=collections, entry_count=len(list.entries)))
+                custom_lists.append(dict(id=list.id, name=list.name, collections=collections, entry_count=list.size))
             return dict(custom_lists=custom_lists)
 
         if flask.request.method == "POST":
@@ -1664,11 +846,16 @@ class CustomListsController(AdminCirculationManagerController):
             # Build the list of affected lanes before modifying the
             # CustomList.
             affected_lanes = Lane.affected_by_customlist(list)
+            for lane in affected_lanes:
+                lane.update_size(self._db)
+                # There's only one custom list in the lane and it's going
+                # to be deleted.
+                if lane.size == 0 and len(lane._customlist_ids) == 1:
+                    self._db.delete(lane)
             for entry in list.entries:
                 self._db.delete(entry)
             self._db.delete(list)
-            for lane in affected_lanes:
-                lane.update_size(self._db)
+
             return Response(unicode(_("Deleted")), 200)
 
 
@@ -1811,6 +998,22 @@ class LanesController(AdminCirculationManagerController):
         create_default_lanes(self._db, flask.request.library)
         return Response(unicode(_("Success")), 200)
 
+    def change_order(self):
+        self.require_library_manager(flask.request.library)
+
+        submitted_lanes = json.loads(flask.request.data)
+
+        def update_lane_order(lanes):
+            for index, lane_data in enumerate(lanes):
+                lane_id = lane_data.get("id")
+                lane = self._db.query(Lane).filter(Lane.id==lane_id).one()
+                lane.priority = index
+                update_lane_order(lane_data.get("sublanes", []))
+
+        update_lane_order(submitted_lanes)
+
+        return Response(unicode(_("Success")), 200)
+
 
 class DashboardController(AdminCirculationManagerController):
 
@@ -1913,8 +1116,11 @@ class DashboardController(AdminCirculationManagerController):
                     join(
                         Hold,
                         Patron,
-                        Patron.id == Hold.patron_id,
-                        Patron.library_id == library.id,
+                        and_(
+                            Patron.id == Hold.patron_id,
+                            Patron.library_id == library.id,
+                            Hold.id != None,
+                        )
                     )
                 )
             ).alias()
@@ -2110,7 +1316,7 @@ class SettingsController(AdminCirculationManagerController):
                      Axis360API,
                      RBDigitalAPI,
                      EnkiAPI,
-                     ODLWithConsolidatedCopiesAPI,
+                     ODLAPI,
                      SharedODLAPI,
                      FeedbooksOPDSImporter,
                     ]
@@ -2183,7 +1389,6 @@ class SettingsController(AdminCirculationManagerController):
         services = []
         for service in self._db.query(ExternalIntegration).filter(
             ExternalIntegration.goal==goal):
-
             candidates = [p for p in protocols if p.get("name") == service.protocol]
             if not candidates:
                 continue
@@ -2205,16 +1410,18 @@ class SettingsController(AdminCirculationManagerController):
                         key, service).value
                 settings[key] = value
 
-            services.append(
-                dict(
-                    id=service.id,
-                    name=service.name,
-                    protocol=service.protocol,
-                    settings=settings,
-                    libraries=libraries,
-                )
+            service_info = dict(
+                id=service.id,
+                name=service.name,
+                protocol=service.protocol,
+                settings=settings,
+                libraries=libraries,
             )
 
+            if "test_search_term" in [x.get("key") for x in protocol.get("settings")]:
+                service_info["self_test_results"] = self._get_prior_test_results(service)
+
+            services.append(service_info)
         return services
 
     def _set_integration_setting(self, integration, setting):
@@ -2234,7 +1441,7 @@ class SettingsController(AdminCirculationManagerController):
                     "The configuration value for %(setting)s is invalid.",
                     setting=setting.get("label"),
                 ))
-        if not value and setting.get("required") and not setting.get("default"):
+        if not value and setting.get("required") and not "default" in setting.keys():
             return INCOMPLETE_CONFIGURATION.detailed(
                 _("The configuration is missing a required setting: %(setting)s",
                   setting=setting.get("label")))
@@ -2307,43 +1514,63 @@ class SettingsController(AdminCirculationManagerController):
 
         return protocols
 
+    def _get_prior_test_results(self, item, protocol_class=None):
+        # :param item: An ExternalSearchIndex, an ExternalIntegration for patron authentication, or a Collection
+        if not protocol_class and hasattr(self, "protocol_class"):
+            protocol_class = self.protocol_class
 
-    def _get_prior_test_results(self, collection, protocolClass):
-        """This helper function returns previous self test results for a given
-        collection if it has a protocol.  Used by both SelfTestsController and
-        CollectionSettingsController
-        """
-        provider_apis = list(self.PROVIDER_APIS)
-        provider_apis.append(OPDSImportMonitor)
-
-        self_test_results = None
-        protocol = protocolClass
-
-        if not collection or not collection.protocol:
+        if not item:
             return None
 
-        if collection.protocol == OPDSImportMonitor.PROTOCOL:
-            protocol = OPDSImportMonitor
-
         self_test_results = None
-        if protocol in provider_apis and issubclass(protocol, HasSelfTests):
-            if (collection.protocol == OPDSImportMonitor.PROTOCOL):
-                extra_args = (OPDSImporter,)
-            else:
-                extra_args = ()
-            try:
-                self_test_results = protocol.prior_test_results(
-                    self._db, protocol, self._db, collection, *extra_args
+
+        try:
+            if self.type == "collection":
+                if not item.protocol or not len(item.protocol):
+                    return None
+                provider_apis = list(self.PROVIDER_APIS)
+                provider_apis.append(OPDSImportMonitor)
+
+                if item.protocol == OPDSImportMonitor.PROTOCOL:
+                    protocol_class = OPDSImportMonitor
+
+                if protocol_class in provider_apis and issubclass(protocol_class, HasSelfTests):
+                    if (item.protocol == OPDSImportMonitor.PROTOCOL):
+                        extra_args = (OPDSImporter,)
+                    else:
+                        extra_args = ()
+
+                    self_test_results = protocol_class.prior_test_results(
+                        self._db, protocol_class, self._db, item, *extra_args
+                    )
+
+            elif self.type == "search service":
+                self_test_results = ExternalSearchIndex.prior_test_results(
+                    self._db, None, self._db, item
                 )
-            except Exception, e:
-                # This is bad, but not so bad that we should short-circuit
-                # this whole process -- that might prevent an admin from
-                # making the configuration changes necessary to fix
-                # this problem.
-                message = _("Exception getting self-test results for collection %s: %s")
-                args = (collection.name, e.message)
-                logging.warn(message, *args, exc_info=e)
-                self_test_results = dict(exception=message % args)
+
+            elif self.type == "patron authentication service":
+                library = None
+                if len(item.libraries):
+                    library = item.libraries[0]
+                    self_test_results = protocol_class.prior_test_results(
+                        self._db, None, library, item
+                    )
+                else:
+                    self_test_results = dict(
+                        exception=_("You must associate this service with at least one library before you can run self tests for it."),
+                        disabled=True
+                    )
+
+        except Exception, e:
+            # This is bad, but not so bad that we should short-circuit
+            # this whole process -- that might prevent an admin from
+            # making the configuration changes necessary to fix
+            # this problem.
+            message = _("Exception getting self-test results for %s %s: %s")
+            args = (self.type, item.name, e.message)
+            logging.warn(message, *args, exc_info=e)
+            self_test_results = dict(exception=message % args)
 
         return self_test_results
 
@@ -2448,7 +1675,7 @@ class SettingsController(AdminCirculationManagerController):
         service = get_one(self._db, ExternalIntegration, id=id, goal=goal)
         if not service:
             return MISSING_SERVICE
-        if protocol != service.protocol:
+        if protocol and (protocol != service.protocol):
             return CANNOT_CHANGE_PROTOCOL
         return service
 
@@ -2477,111 +1704,174 @@ class SettingsController(AdminCirculationManagerController):
         [protocol] = [p for p in self.protocols if p.get("name") == flask.request.form.get("protocol")]
         return protocol.get("settings")
 
-    def validate_formats(self, settings=None):
+    def validate_formats(self, settings=None, validator=None):
         # If the service has self.protocols set, we can extract the list of settings here;
         # otherwise, the settings have to be passed in as an argument--either a list or
         # a string.
+        validator = validator or Validator()
         settings = settings or self._get_settings()
-        validators = [
-            self.validate_email,
-            self.validate_url,
-            self.validate_number,
-            self.validate_language_code,
-        ]
-        for validator in validators:
-            error = validator(settings)
-            if error:
-                return error
+        form = flask.request.form or None
+        try:
+            files = flask.request.files
+        except:
+            files = None
+        error = validator.validate(settings, dict(form=form, files=files))
+        if error:
+            return error
 
-    def validate_email(self, settings):
-        """Find any email addresses that the user has submitted, and make sure that
-        they are in a valid format.
-        This method is used by individual_admin_settings and library_settings.
+class SitewideRegistrationController(SettingsController):
+    """A controller for managing a circulation manager's registrations
+    with external services.
+
+    Currently the only supported site-wide registration is with a
+    metadata wrangler. The protocol for registration with library
+    registries and ODL collections is similar, but those registrations
+    happen on the level of the individual library, not on the level of
+    the circulation manager.
+    """
+
+    def process_sitewide_registration(self, integration, do_get=HTTP.debuggable_get,
+                              do_post=HTTP.debuggable_post
+    ):
+        """Performs a sitewide registration for a particular service.
+
+        :return: A ProblemDetail or, if successful, None
         """
-        # If :param settings is a list of objects--i.e. the LibrarySettingsController
-        # is calling this method--then we need to pull out the relevant input strings
-        # to validate.
-        if isinstance(settings, (list,)):
-            # Find the fields that have to do with email addresses and are not blank
-            email_fields = filter(lambda s: s.get("format") == "email" and flask.request.form.get(s.get("key")), settings)
-            # Narrow the email-related fields down to the ones for which the user actually entered a value
-            email_inputs = [flask.request.form.get(field.get("key")) for field in email_fields]
-            # Now check that each email input is in a valid format
-        else:
-        # If the IndividualAdminSettingsController is calling this method, then we already have the
-        # input string; it was passed in directly.
-            email_inputs = [settings]
-        for email in email_inputs:
-            if not self._is_email(email):
-                return INVALID_EMAIL.detailed(_('"%(email)s" is not a valid email address.', email=email))
 
-    def _is_email(self, email):
-        """Email addresses must be in the format 'x@y.z'."""
-        email_format = ".+\@.+\..+"
-        return re.search(email_format, email)
+        self.require_system_admin()
 
-    def validate_url(self, settings):
-        """Find any URLs that the user has submitted, and make sure that
-        they are in a valid format."""
-        # Find the fields that have to do with URLs and are not blank.
-        # If this is a sitewide setting, then the user input needs to be accessed
-        # via "value" rather than via the setting's key.
-        url_fields = filter(lambda s: s.get("format") == "url" and
-                            (flask.request.form.get(s.get("key")) or flask.request.form.get("value"))
-                            , settings)
-        # Narrow the URL-related fields down to the ones for which the user actually entered a value
-        url_inputs = [(flask.request.form.get(field.get("key")) or flask.request.form.get("value")) for field in url_fields]
+        if not integration:
+            return MISSING_SERVICE
 
-        for url in url_inputs:
-            if not self._is_url(url):
-                return INVALID_URL.detailed(_('"%(url)s" is not a valid URL.', url=url))
+        catalog_response = self.get_catalog(do_get, integration.url)
+        if isinstance(catalog_response, ProblemDetail):
+            return catalog_response
 
-    def _is_url(self, url):
-        return any([url.startswith(protocol + "://") for protocol in "http", "https"])
+        if isinstance(self.check_content_type(catalog_response), ProblemDetail):
+            return self.check_content_type(catalog_response)
 
-    def validate_number(self, settings):
-        """Find any numbers that the user has submitted, and make sure that they are 1) actually numbers,
-        2) positive, and 3) lower than the specified maximum, if there is one."""
-        # Find the fields that should have numeric input and are not blank.
-        number_fields = filter(
-                            lambda s: ("number" in [s.get("type"), s.get("format")]) and
-                            (flask.request.form.get(s.get("key")) or flask.request.form.get("value"))
-                            , settings
-                        )
+        catalog = catalog_response.json()
+        links = catalog.get('links', [])
 
-        for field in number_fields:
-            if self._number_error(field):
-                return self._number_error(field)
+        register_url = self.get_registration_link(catalog, links)
+        if isinstance(register_url, ProblemDetail):
+            return register_url
 
-    def _number_error(self, field):
-        input = flask.request.form.get(field.get("key")) or flask.request.form.get("value")
-        min = field.get("min") or 0
-        max = field.get("max")
+        headers = self.update_headers(integration)
+        if isinstance(headers, ProblemDetail):
+            return headers
+
+        response = self.register(register_url, headers, do_post)
+        if isinstance(response, ProblemDetail):
+            return response
+
+        shared_secret = self.get_shared_secret(response)
+        if isinstance(shared_secret, ProblemDetail):
+            return shared_secret
+
+        ignore, private_key = self.manager.sitewide_key_pair
+        decryptor = Configuration.cipher(private_key)
+        shared_secret = decryptor.decrypt(base64.b64decode(shared_secret))
+        integration.password = unicode(shared_secret)
+
+    def get_catalog(self, do_get, url):
+        """Get the catalog for this service."""
 
         try:
-            input = float(input)
-        except ValueError:
-            return INVALID_NUMBER.detailed(_('"%(input)s" is not a number.', input=input))
+            response = do_get(url)
+        except Exception as e:
+            return REMOTE_INTEGRATION_FAILED.detailed(e.message)
 
-        if input < min:
-            return INVALID_NUMBER.detailed(_('%(field)s must be greater than %(min)s.', field=field.get("label"), min=min))
-        if max and input > max:
-            return INVALID_NUMBER.detailed(_('%(field)s cannot be greater than %(max)s.', field=field.get("label"), max=max))
+        if isinstance(response, ProblemDetail):
+            return response
+        return response
 
-    def validate_language_code(self, settings):
-        # Find the fields that should contain language codes and are not blank.
-        language_fields = filter(lambda s: s.get("format") == "language-code" and
-                            (flask.request.form.get(s.get("key")))
-                            , settings)
-        # Get the language codes that the user entered; this produces a nested list.
-        language_inputs = [flask.request.form.getlist(field.get("key")) for field in language_fields]
-        # Flatten the nested list of language codes so that it can be iterated over.
-        flattened_list = [language for list in language_inputs for language in list]
+    def check_content_type(self, catalog_response):
+        """Make sure the catalog for the service is in a valid format."""
 
-        for language in flattened_list:
-            if language and not self._is_language(language):
-                return UNKNOWN_LANGUAGE.detailed(_('"%(language)s" is not a valid language code.', language=language))
+        content_type = catalog_response.headers.get('Content-Type')
+        if content_type != 'application/opds+json':
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _('The service did not provide a valid catalog.')
+            )
 
-    def _is_language(self, language):
-        # Check that the input string is in the list of recognized language codes.
-        return LanguageCodes.string_to_alpha_3(language)
+    def get_registration_link(self, catalog, links):
+        """Get the link for registration from the catalog."""
+
+        register_link_filter = lambda l: (
+            l.get('rel')=='register' and
+            l.get('type')==self.METADATA_SERVICE_URI_TYPE
+        )
+
+        register_urls = filter(register_link_filter, links)
+        if not register_urls:
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _('The service did not provide a register link.')
+            )
+
+        # Get the full registration url.
+        register_url = register_urls[0].get('href')
+        if not register_url.startswith('http'):
+            # We have a relative path. Create a full registration url.
+            base_url = catalog.get('id')
+            register_url = urlparse.urljoin(base_url, register_url)
+
+        return register_url
+
+    def update_headers(self, integration):
+        """If the integration has an existing shared_secret, use it to access the
+        server and update it."""
+
+        # NOTE: This is no longer technically necessary since we prove
+        # ownership with a signed JWT.
+        headers = { 'Content-Type' : 'application/x-www-form-urlencoded' }
+        if integration.password:
+            token = base64.b64encode(integration.password.encode('utf-8'))
+            headers['Authorization'] = 'Bearer ' + token
+        return headers
+
+    def register(self, register_url, headers, do_post):
+        """Register this server using the sitewide registration document."""
+
+        try:
+            body = self.sitewide_registration_document()
+            response = do_post(
+                register_url, body, allowed_response_codes=['2xx'],
+                headers=headers
+            )
+        except Exception as e:
+            return REMOTE_INTEGRATION_FAILED.detailed(e.message)
+        return response
+
+    def get_shared_secret(self, response):
+        """Find the shared secret which we need to use in order to register this
+        service, or return an error message if there is no shared secret."""
+
+        registration_info = response.json()
+        shared_secret = registration_info.get('metadata', {}).get('shared_secret')
+
+        if not shared_secret:
+            return REMOTE_INTEGRATION_FAILED.detailed(
+                _('The service did not provide registration information.')
+            )
+        return shared_secret
+
+    def sitewide_registration_document(self):
+        """Generate the document to be sent as part of a sitewide registration
+        request.
+
+        :return: A dictionary with keys 'url' and 'jwt'. 'url' is the URL to
+            this site's public key document, and 'jwt' is a JSON Web Token
+            proving control over that URL.
+        """
+
+        public_key, private_key = self.manager.sitewide_key_pair
+        # Advertise the public key so that the foreign site can encrypt
+        # things for us.
+        public_key_dict = dict(type='RSA', value=public_key)
+        public_key_url = self.url_for('public_key_document')
+        in_one_minute = datetime.utcnow() + timedelta(seconds=60)
+        payload = {'exp': in_one_minute}
+        # Sign a JWT with the private key to prove ownership of the site.
+        token = jwt.encode(payload, private_key, algorithm='RS256')
+        return dict(url=public_key_url, jwt=token)

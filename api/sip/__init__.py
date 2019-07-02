@@ -9,6 +9,7 @@ from api.sip.client import SIPClient
 from core.util.http import RemoteIntegrationException
 from core.util import MoneyUtility
 from core.model import ExternalIntegration
+import json
 
 class SIP2AuthenticationProvider(BasicAuthenticationProvider):
 
@@ -20,13 +21,35 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
     PORT = "port"
     LOCATION_CODE = "location code"
     FIELD_SEPARATOR = "field separator"
+    USE_SSL = "use_ssl"
+    SSL_CERTIFICATE = "ssl_certificate"
+    SSL_KEY = "ssl_key"
 
     SETTINGS = [
         { "key": ExternalIntegration.URL, "label": _("Server"), "required": True },
-        { "key": PORT, "label": _("Port"), "required": True },
+        { "key": PORT, "label": _("Port"), "required": True , "type": "number" },
         { "key": ExternalIntegration.USERNAME, "label": _("Login User ID") },
         { "key": ExternalIntegration.PASSWORD, "label": _("Login Password") },
         { "key": LOCATION_CODE, "label": _("Location Code") },
+        { "key": USE_SSL, "label": _("Connect over SSL?"),
+          "description": _("Some SIP2 servers require or allow clients to connect securely over SSL. Other servers don't support SSL, and require clients to use an ordinary socket connection."),
+          "type": "select",
+          "options": [
+              { "key": "true", "label": _("Connect to the SIP2 server over SSL")},
+              { "key": "false", "label": _("Connect to the SIP2 server over an ordinary socket connection")},
+          ],
+          "default": "false",
+          "required": True,
+        },
+        { "key": SSL_CERTIFICATE, "label": _("SSL Certificate"),
+          "description": _('The SSL certificate used to securely connect to an SSL-enabled SIP2 server. Not all SSL-enabled SIP2 servers require a custom certificate, but some do. This should be a string beginning with <code>-----BEGIN CERTIFICATE-----</code> and ending with <code>-----END CERTIFICATE-----</code>'),
+          "type": "textarea",
+        },
+        {
+            "key": SSL_KEY, "label": _("SSL Key"),
+            "description" : _('The private key, if any, used to sign the SSL certificate above. If present, this should be a string beginning with <code>-----BEGIN PRIVATE KEY-----</code> and ending with <code>-----END PRIVATE KEY-----</code>'),
+          "type": "textarea",
+        },
         { "key": FIELD_SEPARATOR, "label": _("Field Separator"),
           "default": "|", "required": True,
         },
@@ -91,6 +114,9 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
         self.login_password = integration.password
         self.location_code = integration.setting(self.LOCATION_CODE).value
         self.field_separator = integration.setting(self.FIELD_SEPARATOR).value or '|'
+        self.use_ssl = integration.setting(self.USE_SSL).json_value
+        self.ssl_cert = integration.setting(self.SSL_CERTIFICATE).value
+        self.ssl_key = integration.setting(self.SSL_KEY).value
         self.client = client
 
     def patron_information(self, username, password):
@@ -101,7 +127,8 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
                 sip = SIPClient(
                     target_server=self.server, target_port=self.port,
                     login_user_id=self.login_user_id, login_password=self.login_password,
-                    location_code=self.location_code, separator=self.field_separator
+                    location_code=self.location_code, separator=self.field_separator,
+                    use_ssl=self.use_ssl, ssl_cert=self.ssl_cert, ssl_key=self.ssl_key
                 )
             sip.connect()
             sip.login()
@@ -134,6 +161,61 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
             password = None
         info = self.patron_information(username, password)
         return self.info_to_patrondata(info)
+
+    def _run_self_tests(self, _db):
+        def makeConnection(sip):
+            sip.connect()
+            return sip.connection
+
+        if self.client:
+            sip = self.client
+        else:
+            sip = SIPClient(
+                target_server=self.server, target_port=self.port,
+                login_user_id=self.login_user_id, login_password=self.login_password,
+                location_code=self.location_code, separator=self.field_separator,
+                use_ssl=self.use_ssl, ssl_cert=self.ssl_cert, ssl_key=self.ssl_key
+            )
+        
+        connection = self.run_test(
+            ("Test Connection"),
+            makeConnection,
+            sip
+        )
+        yield connection
+
+        if not connection.success:
+            return
+
+        login = self.run_test(
+            ("Test Login with username '%s' and password '%s'" % (self.login_user_id, self.login_password)),
+            sip.login
+        )
+        yield login
+
+        # Log in was successful so test patron's test credentials
+        if login.success:
+            results = [r for r in super(SIP2AuthenticationProvider, self)._run_self_tests(_db)]
+            for result in results:
+                yield result
+
+            if results[0].success:
+                def raw_patron_information():
+                    info = sip.patron_information(self.test_username, self.test_password)
+                    return json.dumps(info, indent=1)
+
+                yield self.run_test(
+                    "Patron information request",
+                    sip.patron_information_request,
+                    self.test_username,
+                    patron_password=self.test_password
+                )
+
+                yield self.run_test(
+                    ("Raw test patron information"),
+                    raw_patron_information
+                )
+        
 
     @classmethod
     def info_to_patrondata(cls, info, validate_password=True):

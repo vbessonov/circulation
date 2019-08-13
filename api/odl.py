@@ -1,6 +1,5 @@
 from nose.tools import set_trace
 
-import base64
 import json
 import uuid
 import datetime
@@ -11,7 +10,7 @@ import flask
 from flask import Response
 import feedparser
 from lxml import etree
-from StringIO import StringIO
+from io import BytesIO
 import re
 from uritemplate import URITemplate
 
@@ -59,6 +58,7 @@ from circulation import (
     HoldInfo,
 )
 from core.analytics import Analytics
+from core.util.string_helpers import base64
 from core.util.http import (
     HTTP,
     BadResponseException,
@@ -189,7 +189,9 @@ class ODLAPI(BaseCirculationAPI, BaseSharedCollectionAPI):
         username = self.username
         password = self.password
         headers = dict(headers or {})
-        auth_header = "Basic %s" % base64.b64encode("%s:%s" % (username, password))
+        auth_header = "Basic %s" % base64.b64encode(
+            "%s:%s" % (username, password)
+        )
         headers['Authorization'] = auth_header
 
         return HTTP.get_with_timeout(url, headers=headers)
@@ -526,7 +528,7 @@ class ODLAPI(BaseCirculationAPI, BaseSharedCollectionAPI):
             # The licenses will have to go through some number of cycles
             # before one of them gets to this hold. This leavs out the first cycle -
             # it's already started so we'll handle it separately.
-            cycles = (hold.position - licenses_reserved - 1) / pool.licenses_owned
+            cycles = (hold.position - licenses_reserved - 1) // pool.licenses_owned
 
             # Each of the owned licenses is currently either on loan or reserved.
             # Figure out which license this hold will eventually get if every
@@ -1047,7 +1049,7 @@ class SharedODLAPI(BaseCirculationAPI):
                 hold_info_response = self._get(hold.external_identifier)
             except RemoteIntegrationException, e:
                 raise CannotLoan()
-            feed = feedparser.parse(unicode(hold_info_response.content))
+            feed = feedparser.parse(hold_info_response.content.decode("utf8"))
             entries = feed.get("entries")
             if len(entries) < 1:
                 raise CannotLoan()
@@ -1070,7 +1072,7 @@ class SharedODLAPI(BaseCirculationAPI):
             raise CannotLoan()
         if response.status_code == 403:
             raise NoAvailableCopies()
-        feed = feedparser.parse(unicode(response.content))
+        feed = feedparser.parse(response.content.decode("utf8"))
         entries = feed.get("entries")
         if len(entries) < 1:
             raise CannotLoan()
@@ -1134,7 +1136,7 @@ class SharedODLAPI(BaseCirculationAPI):
             raise CannotReturn()
         if response.status_code == 404:
             raise NotCheckedOut()
-        feed = feedparser.parse(unicode(response.content))
+        feed = feedparser.parse(response.content.decode("utf8"))
         entries = feed.get("entries")
         if len(entries) < 1:
             raise CannotReturn()
@@ -1179,7 +1181,7 @@ class SharedODLAPI(BaseCirculationAPI):
         requested_content_type = internal_format.delivery_mechanism.content_type
         requested_drm_scheme = internal_format.delivery_mechanism.drm_scheme
 
-        feed = feedparser.parse(unicode(response.content))
+        feed = feedparser.parse(response.content.decode("utf8"))
         entries = feed.get("entries")
         if len(entries) < 1:
             raise CannotFulfill()
@@ -1191,7 +1193,7 @@ class SharedODLAPI(BaseCirculationAPI):
 
         # The entry is parsed with etree to get indirect acquisitions
         parser = SharedODLImporter.PARSER_CLASS()
-        root = etree.parse(StringIO(unicode(response.content)))
+        root = etree.parse(BytesIO(response.content))
 
         fulfill_url = SharedODLImporter.get_fulfill_url(response.content, requested_content_type, requested_drm_scheme)
         if not fulfill_url:
@@ -1236,7 +1238,7 @@ class SharedODLAPI(BaseCirculationAPI):
             raise CannotReleaseHold()
         if response.status_code == 404:
             raise NotOnHold()
-        feed = feedparser.parse(unicode(response.content))
+        feed = feedparser.parse(response.content.decode("utf8"))
         entries = feed.get("entries")
         if len(entries) < 1:
             raise CannotReleaseHold()
@@ -1275,7 +1277,7 @@ class SharedODLAPI(BaseCirculationAPI):
             if response.status_code == 404:
                 # 404 is returned when the loan has been deleted. Leave this loan out of the result.
                 continue
-            feed = feedparser.parse(unicode(response.content))
+            feed = feedparser.parse(response.content.decode("utf8"))
             entries = feed.get("entries")
             if len(entries) < 1:
                 raise CirculationException()
@@ -1304,7 +1306,7 @@ class SharedODLAPI(BaseCirculationAPI):
             if response.status_code == 404:
                 # 404 is returned when the hold has been deleted. Leave this hold out of the result.
                 continue
-            feed = feedparser.parse(unicode(response.content))
+            feed = feedparser.parse(response.content.decode("utf8"))
             entries = feed.get("entries")
             if len(entries) < 1:
                 raise CirculationException()
@@ -1338,7 +1340,7 @@ class SharedODLImporter(OPDSImporter):
     @classmethod
     def get_fulfill_url(cls, entry, requested_content_type, requested_drm_scheme):
         parser = cls.PARSER_CLASS()
-        root = etree.parse(StringIO(unicode(entry)))
+        root = etree.parse(BytesIO(entry))
 
         fulfill_url = None
         for link_tag in parser._xpath(root, 'atom:link'):

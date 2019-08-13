@@ -9,6 +9,7 @@ from nose.tools import (
     set_trace,
 )
 
+from collections import OrderedDict
 import datetime
 from decimal import Decimal
 import json
@@ -657,11 +658,10 @@ class TestLibraryAuthenticator(AuthenticatorTest):
         eq_([], list(authenticator.providers))
 
     def test_configuration_exception_during_from_config_stored(self):
-        """If the initialization of an AuthenticationProvider from config
-        raises CannotLoadConfiguration or ImportError, the exception
-        is stored with the LibraryAuthenticator rather than being
-        propagated.
-        """
+        # If the initialization of an AuthenticationProvider from config
+        # raises CannotLoadConfiguration or ImportError, the exception
+        # is stored with the LibraryAuthenticator rather than being
+        # propagated.
 
         # Create an integration destined to raise CannotLoadConfiguration..
         misconfigured = self._external_integration(
@@ -684,11 +684,11 @@ class TestLibraryAuthenticator(AuthenticatorTest):
         # initialization_exceptions.
         not_configured = auth.initialization_exceptions[misconfigured.id]
         assert isinstance(not_configured, CannotLoadConfiguration)
-        eq_('First Book server not configured.', not_configured.message)
+        eq_('First Book server not configured.', str(not_configured))
 
         not_found = auth.initialization_exceptions[unknown.id]
         assert isinstance(not_found, ImportError)
-        eq_('No module named unknown protocol', not_found.message)
+        eq_("No module named unknown protocol", unicode(not_found))
 
     def test_register_fails_when_integration_has_wrong_goal(self):
         integration = self._external_integration(
@@ -798,8 +798,10 @@ class TestLibraryAuthenticator(AuthenticatorTest):
         # But you can't create an Authenticator that uses OAuth
         # without providing a secret.
         assert_raises_regexp(
-            LibraryAuthenticator,
+            CannotLoadConfiguration,
             "OAuth providers are configured, but secret for signing bearer tokens is not.",
+            LibraryAuthenticator,
+            _db=self._db,
             library=self._default_library,
             oauth_providers=[oauth]
         )
@@ -1068,11 +1070,25 @@ class TestLibraryAuthenticator(AuthenticatorTest):
             bearer_token_signing_secret='foo'
         )
 
-        # A token is created and signed with the bearer token.
         token1 = authenticator.create_bearer_token(oauth1.NAME, "some token")
-        eq_("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJvYXV0aDEiLCJ0b2tlbiI6InNvbWUgdG9rZW4ifQ.Ve-bbEN4mdWQdR-VA6gbrK2xOz2KRbmPhttmTTCA0ng",
-            token1
-        )
+
+        # We know the bearer token is a JWT-like string that looks
+        # like this. There's no timestamp in the payload, so this won't
+        # change over time.
+        expect_jwtlike = u'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbiI6InNvbWUgdG9rZW4iLCJpc3MiOiJvYXV0aDEifQ.tolCFBIKqtp2NORHtwy5-44GwAwDIma2pebPGXvPY-g'
+        eq_(token1, expect_jwtlike)
+
+        # We can't call jwt.decode to peek into expect_jwt, because
+        # it's not a proper JWT and the signature verification will
+        # fail.  But if you're debugging this test and you need to
+        # look at the pieces that make up expect_jwt, you can call
+        # PyJWT._load(), like so:
+        from jwt.api_jwt import _jwt_global_obj
+        loaded = _jwt_global_obj._load(expect_jwtlike)
+        payload = loaded[0]
+        payload_dict = json.loads(payload)
+        eq_("some token", payload_dict['token'])
+        eq_(oauth1.NAME, payload_dict['iss'])
 
         # Varying the name of the OAuth provider varies the bearer
         # token.
@@ -1887,7 +1903,7 @@ class TestBasicAuthenticationProvider(AuthenticatorTest):
         [result] = list(provider._run_self_tests(_db))
         eq_(_db, provider.called_with)
         eq_(False, result.success)
-        eq_("Nope", result.exception.message)
+        eq_("Nope", unicode(result.exception))
 
         # If we can authenticate a test patron, the patron and their
         # password are passed into the next test.
@@ -2627,17 +2643,23 @@ class TestOAuthController(AuthenticatorTest):
         self.controller = OAuthController(self.auth)
 
     def test_oauth_authentication_redirect(self):
-        """Test the controller method that sends patrons off to the OAuth
-        provider, where they're supposed to log in.
-        """
+        # Test the controller method that sends patrons off to the OAuth
+        # provider, where they're supposed to log in.
         params = dict(provider=self.oauth1.NAME)
         response = self.controller.oauth_authentication_redirect(params, self._db)
         eq_(302, response.status_code)
-        expected_state = dict(redirect_uri="", provider=self.oauth1.NAME)
+
+        # TODO PYTHON3 Flask may put the dict keys in a different order --
+        # in that case the string will come out different.
+        expected_state = OrderedDict()
+        expected_state['redirect_uri'] = ""
+        expected_state['provider'] = self.oauth1.NAME
         expected_state = urllib.quote(json.dumps(expected_state))
         eq_("http://oauth1.com/?state=" + expected_state, response.location)
 
-        params = dict(provider=self.oauth2.NAME, redirect_uri="http://foo.com/")
+        params = OrderedDict()
+        params['redirect_uri'] = "http://foo.com/"
+        params['provider'] = self.oauth2.NAME
         response = self.controller.oauth_authentication_redirect(params, self._db)
         eq_(302, response.status_code)
         expected_state = urllib.quote(json.dumps(params))

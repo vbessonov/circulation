@@ -179,8 +179,8 @@ class TestRBDigitalAPI(RBDigitalAPITest):
             no_patron_credential.name
         )
         eq_(False, no_patron_credential.success)
-        eq_("Library has no test patron configured.",
-            no_patron_credential.exception.message)
+        eq_(u"Library has no test patron configured.",
+            unicode(no_patron_credential.exception))
 
         eq_("Checking patron activity, using test patron for library %s" % with_default_patron.name,
             patron_activity.name)
@@ -212,7 +212,8 @@ class TestRBDigitalAPI(RBDigitalAPITest):
 
         # We gave up after the first test failed.
         eq_("Counting ebooks in collection", result.name)
-        eq_("Invalid library id is provided or permission denied", result.exception.message)
+        eq_(u"Invalid library id is provided or permission denied",
+            unicode(result.exception))
         eq_(repr(error), result.exception.debug_message)
 
     def test_external_integration(self):
@@ -1291,13 +1292,12 @@ class TestRBDigitalAPI(RBDigitalAPITest):
                       patron, None, pool)
 
     def test_update_licensepool_for_identifier(self):
-        """Test the RBDigital implementation of the update_availability method
-        defined by the CirculationAPI interface.
-        """
+        # Test the RBDigital implementation of the update_availability method
+        # defined by the CirculationAPI interface.
 
         # Update a LicensePool that doesn't exist yet, and it gets created.
         identifier = self._identifier(identifier_type=Identifier.RB_DIGITAL_ID)
-        isbn = identifier.identifier.encode("ascii")
+        isbn = identifier.identifier
 
         # The BibliographicCoverageProvider gets called for a new license pool.
         self.api.queue_response(200, content=json.dumps({}))
@@ -1328,7 +1328,7 @@ class TestRBDigitalAPI(RBDigitalAPITest):
         pool.patrons_in_hold_queue = 3
         eq_(None, pool.last_checked)
 
-        isbn = pool.identifier.identifier.encode("ascii")
+        isbn = pool.identifier.identifier
 
         pool, is_new, circulation_changed = self.api.update_licensepool_for_identifier(
             isbn, False, 'eaudio'
@@ -1411,7 +1411,7 @@ class TestCirculationMonitor(RBDigitalAPITest):
 
         # Modify the data so that it appears to be talking about the
         # book we just created.
-        new_identifier = pool_ebook.identifier.identifier.encode("ascii")
+        new_identifier = pool_ebook.identifier.identifier
         datastr = datastr.replace("9781781107041", new_identifier)
         monitor.api.queue_response(status_code=200, content=datastr)
 
@@ -1625,6 +1625,7 @@ class TestRBDigitalRepresentationExtractor(RBDigitalAPITest):
         eq_(u"Laura Flanagan Guskin", narrator.display_name)
         eq_([Contributor.NARRATOR_ROLE], narrator.roles)
 
+        # TODO PYTHON3 it's better not to sort this list.
         subjects = sorted(metadata.subjects, key=lambda x: x.identifier)
 
         eq_([(None, u"FICTION / Humorous / General", Subject.BISAC, 100),

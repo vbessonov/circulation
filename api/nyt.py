@@ -137,8 +137,11 @@ class NYTBestSellerAPI(NYTAPI, HasSelfTests):
             content = json.loads(representation.content)
             return content
 
-        diagnostic = "Response from %s was: %r" % (
-            url, representation.content
+        content = representation.content
+        if isinstance(content, bytes):
+            content = content.decode("utf8")
+        diagnostic = "Response from %s was: '%s'" % (
+            url, content
         )
 
         if status == 403:

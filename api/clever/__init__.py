@@ -204,7 +204,7 @@ class CleverAuthenticationAPI(OAuthAuthenticationProvider):
         )
 
         self.log.error("Made request for school ID %s", school_id)
-        self.log.error("Response was: %r", school)
+        self.log.error("Response was: %s" % repr(school))
         school_nces_id = school['data'].get('nces_id')
 
         # TODO: check student free and reduced lunch status as well

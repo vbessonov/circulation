@@ -9,6 +9,7 @@ import jwt
 import re
 import urllib
 import urlparse
+import copy
 
 import flask
 from flask import (
@@ -60,6 +61,7 @@ from core.model import (
     Work,
     WorkGenre,
 )
+from core.model.configuration import ExternalIntegrationLink
 from core.lane import (Lane, WorkList)
 from core.log import (LogConfiguration, SysLogger, Loggly, CloudwatchLogs)
 from core.util.problem_detail import ProblemDetail
@@ -98,10 +100,9 @@ from core.classifier import (
     NO_NUMBER,
     NO_VALUE
 )
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from sqlalchemy.sql import func
 from sqlalchemy.sql.expression import desc, nullslast, or_, and_, distinct, select, join
-from sqlalchemy.orm import lazyload
 
 from api.admin.templates import admin as admin_template
 from api.authenticator import LibraryAuthenticator
@@ -122,6 +123,8 @@ from api.adobe_vendor_id import AuthdataUtility
 from api.admin.template_styles import *
 
 from core.selftest import HasSelfTests
+
+from api.local_analytics_exporter import LocalAnalyticsExporter
 
 def setup_admin_controllers(manager):
     """Set up all the controllers that will be used by the admin parts of the web app."""
@@ -179,6 +182,7 @@ def setup_admin_controllers(manager):
     from api.admin.controller.search_service_self_tests import SearchServiceSelfTestsController
     manager.admin_search_service_self_tests_controller = SearchServiceSelfTestsController(manager)
     manager.admin_search_services_controller = SearchServicesController(manager)
+    from api.admin.controller.storage_services import StorageServicesController
     manager.admin_storage_services_controller = StorageServicesController(manager)
     from api.admin.controller.catalog_services import *
     manager.admin_catalog_services_controller = CatalogServicesController(manager)
@@ -812,7 +816,15 @@ class CustomListsController(AdminCirculationManagerController):
             if isinstance(pagination, ProblemDetail):
                 return pagination
 
-            query = self._db.query(Work).join(Work.custom_list_entries).filter(CustomListEntry.list_id==list_id)
+            query = self._db.query(
+                Work
+            ).join(
+                Work.custom_list_entries
+            ).filter(
+                CustomListEntry.list_id==list_id
+            ).order_by(
+                Work.id
+            )
             url = self.url_for(
                 "custom_list", list_name=list.name,
                 library_short_name=library.short_name,
@@ -1242,7 +1254,6 @@ class DashboardController(AdminCirculationManagerController):
         events = map(lambda result: {
             "id": result.id,
             "type": result.type,
-            "patron_id": result.foreign_patron_id,
             "time": result.start,
             "book": {
                 "title": result.license_pool.work.title,
@@ -1252,63 +1263,43 @@ class DashboardController(AdminCirculationManagerController):
 
         return dict({ "circulation_events": events })
 
-    def bulk_circulation_events(self):
-        default = str(datetime.today()).split(" ")[0]
-        date = flask.request.args.get("date", default)
-        next_date = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
+    def bulk_circulation_events(self, analytics_exporter=None):
+        date_format = "%Y-%m-%d"
+        def get_date(field):
+            # Return a date or datetime object representing the
+            # _beginning_ of the asked-for day.
+            today = date.today()
+            value = flask.request.args.get(field, None)
+            if not value:
+                return today
+            try:
+                return datetime.strptime(value, date_format)
+            except ValueError, e:
+                # This won't happen in real life since the format is
+                # controlled by the calendar widget. There's no need
+                # to send an error message -- just use the default
+                # date.
+                return today
 
-        query = self._db.query(
-                CirculationEvent, Identifier, Work, Edition
-            ) \
-            .join(LicensePool, LicensePool.id == CirculationEvent.license_pool_id) \
-            .join(Identifier, Identifier.id == LicensePool.identifier_id) \
-            .join(Work, Work.id == LicensePool.work_id) \
-            .join(Edition, Edition.id == Work.presentation_edition_id) \
-            .filter(CirculationEvent.start >= date) \
-            .filter(CirculationEvent.start < next_date) \
-            .order_by(CirculationEvent.start.asc())
-        query = query \
-            .options(lazyload(Identifier.licensed_through)) \
-            .options(lazyload(Work.license_pools))
-        results = query.all()
+        # For the start date we should use the _beginning_ of the day,
+        # which is what get_date returns.
+        date_start = get_date("date")
 
-        work_ids = map(lambda result: result[2].id, results)
+        # When running the search, the cutoff is the first moment of
+        # the day _after_ the end date. When generating the filename,
+        # though, we should use the date provided by the user.
+        date_end_label = get_date("dateEnd")
+        date_end = date_end_label + timedelta(days=1)
+        locations = flask.request.args.get("locations", None)
+        library = getattr(flask.request, 'library', None)
+        library_short_name = library.short_name if library else None
 
-        subquery = self._db \
-            .query(WorkGenre.work_id, Genre.name) \
-            .join(Genre) \
-            .filter(WorkGenre.work_id.in_(work_ids)) \
-            .order_by(WorkGenre.affinity.desc()) \
-            .subquery()
-        genre_query = self._db \
-            .query(subquery.c.work_id, func.string_agg(subquery.c.name, ",")) \
-            .select_from(subquery) \
-            .group_by(subquery.c.work_id)
-        genres = dict(genre_query.all())
-
-        header = [
-            "time", "event", "identifier", "identifier_type", "title", "author",
-            "fiction", "audience", "publisher", "language", "target_age", "genres"
-        ]
-
-        def result_to_row(result):
-            (event, identifier, work, edition) = result
-            return [
-                str(event.start) or "",
-                event.type,
-                identifier.identifier,
-                identifier.type,
-                edition.title,
-                edition.author,
-                "fiction" if work.fiction else "nonfiction",
-                work.audience,
-                edition.publisher,
-                edition.language,
-                work.target_age_string,
-                genres.get(work.id)
-            ]
-
-        return [header] + map(result_to_row, results), date
+        analytics_exporter = analytics_exporter or LocalAnalyticsExporter()
+        data = analytics_exporter.export(
+            self._db, date_start, date_end, locations, library
+        )
+        return (data, date_start.strftime(date_format),
+                date_end_label.strftime(date_format), library_short_name)
 
 class SettingsController(AdminCirculationManagerController):
 
@@ -1410,12 +1401,25 @@ class SettingsController(AdminCirculationManagerController):
             settings = dict()
             for setting in protocol.get("settings", []):
                 key = setting.get("key")
-                if setting.get("type") == "list":
-                    value = ConfigurationSetting.for_externalintegration(
-                        key, service).json_value
+
+                # If the setting is a covers or books mirror, we need to get
+                # the value from ExternalIntegrationLink and
+                # not from a ConfigurationSetting.
+                if key.endswith('mirror_integration_id'):
+                    storage_integration = get_one(
+                        self._db, ExternalIntegrationLink, external_integration_id=service.id
+                    )
+                    if storage_integration:
+                        value = str(storage_integration.other_integration_id)
+                    else:
+                        value = self.NO_MIRROR_INTEGRATION
                 else:
-                    value = ConfigurationSetting.for_externalintegration(
-                        key, service).value
+                    if setting.get("type") == "list":
+                        value = ConfigurationSetting.for_externalintegration(
+                            key, service).json_value
+                    else:
+                        value = ConfigurationSetting.for_externalintegration(
+                            key, service).value
                 settings[key] = value
 
             service_info = dict(
@@ -1482,9 +1486,10 @@ class SettingsController(AdminCirculationManagerController):
     def _set_integration_settings_and_libraries(self, integration, protocol):
         settings = protocol.get("settings")
         for setting in settings:
-            result = self._set_integration_setting(integration, setting)
-            if isinstance(result, ProblemDetail):
-                return result
+            if not setting.get('key').endswith('mirror_integration_id'):
+                result = self._set_integration_setting(integration, setting)
+                if isinstance(result, ProblemDetail):
+                    return result
 
         if not protocol.get("sitewide") or protocol.get("library_settings"):
             integration.libraries = []
@@ -1582,7 +1587,7 @@ class SettingsController(AdminCirculationManagerController):
 
         return self_test_results
 
-    def _mirror_integration_setting(self):
+    def _mirror_integration_settings(self):
         """Create a setting interface for selecting a storage integration to
         be used when mirroring items from a collection.
         """
@@ -1590,26 +1595,18 @@ class SettingsController(AdminCirculationManagerController):
             ExternalIntegration.goal==ExternalIntegration.STORAGE_GOAL
         ).order_by(
             ExternalIntegration.name
-        ).all()
-        if not integrations:
+        )
+
+        if not integrations.all():
             return
-        mirror_integration_setting = {
-            "key": "mirror_integration_id",
-            "label": _("Mirror"),
-            "description": _("Any cover images or free books encountered while importing content from this collection can be mirrored to a server you control."),
-            "type": "select",
-            "options" : [
-                dict(
-                    key=self.NO_MIRROR_INTEGRATION,
-                    label=_("None - Do not mirror cover images or free books")
+
+        mirror_integration_settings = copy.deepcopy(ExternalIntegrationLink.COLLECTION_MIRROR_SETTINGS)
+        for setting in mirror_integration_settings:
+            for integration in integrations:
+                setting['options'].append(
+                    dict(key=str(integration.id), label=integration.name)
                 )
-            ]
-        }
-        for integration in integrations:
-            mirror_integration_setting['options'].append(
-                dict(key=integration.id, label=integration.name)
-            )
-        return mirror_integration_setting
+        return mirror_integration_settings
 
     def _create_integration(self, protocol_definitions, protocol, goal):
         """Create a new ExternalIntegration for the given protocol and
@@ -1669,6 +1666,81 @@ class SettingsController(AdminCirculationManagerController):
             # Without checking that the IDs are different, you can't save
             # changes to an existing service unless you've also changed its name.
             return INTEGRATION_NAME_ALREADY_IN_USE
+
+    @classmethod
+    def url_variants(cls, url, check_protocol_variant=True):
+        """Generate minor variants of a URL -- HTTP vs HTTPS, trailing slash
+        vs not, etc.
+
+        Technically these are all distinct URLs, but in real life they
+        generally mean someone typed the same URL slightly
+        differently. Since this isn't an exact science, this doesn't
+        need to catch all variant URLs, only the most common ones.
+        """
+        if not Validator()._is_url(url, []):
+            # An invalid URL has no variants.
+            return
+
+        # A URL is a 'variant' of itself.
+        yield url
+
+        # Adding or removing a slash creates a variant.
+        if url.endswith("/"):
+            yield url[:-1]
+        else:
+            yield url + '/'
+
+        # Changing protocols may create one or more variants.
+        https = "https://"
+        http = "http://"
+        if check_protocol_variant:
+            protocol_variant = None
+            if url.startswith(https):
+                protocol_variant = url.replace(https, http, 1)
+            elif url.startswith(http):
+                protocol_variant = url.replace(http, https, 1)
+            if protocol_variant:
+                for v in cls.url_variants(protocol_variant, False):
+                    yield v
+
+    def check_url_unique(self, new_service, url, protocol, goal):
+        """Enforce a rule that a given circulation manager can only have
+        one integration that uses a given URL for a certain purpose.
+
+        Whether to enforce this rule for a given type of integration
+        is up to you -- it's a good general rule but there are
+        conceivable exceptions.
+
+        This method is used by discovery_services.
+        """
+        if not url:
+            return
+
+        # Look for the given URL as well as minor variations.
+        #
+        # We can't use urlparse to ignore minor differences in URLs
+        # because we're doing the comparison in the database.
+        urls = list(self.url_variants(url))
+
+        qu = self._db.query(ExternalIntegration).join(
+            ExternalIntegration.settings
+        ).filter(
+            # Protocol must match.
+            ExternalIntegration.protocol==protocol
+        ).filter(
+            # Goal must match.
+            ExternalIntegration.goal==goal
+        ).filter(
+            ConfigurationSetting.key==ExternalIntegration.URL
+        ).filter(
+            # URL must be one of the URLs we're concerned about.
+            ConfigurationSetting.value.in_(urls)
+        ).filter(
+            # But don't count the service we're trying to edit.
+            ExternalIntegration.id != new_service.id
+        )
+        if qu.count() > 0:
+            return INTEGRATION_URL_ALREADY_IN_USE
 
     def look_up_service_by_id(self, id, protocol, goal=None):
         """Find an existing service, and make sure that the user is not trying to edit

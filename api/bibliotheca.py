@@ -37,6 +37,7 @@ from selftest import (
 
 from core.model import (
     CirculationEvent,
+    Classification,
     Collection,
     Contributor,
     DataSource,
@@ -247,7 +248,8 @@ class BibliothecaAPI(BaseCirculationAPI, HasSelfTests):
         else:
             return self._request_with_timeout(
                 method, url, data=body, headers=headers,
-                allow_redirects=False)
+                allow_redirects=False, timeout=60
+            )
 
     def get_bibliographic_info_for(self, editions, max_age=None):
         results = dict()
@@ -698,7 +700,7 @@ class ItemListParser(XMLParser):
             if not i:
                 continue
             i = i.replace("&amp;amp;", "&amp;").replace("&amp;", "&").replace("&#39;", "'")
-            genres.append(SubjectData(Subject.BISAC, None, i, weight=15))
+            genres.append(SubjectData(Subject.BISAC, None, i, weight=Classification.TRUSTED_DISTRIBUTOR_WEIGHT))
         return genres
 
 
@@ -760,8 +762,29 @@ class ItemListParser(XMLParser):
                 LinkData(rel=Hyperlink.DESCRIPTION, content=description)
             )
 
+        # Presume all images from Bibliotheca are JPEG.
+        media_type = Representation.JPEG_MEDIA_TYPE
         cover_url = value("CoverLinkURL").replace("&amp;", "&")
-        links.append(LinkData(rel=Hyperlink.IMAGE, href=cover_url))
+        cover_link = LinkData(
+            rel=Hyperlink.IMAGE, href=cover_url,
+            media_type=media_type
+        )
+
+        # Unless the URL format has drastically changed, we should be
+        # able to generate a thumbnail URL based on the full-size
+        # cover URL found in the response document.
+        #
+        # NOTE: this is an undocumented feature of the Bibliotheca API
+        # which was discovered by investigating the BookLinkURL.
+        if '/delivery/img' in cover_url:
+            thumbnail_url = cover_url + "&size=NORMAL"
+            thumbnail = LinkData(
+                rel=Hyperlink.THUMBNAIL_IMAGE,
+                href=thumbnail_url,
+                media_type=media_type
+            )
+            cover_link.thumbnail = thumbnail
+        links.append(cover_link)
 
         alternate_url = value("BookLinkURL").replace("&amp;", "&")
         links.append(LinkData(rel='alternate', href=alternate_url))

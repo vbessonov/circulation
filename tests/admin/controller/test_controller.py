@@ -19,6 +19,7 @@ from PIL import Image
 import math
 import operator
 from flask_babel import lazy_gettext as _
+import csv
 
 from tests import sample_data
 from tests.test_controller import CirculationControllerTest
@@ -74,6 +75,7 @@ from core.model import (
     Timestamp,
     WorkGenre
 )
+from core.model.configuration import ExternalIntegrationLink
 from core.lane import Lane
 from core.s3 import MockS3Uploader
 from core.testing import (
@@ -249,21 +251,8 @@ class TestViewController(AdminControllerTest):
             assert token in response.headers.get('Set-Cookie')
 
     def test_show_circ_events_download(self):
-        # The local analytics provider isn't configured yet.
-        with self.app.test_request_context('/admin'):
-            flask.session['admin_email'] = self.admin.email
-            flask.session['auth_type'] = PasswordAdminAuthenticationProvider.NAME
-            response = self.manager.admin_view_controller("collection", "book")
-            eq_(200, response.status_code)
-            html = response.response[0]
-            assert 'showCircEventsDownload: false' in html
-
-        # Create the local analytics integration.
-        local_service, ignore = create(
-            self._db, ExternalIntegration,
-            protocol=LocalAnalyticsProvider.__module__,
-            goal=ExternalIntegration.ANALYTICS_GOAL,
-        )
+        # The local analytics provider will be configured by default if
+        # there isn't one.
         with self.app.test_request_context('/admin'):
             flask.session['admin_email'] = self.admin.email
             flask.session['auth_type'] = PasswordAdminAuthenticationProvider.NAME
@@ -1712,7 +1701,6 @@ class TestDashboardController(AdminControllerTest):
 
     def test_circulation_events(self):
         [lp] = self.english_1.license_pools
-        patron_id = "patronid"
         types = [
             CirculationEvent.DISTRIBUTOR_CHECKIN,
             CirculationEvent.DISTRIBUTOR_CHECKOUT,
@@ -1725,7 +1713,7 @@ class TestDashboardController(AdminControllerTest):
             get_one_or_create(
                 self._db, CirculationEvent,
                 license_pool=lp, type=type, start=time, end=time,
-                foreign_patron_id=patron_id)
+            )
             time += timedelta(minutes=1)
 
         with self.request_context_with_library_and_admin("/"):
@@ -1736,7 +1724,6 @@ class TestDashboardController(AdminControllerTest):
         eq_(types[::-1], [event['type'] for event in events])
         eq_([self.english_1.title]*len(types), [event['book']['title'] for event in events])
         eq_([url]*len(types), [event['book']['url'] for event in events])
-        eq_([patron_id]*len(types), [event['patron_id'] for event in events])
 
         # request fewer events
         with self.request_context_with_library_and_admin("/?num=2"):
@@ -1751,46 +1738,71 @@ class TestDashboardController(AdminControllerTest):
         identifier = self.english_1.presentation_edition.primary_identifier
         genres = self._db.query(Genre).all()
         get_one_or_create(self._db, WorkGenre, work=self.english_1, genre=genres[0], affinity=0.2)
-        get_one_or_create(self._db, WorkGenre, work=self.english_1, genre=genres[1], affinity=0.3)
-        get_one_or_create(self._db, WorkGenre, work=self.english_1, genre=genres[2], affinity=0.5)
-        ordered_genre_string = ",".join([genres[2].name, genres[1].name, genres[0].name])
-        types = [
-            CirculationEvent.DISTRIBUTOR_CHECKIN,
-            CirculationEvent.DISTRIBUTOR_CHECKOUT,
-            CirculationEvent.DISTRIBUTOR_HOLD_PLACE,
-            CirculationEvent.DISTRIBUTOR_HOLD_RELEASE,
-            CirculationEvent.DISTRIBUTOR_TITLE_ADD
-        ]
-        num = len(types)
-        time = datetime.now() - timedelta(minutes=len(types))
-        for type in types:
-            get_one_or_create(
-                self._db, CirculationEvent,
-                license_pool=lp, type=type, start=time, end=time)
-            time += timedelta(minutes=1)
 
+        time = datetime.now() - timedelta(minutes=1)
+        event, ignore = get_one_or_create(
+            self._db, CirculationEvent,
+            license_pool=lp, type=CirculationEvent.DISTRIBUTOR_CHECKOUT,
+            start=time, end=time
+        )
+        time += timedelta(minutes=1)
+
+        # Try an end-to-end test, getting all circulation events for
+        # the current day.
         with self.app.test_request_context("/"):
-            response, requested_date = self.manager.admin_dashboard_controller.bulk_circulation_events()
-        rows = response[1::] # skip header row
-        eq_(num, len(rows))
-        eq_(types, [row[1] for row in rows])
-        eq_([identifier.identifier]*num, [row[2] for row in rows])
-        eq_([identifier.type]*num, [row[3] for row in rows])
-        eq_([edition.title]*num, [row[4] for row in rows])
-        eq_([edition.author]*num, [row[5] for row in rows])
-        eq_(["fiction"]*num, [row[6] for row in rows])
-        eq_([self.english_1.audience]*num, [row[7] for row in rows])
-        eq_([edition.publisher]*num, [row[8] for row in rows])
-        eq_([edition.language]*num, [row[9] for row in rows])
-        eq_([self.english_1.target_age_string]*num, [row[10] for row in rows])
-        eq_([ordered_genre_string]*num, [row[11] for row in rows])
+            response, requested_date, date_end, library_short_name = self.manager.admin_dashboard_controller.bulk_circulation_events()
+        reader = csv.reader(
+            [row for row in response.split("\r\n") if row],
+            dialect=csv.excel
+        )
+        rows = [row for row in reader][1::] # skip header row
+        eq_(1, len(rows))
+        [row] = rows
+        eq_(CirculationEvent.DISTRIBUTOR_CHECKOUT, row[1])
+        eq_(identifier.identifier, row[2])
+        eq_(identifier.type, row[3])
+        eq_(edition.title, row[4])
+        eq_(genres[0].name, row[12])
 
-        # use date
-        today = date.strftime(date.today() - timedelta(days=1), "%Y-%m-%d")
-        with self.app.test_request_context("/?date=%s" % today):
-            response, requested_date = self.manager.admin_dashboard_controller.bulk_circulation_events()
-        rows = response[1::] # skip header row
-        eq_(0, len(rows))
+        # Now verify that this works by passing incoming query
+        # parameters into a LocalAnalyticsExporter object.
+        class MockLocalAnalyticsExporter(object):
+            def export(self, _db, date_start, date_end, locations, library):
+                self.called_with = (
+                    _db, date_start, date_end, locations, library
+                )
+                return "A CSV file"
+
+        exporter = MockLocalAnalyticsExporter()
+        with self.request_context_with_library("/?date=2018-01-01&dateEnd=2018-01-04&locations=loc1,loc2"):
+            response, requested_date, date_end, library_short_name = self.manager.admin_dashboard_controller.bulk_circulation_events(analytics_exporter=exporter)
+
+            # export() was called with the arguments we expect.
+            #
+            args = list(exporter.called_with)
+            eq_(self._db, args.pop(0))
+            eq_(datetime(2018, 1, 1), args.pop(0))
+            # This is the start of the day _after_ the dateEnd we
+            # specified -- we want all events that happened _before_
+            # 2018-01-05.
+            eq_(datetime(2018, 1, 5), args.pop(0))
+            eq_("loc1,loc2", args.pop(0))
+            eq_(self._default_library, args.pop(0))
+            eq_([], args)
+
+            # The data returned is whatever export() returned.
+            eq_("A CSV file", response)
+
+            # The other data is necessary to build a filename for the
+            # "CSV file".
+            eq_("2018-01-01", requested_date)
+
+            # Note that the date_end is the date we requested --
+            # 2018-01-04 -- not the cutoff time passed in to export(),
+            # which is the start of the subsequent day.
+            eq_("2018-01-04", date_end)
+            eq_(self._default_library.short_name, library_short_name)
+
 
     def test_stats_patrons(self):
         with self.request_context_with_admin("/"):
@@ -2282,3 +2294,142 @@ class TestSettingsController(SettingsControllerTest):
             # If the validator returns an problem detail, validate_formats returns it.
             response = self.manager.admin_settings_controller.validate_formats(Configuration.LIBRARY_SETTINGS, validator)
             eq_(response, INVALID_EMAIL)
+
+    def test__mirror_integration_settings(self):
+        # If no storage integrations are available, return none
+        mirror_integration_settings = self.manager.admin_settings_controller._mirror_integration_settings
+
+        eq_(None, mirror_integration_settings())
+
+        # Storages created will appear for settings of any purpose
+        storage1 = self._external_integration(
+            "protocol1", ExternalIntegration.STORAGE_GOAL, name="storage1",
+        )
+
+        settings = mirror_integration_settings()
+
+        eq_(settings[0]["key"], "covers_mirror_integration_id")
+        eq_(settings[0]["label"], "Covers Mirror")
+        eq_(settings[0]["options"][0]['key'],
+            self.manager.admin_settings_controller.NO_MIRROR_INTEGRATION)
+        eq_(settings[0]["options"][1]['key'],
+            str(storage1.id))
+        eq_(settings[1]["key"], "books_mirror_integration_id")
+        eq_(settings[1]["label"], "Books Mirror")
+        eq_(settings[1]["options"][0]['key'],
+            self.manager.admin_settings_controller.NO_MIRROR_INTEGRATION)
+        eq_(settings[1]["options"][1]['key'],
+            str(storage1.id))
+
+        storage2 = self._external_integration(
+            "protocol2", ExternalIntegration.STORAGE_GOAL, name="storage2"
+        )
+        settings = mirror_integration_settings()
+
+        eq_(settings[0]["key"], "covers_mirror_integration_id")
+        eq_(settings[0]["label"], "Covers Mirror")
+        eq_(settings[0]["options"][0]['key'],
+            self.manager.admin_settings_controller.NO_MIRROR_INTEGRATION)
+        eq_(settings[0]["options"][1]['key'],
+            str(storage1.id))
+        eq_(settings[0]["options"][2]['key'],
+            str(storage2.id))
+        eq_(settings[1]["key"], "books_mirror_integration_id")
+        eq_(settings[1]["label"], "Books Mirror")
+        eq_(settings[1]["options"][0]['key'],
+            self.manager.admin_settings_controller.NO_MIRROR_INTEGRATION)
+        eq_(settings[1]["options"][1]['key'],
+            str(storage1.id))
+        eq_(settings[1]["options"][2]['key'],
+            str(storage2.id))
+
+    def test_check_url_unique(self):
+        # Verify our ability to catch duplicate integrations for a
+        # given URL.
+        m = self.manager.admin_settings_controller.check_url_unique
+
+        # Here's an ExternalIntegration.
+        protocol = "a protocol"
+        goal = "a goal"
+        original = self._external_integration(
+            url="http://service/", protocol=protocol, goal=goal
+        )
+        protocol = original.protocol
+        goal = original.goal
+
+        # Here's another ExternalIntegration that might or might not
+        # be about to become a duplicate of the original.
+        new = self._external_integration(
+            protocol=protocol, goal="new goal"
+        )
+        new.goal = original.goal
+        assert new != original
+
+        # We're going to call this helper function multiple times to check if
+        # different scenarios trip the "duplicate" logic.
+        def is_dupe(url, protocol, goal):
+            result = m(new, url, protocol, goal)
+            if result is None:
+                return False
+            elif result is INTEGRATION_URL_ALREADY_IN_USE:
+                return True
+            else:
+                raise Exception(
+                    "check_url_unique must return either the problem detail or None"
+                )
+
+        # The original ExternalIntegration is not a duplicate of itself.
+        eq_(
+            None,
+            m(original, original.url, protocol, goal)
+        )
+
+        # However, any other ExternalIntegration with the same URL,
+        # protocol, and goal is considered a duplicate.
+        eq_(True, is_dupe(original.url, protocol, goal))
+
+        # Minor URL differences are ignored when considering duplicates
+        # -- this is with help from url_variants().
+        eq_(True, is_dupe("https://service/", protocol, goal))
+        eq_(True, is_dupe("https://service", protocol, goal))
+
+        # Not all variants are handled in this way
+        eq_(False, is_dupe("https://service/#fragment", protocol, goal))
+
+        # If any of URL, protocol, and goal are different, then the
+        # integration is not considered a duplicate.
+        eq_(False, is_dupe("different url", protocol, goal))
+        eq_(False, is_dupe(original.url, "different protocol", goal))
+        eq_(False, is_dupe(original.url, protocol, "different goal"))
+
+        # If you're not considering a URL at all, we assume no
+        # duplicate.
+        eq_(False, is_dupe(None, protocol, goal))
+
+    def test_url_variants(self):
+        # Test the helper method that generates slight variants of
+        # any given URL.
+        def m(url):
+            return list(SettingsController.url_variants(url))
+
+        # No URL, no variants.
+        eq_([], m(None))
+        eq_([], m("not a url"))
+
+        # Variants of an HTTP URL with a trailing slash.
+        eq_(
+            ['http://url/', 'http://url', 'https://url/', 'https://url'],
+            m("http://url/")
+        )
+
+        # Variants of an HTTPS URL with a trailing slash.
+        eq_(
+            ['https://url/', 'https://url', 'http://url/', 'http://url'],
+            m("https://url/")
+        )
+
+        # Variants of a URL with no trailing slash.
+        eq_(
+            ['https://url', 'https://url/', 'http://url', 'http://url/'],
+            m("https://url")
+        )

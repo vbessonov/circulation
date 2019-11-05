@@ -203,6 +203,8 @@ class CleverAuthenticationAPI(OAuthAuthenticationProvider):
             bearer_headers
         )
 
+        self.log.error("Made request for school ID %s", school_id)
+        self.log.error("Response was: %r", school)
         school_nces_id = school['data'].get('nces_id')
 
         # TODO: check student free and reduced lunch status as well
@@ -239,6 +241,6 @@ class CleverAuthenticationAPI(OAuthAuthenticationProvider):
         return response.json()
 
     def _get(self, url, headers):
-        return HTTP.get_with_timeout(url, headers=headers).json()
+        return HTTP.get_with_timeout(url, headers=headers, verbose=True).json()
 
 AuthenticationProvider = CleverAuthenticationAPI

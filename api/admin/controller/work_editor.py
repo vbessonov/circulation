@@ -11,11 +11,9 @@ from api.config import (
     Configuration,
     CannotLoadConfiguration
 )
-from api.coverage import MetadataWranglerCollectionRegistrar
+from api.metadata_wrangler import MetadataWranglerCollectionRegistrar
 from api.admin.validator import Validator
 from core.app_server import (
-    entry_response,
-    feed_response,
     load_pagination_from_request,
 )
 from core.classifier import (
@@ -53,6 +51,7 @@ from core.model import (
     Subject,
     Work
 )
+from core.model.configuration import ExternalIntegrationLink
 import base64
 from datetime import date, datetime, timedelta
 import json
@@ -70,6 +69,8 @@ class WorkController(AdminCirculationManagerController):
         """Return an OPDS entry with detailed information for admins.
 
         This includes relevant links for editing the book.
+
+        :return: An OPDSEntryResponse
         """
         self.require_librarian(flask.request.library)
 
@@ -78,11 +79,11 @@ class WorkController(AdminCirculationManagerController):
             return work
 
         annotator = AdminAnnotator(self.circulation, flask.request.library)
-        # Don't cache these OPDS entries - they should update immediately
-        # in the admin interface when an admin makes a change.
-        return entry_response(
-            AcquisitionFeed.single_entry(self._db, work, annotator), cache_for=0,
-        )
+
+        # single_entry returns an OPDSEntryResponse that will not be
+        # cached, which is perfect. We want the admin interface
+        # to update immediately when an admin makes a change.
+        return AcquisitionFeed.single_entry(self._db, work, annotator)
 
     def complaints(self, identifier_type, identifier):
         """Return detailed complaint information for admins."""
@@ -768,7 +769,6 @@ class WorkController(AdminCirculationManagerController):
             return INVALID_URL.detailed(_('"%(url)s" is not a valid URL.', url=image_url))
 
         title_position = flask.request.form.get("title_position")
-
         if image_url and not image_file:
             image_file = StringIO(urllib.urlopen(image_url).read())
 
@@ -827,7 +827,7 @@ class WorkController(AdminCirculationManagerController):
         collection = pools[0].collection
         return collection
 
-    def change_book_cover(self, identifier_type, identifier, mirror=None):
+    def change_book_cover(self, identifier_type, identifier, mirrors=None):
         """Save a new book cover based on the submitted form."""
         self.require_librarian(flask.request.library)
 
@@ -847,9 +847,13 @@ class WorkController(AdminCirculationManagerController):
         if isinstance(collection, ProblemDetail):
             return collection
 
-        # Look for an appropriate mirror to store this cover image.
-        mirror = mirror or MirrorUploader.for_collection(collection, use_sitewide=True)
-        if not mirror:
+        # Look for an appropriate mirror to store this cover image. Since the 
+        # mirror should be used for covers, we don't need a mirror for books.
+        mirrors = mirrors or dict(
+            covers_mirror=MirrorUploader.for_collection(collection, ExternalIntegrationLink.COVERS),
+            books_mirror=None
+        )
+        if not mirrors.get(ExternalIntegrationLink.COVERS):
             return INVALID_CONFIGURATION_OPTION.detailed(_("Could not find a storage integration for uploading the cover."))
 
         image = self.generate_cover_image(work, identifier_type, identifier)
@@ -890,7 +894,7 @@ class WorkController(AdminCirculationManagerController):
             # link_content is false because we already have the content.
             # We don't want the metadata layer to try to fetch it again.
             link_content=False,
-            mirror=mirror,
+            mirrors=mirrors,
             presentation_calculation_policy=presentation_policy,
         )
 

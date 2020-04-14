@@ -226,8 +226,10 @@ class NoveListAPI(object):
         )
         return target_metadata[0], confidence
 
-    def lookup(self, identifier):
+    def lookup(self, identifier, **kwargs):
         """Requests NoveList metadata for a particular identifier
+
+        :param kwargs: Keyword arguments passed into Representation.post().
 
         :return: Metadata object or None
         """
@@ -241,21 +243,26 @@ class NoveListAPI(object):
         )
         scrubbed_url = unicode(self.scrubbed_url(params))
 
-        representation = self.cached_representation(scrubbed_url)
-        if not representation:
-            self.log.info("No cached NoveList request available.")
+        url = self.build_query_url(params)
+        self.log.debug("NoveList lookup: %s",  url)
 
-            url = self.build_query_url(params)
-            self.log.debug("NoveList lookup: %s",  url)
-            representation, from_cache = Representation.post(
-                self._db, unicode(url), '', max_age=self.MAX_REPRESENTATION_AGE,
-                response_reviewer=self.review_response
-            )
+        # We want to make an HTTP request for `url` but cache the
+        # result under `scrubbed_url`. Define a 'URL normalization'
+        # function that always returns `scrubbed_url`.
+        def normalized_url(original):
+            return scrubbed_url
 
-            # Remove credential information from the Representation URL. This
-            # avoids holding those details in an unexpected part of the database
-            # and lets multiple libraries to use the same cached representation.
-            representation.url = scrubbed_url
+        representation, from_cache = Representation.post(
+            _db=self._db, url=unicode(url), data='',
+            max_age=self.MAX_REPRESENTATION_AGE,
+            response_reviewer=self.review_response,
+            url_normalizer=normalized_url, **kwargs
+        )
+
+        # Commit to the database immediately to reduce the chance
+        # that some other incoming request will try to create a
+        # duplicate Representation and crash.
+        self._db.commit()
 
         return self.lookup_info_to_metadata(representation)
 
@@ -294,21 +301,6 @@ class NoveListAPI(object):
         for name, value in params.items():
             urlencoded_params[name] = urllib.quote(value)
         return url % urlencoded_params
-
-    def cached_representation(self, scrubbed_url):
-        """Attempts to find a usable cached Representation for a given URL"""
-        representation = get_one(
-            self._db, Representation, 'interchangeable', url=scrubbed_url
-        )
-
-        if not representation:
-            return None
-        if not representation.is_fresher_than(self.MAX_REPRESENTATION_AGE):
-            # The Representation is nonexistent or stale. Delete it, so it
-            # can be replaced.
-            self._db.delete(representation)
-            return None
-        return representation
 
     def lookup_info_to_metadata(self, lookup_representation):
         """Transforms a NoveList JSON representation into a Metadata object"""
@@ -378,6 +370,8 @@ class NoveListAPI(object):
         )
         metadata.subtitle = self._scrub_subtitle(subtitle)
 
+        # TODO: How well do we trust this data? We could conceivably bump up
+        # the weight here.
         if appeals_info:
             extracted_genres = False
             for appeal in appeals_info:
@@ -685,43 +679,3 @@ class MockNoveListAPI(NoveListAPI):
         response = self.responses[0]
         self.responses = self.responses[1:]
         return response
-
-
-class NoveListCoverageProvider(IdentifierCoverageProvider):
-
-    SERVICE_NAME = "NoveList CoverageProvider"
-    DATA_SOURCE_NAME = DataSource.NOVELIST
-    DEFAULT_BATCH_SIZE = 25
-    INPUT_IDENTIFIER_TYPES = [Identifier.ISBN]
-
-    def process_item(self, identifier):
-        metadata = self.api.lookup(identifier)
-        if not metadata:
-            # Either NoveList didn't recognize the identifier or
-            # no interesting data came of this. Consider it covered.
-            return identifier
-
-        # Set identifier equivalent to its NoveList ID.
-        identifier.equivalent_to(
-            self.data_source, metadata.primary_identifier,
-            strength=1
-        )
-        # Create an edition with the NoveList metadata & NoveList identifier.
-        # This will capture equivalent ISBNs and less appealing metadata in
-        # its unfettered state on the NoveList identifier alone.
-        edition, ignore = metadata.edition(self._db)
-        metadata.apply(edition, collection=None)
-
-        if edition.series or edition.series_position:
-            metadata.primary_identifier = identifier
-            # Series data from NoveList is appealing, but we need to avoid
-            # creating any potentially-inaccurate ISBN equivalencies on the
-            # license source identifier.
-            #
-            # So just remove the identifiers from the metadata object entirely.
-            metadata.identifiers = []
-            # Before creating an edition for the original identifier.
-            novelist_edition, ignore = metadata.edition(self._db)
-            metadata.apply(novelist_edition, collection=None)
-
-        return identifier

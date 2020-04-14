@@ -19,11 +19,13 @@ from core.model import (
     Credential,
     DataSource,
     DeliveryMechanism,
+    Edition,
     ExternalIntegration,
     Hold,
     Hyperlink,
     Identifier,
     Loan,
+    MediaTypes,
     Representation,
     RightsStatus,
     get_one,
@@ -477,7 +479,8 @@ class TestODLAPI(DatabaseTest, BaseODLTest):
 
         eq_(0, self._db.query(Loan).count())
 
-    def test_fulfill_success(self):
+    def test_fulfill_success_license(self):
+        # Fulfill a loan in a way that gives access to a license file.
         loan, ignore = self.license.loan_to(self.patron)
         loan.external_identifier = self._str
         loan.end = datetime.datetime.utcnow() + datetime.timedelta(days=3)
@@ -489,7 +492,7 @@ class TestODLAPI(DatabaseTest, BaseODLTest):
             },
             "links": [{
                 "rel": "license",
-                "href": "http://license",
+                "href": "http://acsm",
                 "type": DeliveryMechanism.ADOBE_DRM,
             }],
         })
@@ -501,8 +504,40 @@ class TestODLAPI(DatabaseTest, BaseODLTest):
         eq_(self.pool.identifier.type, fulfillment.identifier_type)
         eq_(self.pool.identifier.identifier, fulfillment.identifier)
         eq_(datetime.datetime(2017, 10, 21, 11, 12, 13), fulfillment.content_expires)
-        eq_("http://license", fulfillment.content_link)
+        eq_("http://acsm", fulfillment.content_link)
         eq_(DeliveryMechanism.ADOBE_DRM, fulfillment.content_type)
+
+    def test_fulfill_success_manifest(self):
+        # Fulfill a loan in a way that gives access to a manifest
+        # file.
+        loan, ignore = self.license.loan_to(self.patron)
+        loan.external_identifier = self._str
+        loan.end = datetime.datetime.utcnow() + datetime.timedelta(days=3)
+
+        audiobook = MediaTypes.AUDIOBOOK_MANIFEST_MEDIA_TYPE
+
+        lsd = json.dumps({
+            "status": "ready",
+            "potential_rights": {
+                "end": "2017-10-21T11:12:13Z"
+            },
+            "links": [{
+                "rel": "manifest",
+                "href": "http://manifest",
+                "type": audiobook,
+            }],
+        })
+
+        self.api.queue_response(200, content=lsd)
+        fulfillment = self.api.fulfill(self.patron, "pin", self.pool, audiobook)
+        eq_(self.collection, fulfillment.collection(self._db))
+        eq_(self.pool.data_source.name, fulfillment.data_source_name)
+        eq_(self.pool.identifier.type, fulfillment.identifier_type)
+        eq_(self.pool.identifier.identifier, fulfillment.identifier)
+        eq_(datetime.datetime(2017, 10, 21, 11, 12, 13), fulfillment.content_expires)
+        eq_("http://manifest", fulfillment.content_link)
+        eq_(audiobook, fulfillment.content_type)
+
 
     def test_fulfill_cannot_fulfill(self):
         self.pool.licenses_owned = 7
@@ -1177,7 +1212,7 @@ class TestODLAPI(DatabaseTest, BaseODLTest):
             },
             "links": [{
                 "rel": "license",
-                "href": "http://license",
+                "href": "http://acsm",
                 "type": DeliveryMechanism.ADOBE_DRM,
             }],
         })
@@ -1189,7 +1224,7 @@ class TestODLAPI(DatabaseTest, BaseODLTest):
         eq_(self.pool.identifier.type, fulfillment.identifier_type)
         eq_(self.pool.identifier.identifier, fulfillment.identifier)
         eq_(datetime.datetime(2017, 10, 21, 11, 12, 13), fulfillment.content_expires)
-        eq_("http://license", fulfillment.content_link)
+        eq_("http://acsm", fulfillment.content_link)
         eq_(DeliveryMechanism.ADOBE_DRM, fulfillment.content_type)
 
     def test_release_hold_from_external_library(self):
@@ -1244,10 +1279,13 @@ class TestODLImporter(DatabaseTest, BaseODLTest):
         canadianity_perpetual = dict(checkouts=dict(available=1))
         midnight_loan_limited_1 = dict(checkouts=dict(left=20, available=1))
         midnight_loan_limited_2 = dict(checkouts=dict(left=52, available=1))
+        everglades_loan = dict(checkouts=dict(left=10, available=5))
+        poetry_loan = dict(checkouts=dict(left=10, available=5))
         mock_responses = [json.dumps(r) for r in [
             warrior_time_limited, canadianity_loan_limited, canadianity_perpetual,
-            midnight_loan_limited_1, midnight_loan_limited_2,
+            midnight_loan_limited_1, midnight_loan_limited_2, everglades_loan, poetry_loan
         ]]
+
         def do_get(url, headers):
             return 200, {}, mock_responses.pop(0)
 
@@ -1266,28 +1304,33 @@ class TestODLImporter(DatabaseTest, BaseODLTest):
         # it extracts format information from 'odl:license' tags and creates
         # LicensePoolDeliveryMechanisms.
 
-        # The importer created 4 editions, pools, and works.
-        eq_(4, len(imported_editions))
-        eq_(4, len(imported_pools))
-        eq_(4, len(imported_works))
 
-        [canadianity, warrior, blazing, midnight] = sorted(imported_editions, key=lambda x: x.title)
+        # The importer created 6 editions, pools, and works.
+        eq_({}, failures)
+        eq_(6, len(imported_editions))
+        eq_(6, len(imported_pools))
+        eq_(6, len(imported_works))
+
+        [canadianity, everglades, dragons, warrior, blazing, midnight,] = sorted(imported_editions, key=lambda x: x.title)
         eq_("The Blazing World", blazing.title)
         eq_("Sun Warrior", warrior.title)
         eq_("Canadianity", canadianity.title)
         eq_("The Midnight Dance", midnight.title)
+        eq_("Everglades Wildguide", everglades.title)
+        eq_("Rise of the Dragons, Book 1", dragons.title)
 
-        # This book is open access and has no 'odl:license' tag.
+        # This book is open access and has no applicable DRM
         [blazing_pool] = [p for p in imported_pools if p.identifier == blazing.primary_identifier]
         eq_(True, blazing_pool.open_access)
         [lpdm] = blazing_pool.delivery_mechanisms
         eq_(Representation.EPUB_MEDIA_TYPE, lpdm.delivery_mechanism.content_type)
         eq_(DeliveryMechanism.NO_DRM, lpdm.delivery_mechanism.drm_scheme)
 
-        # This book has a single 'odl:license' tag.
+        # # This book has a single 'odl:license' tag.
         [warrior_pool] = [p for p in imported_pools if p.identifier == warrior.primary_identifier]
         eq_(False, warrior_pool.open_access)
         [lpdm] = warrior_pool.delivery_mechanisms
+        eq_(Edition.BOOK_MEDIUM, warrior_pool.presentation_edition.medium)
         eq_(Representation.EPUB_MEDIA_TYPE, lpdm.delivery_mechanism.content_type)
         eq_(DeliveryMechanism.ADOBE_DRM, lpdm.delivery_mechanism.drm_scheme)
         eq_(RightsStatus.IN_COPYRIGHT, lpdm.rights_status.uri)
@@ -1302,6 +1345,29 @@ class TestODLImporter(DatabaseTest, BaseODLTest):
         eq_(datetime.datetime(2019, 3, 31, 03, 13, 35), license.expires)
         eq_(None, license.remaining_checkouts)
         eq_(1, license.concurrent_checkouts)
+
+        # This item is an open access audiobook.
+        [everglades_pool] = [p for p in imported_pools if p.identifier == everglades.primary_identifier]
+        eq_(True, everglades_pool.open_access)
+        [lpdm] = everglades_pool.delivery_mechanisms
+        eq_(Edition.AUDIO_MEDIUM, everglades_pool.presentation_edition.medium)
+
+        eq_(Representation.AUDIOBOOK_MANIFEST_MEDIA_TYPE, lpdm.delivery_mechanism.content_type)
+        eq_(DeliveryMechanism.NO_DRM, lpdm.delivery_mechanism.drm_scheme)
+
+        # This is a non-open access audiobook. There is no
+        # <odl:protection> tag; the drm_scheme is implied by the value
+        # of <dcterms:format>.
+        [dragons_pool] = [
+            p for p in imported_pools
+            if p.identifier == dragons.primary_identifier
+        ]
+        eq_(Edition.AUDIO_MEDIUM, dragons_pool.presentation_edition.medium)
+        eq_(False, dragons_pool.open_access)
+        [lpdm] = dragons_pool.delivery_mechanisms
+
+        eq_(Representation.AUDIOBOOK_MANIFEST_MEDIA_TYPE, lpdm.delivery_mechanism.content_type)
+        eq_(DeliveryMechanism.FEEDBOOKS_AUDIOBOOK_DRM, lpdm.delivery_mechanism.drm_scheme)
 
         # This book has two 'odl:license' tags for the same format and drm scheme
         # (this happens if the library purchases two copies).

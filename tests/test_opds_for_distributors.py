@@ -16,7 +16,11 @@ from api.opds_for_distributors import (
 )
 from api.circulation_exceptions import *
 from . import DatabaseTest
-from core.metadata_layer import TimestampData
+from core.metadata_layer import (
+    CirculationData,
+    LinkData,
+    TimestampData,
+)
 from core.model import (
     Collection,
     Credential,
@@ -26,6 +30,7 @@ from core.model import (
     Hyperlink,
     Identifier,
     Loan,
+    MediaTypes,
     Representation,
     RightsStatus,
 )
@@ -70,6 +75,20 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
         eq_("Negotiate a fulfillment token", result.name)
         eq_(True, result.success)
         eq_("a token", result.result)
+
+    def test_supported_media_types(self):
+        # If the default client supports media type X with the
+        # BEARER_TOKEN access control scheme, then X is a supported
+        # media type for an OPDS For Distributors collection.
+        supported = self.api.SUPPORTED_MEDIA_TYPES
+        for (format, drm) in DeliveryMechanism.default_client_can_fulfill_lookup:
+            if drm == (DeliveryMechanism.BEARER_TOKEN) and format is not None:
+                assert format in supported
+
+        # Here's a media type that sometimes shows up in OPDS For
+        # Distributors collections but is _not_ supported. Incoming
+        # items with this media type will _not_ be imported.
+        assert MediaTypes.JPEG_MEDIA_TYPE not in supported
 
     def test_can_fulfill_without_loan(self):
         """A book made available through OPDS For Distributors can be
@@ -435,6 +454,47 @@ class TestOPDSForDistributorsImporter(DatabaseTest, BaseOPDSForDistributorsTest)
         eq_("https://library.biblioboard.com/ext/api/media/04da95cd-6cfc-4e82-810f-121d418b6963/assets/content.epub",
             southern_acquisition_url)
 
+    def test__add_format_data(self):
+
+        # Mock SUPPORTED_MEDIA_TYPES for purposes of test.
+        api = OPDSForDistributorsAPI
+        old_value = api.SUPPORTED_MEDIA_TYPES
+        good_media_type = "media/type"
+        api.SUPPORTED_MEDIA_TYPES = [good_media_type]
+
+        # Create a CirculationData object with a number of links.
+        # Only the third of these links will become a FormatData
+        # object.
+        circulation = CirculationData("data source", "identifier")
+        good_rel = Hyperlink.GENERIC_OPDS_ACQUISITION
+        for rel, media, href in (
+            ("http://wrong/rel/", good_media_type, "http://url1/"),
+            (good_rel, "wrong/media type", "http://url2/"),
+            (good_rel, good_media_type, "http://url3/"),
+        ):
+            link = LinkData(rel=rel, href=href, media_type=media)
+            circulation.links.append(link)
+
+        eq_([], circulation.formats)
+        OPDSForDistributorsImporter._add_format_data(circulation)
+
+        # Only one FormatData was created.
+        [format] = circulation.formats
+
+        # It's the third link we created -- the one where both rel and
+        # media_type were good.
+        eq_("http://url3/", format.link.href)
+        eq_(good_rel, format.link.rel)
+
+        # The FormatData has the content type provided by the LinkData,
+        # and the implicit Bearer Token access control scheme defined
+        # by OPDS For Distrubutors.
+        eq_(good_media_type, format.content_type)
+        eq_(DeliveryMechanism.BEARER_TOKEN, format.drm_scheme)
+
+        # Undo the mock of SUPPORTED_MEDIA_TYPES.
+        api.SUPPORTED_MEDIA_TYPES = old_value
+
 
 class TestOPDSForDistributorsReaperMonitor(DatabaseTest, BaseOPDSForDistributorsTest):
 
@@ -460,19 +520,34 @@ class TestOPDSForDistributorsReaperMonitor(DatabaseTest, BaseOPDSForDistributors
         )
 
         # There's a license pool in the database that isn't in the feed anymore.
-        edition, pool = self._edition(
+        edition, now_gone = self._edition(
             identifier_type=Identifier.URI,
             data_source_name=data_source.name,
             with_license_pool=True,
             collection=collection,
         )
-        pool.licenses_owned = 1
-        pool.licenses_available = 1
+        now_gone.licenses_owned = 1
+        now_gone.licenses_available = 1
+
+        edition, still_there = self._edition(
+            identifier_type=Identifier.URI,
+            identifier_id="urn:uuid:04377e87-ab69-41c8-a2a4-812d55dc0952",
+            data_source_name=data_source.name,
+            with_license_pool=True,
+            collection=collection,
+        )
+        still_there.licenses_owned = 1
+        still_there.licenses_available = 1
 
         progress = monitor.run_once(monitor.timestamp().to_data())
 
-        eq_(0, pool.licenses_owned)
-        eq_(0, pool.licenses_available)
+        # One LicensePool has been cleared out.
+        eq_(0, now_gone.licenses_owned)
+        eq_(0, now_gone.licenses_available)
+
+        # The other is still around.
+        eq_(1, still_there.licenses_owned)
+        eq_(1, still_there.licenses_available)
 
         # The TimestampData returned by run_once() describes its
         # achievements.

@@ -21,6 +21,7 @@ from core.opds import (
     AcquisitionFeed,
     UnfulfillableWork,
 )
+from core.util.flask_util import OPDSFeedResponse
 from core.util.opds_writer import (
     OPDSFeed,
 )
@@ -31,9 +32,11 @@ from core.model import (
     CustomList,
     DataSource,
     DeliveryMechanism,
+    Hold,
     Identifier,
     LicensePool,
     LicensePoolDeliveryMechanism,
+    Loan,
     Patron,
     Session,
     Work,
@@ -53,7 +56,10 @@ from core.app_server import cdn_url_for
 from adobe_vendor_id import AuthdataUtility
 from annotations import AnnotationWriter
 from circulation import BaseCirculationAPI
-from config import Configuration
+from config import (
+    CannotLoadConfiguration,
+    Configuration,
+)
 from novelist import NoveListAPI
 from core.analytics import Analytics
 
@@ -401,7 +407,6 @@ class CirculationManagerAnnotator(Annotator):
                 kw['type'] = rep.media_type
             href = rep.public_url
         kw['href'] = cdnify(href)
-
         link_tag = AcquisitionFeed.link(**kw)
         link_tag.attrib.update(self.rights_attributes(lpdm))
         always_available = OPDSFeed.makeelement(
@@ -420,6 +425,42 @@ class CirculationManagerAnnotator(Annotator):
             return {}
         rights_attr = "{%s}rights" % OPDSFeed.DCTERMS_NS
         return {rights_attr : lpdm.rights_status.uri }
+
+    @classmethod
+    def _single_entry_response(
+        cls, _db, work, annotator, url, feed_class=AcquisitionFeed, **response_kwargs
+    ):
+        """Helper method to create an OPDSEntryResponse for a single OPDS entry.
+
+        :param _db: A database connection.
+        :param work: A Work
+        :param annotator: An Annotator
+        :param url: The URL of the feed to be served. Used only if there's
+            a problem with the Work.
+        :param feed_class: A replacement for AcquisitionFeed, for use in tests.
+        :param response_kwargs: A set of extra keyword arguments to
+            be passed into the OPDSEntryResponse constructor.
+
+        :return: An OPDSEntryResponse if everything goes well; otherwise an OPDSFeedResponse
+            containing an error message.
+        """
+        if not work:
+            return feed_class(
+                _db, title="Unknown work", url=url, works=[],
+                annotator=annotator
+            ).as_error_response()
+
+        # This method is generally used for reporting the results of
+        # authenticated transactions such as borrowing and hold
+        # placement.
+        #
+        # This means the document contains up-to-date information
+        # specific to the authenticated client. The client should
+        # cache this document for a while, but no one else should
+        # cache it.
+        response_kwargs.setdefault('max_age', 30*60)
+        response_kwargs.setdefault('private', True)
+        return feed_class.single_entry(_db, work, annotator, **response_kwargs)
 
 
 class LibraryAnnotator(CirculationManagerAnnotator):
@@ -717,7 +758,12 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             audiences = [Classifier.AUDIENCE_CHILDREN]
         elif work.audience == Classifier.AUDIENCE_YOUNG_ADULT:
             audiences = Classifier.AUDIENCES_JUVENILE
+        elif work.audience == Classifier.AUDIENCE_ALL_AGES:
+            audiences = [Classifier.AUDIENCE_CHILDREN,
+                Classifier.AUDIENCE_ALL_AGES]
         elif work.audience in Classifier.AUDIENCES_ADULT:
+            audiences = list(Classifier.AUDIENCES_NO_RESEARCH)
+        elif work.audience == Classifier.AUDIENCE_RESEARCH:
             audiences = list(Classifier.AUDIENCES)
         else:
             audiences = []
@@ -1064,6 +1110,7 @@ class LibraryAnnotator(CirculationManagerAnnotator):
             library_short_name=self.library.short_name,
             _external=True
         )
+
         link_tag = AcquisitionFeed.acquisition_link(
             rel=rel, href=fulfill_url,
             types=format_types
@@ -1131,7 +1178,12 @@ class LibraryAnnotator(CirculationManagerAnnotator):
         cached = self._adobe_id_tags.get(cache_key)
         if cached is None:
             cached = []
-            authdata = AuthdataUtility.from_config(self.library)
+            authdata = None
+            try:
+                authdata = AuthdataUtility.from_config(self.library)
+            except CannotLoadConfiguration as e:
+                logging.error("Cannot load Short Client Token configuration; outgoing OPDS entries will not have DRM autodiscovery support", exc_info=e)
+                return []
             if authdata:
                 vendor_id, token = authdata.short_client_token_for_patron(patron_identifier)
                 drm_licensor = OPDSFeed.makeelement("{%s}licensor" % OPDSFeed.DRM_NS)
@@ -1346,7 +1398,9 @@ class SharedCollectionAnnotator(CirculationManagerAnnotator):
 class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
 
     @classmethod
-    def active_loans_for(cls, circulation, patron, test_mode=False):
+    def active_loans_for(
+            cls, circulation, patron, test_mode=False, **response_kwargs
+    ):
         db = Session.object_session(patron)
         active_loans_by_work = {}
         for loan in patron.loans:
@@ -1368,60 +1422,60 @@ class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
 
         feed_obj = AcquisitionFeed(db, "Active loans and holds", url, works, annotator)
         annotator.annotate_feed(feed_obj, None)
-        return feed_obj
+        return feed_obj.as_response(max_age=60*30, private=True)
 
     @classmethod
-    def single_loan_feed(cls, circulation, loan, test_mode=False):
-        db = Session.object_session(loan)
-        work = loan.license_pool.work or loan.license_pool.presentation_edition.work
-        annotator = cls(circulation, None, loan.library,
-                        active_loans_by_work={work:loan},
-                        active_holds_by_work={},
-                        test_mode=test_mode)
-        identifier = loan.license_pool.identifier
+    def single_item_feed(cls, circulation, item, fulfillment=None, test_mode=False,
+                         feed_class=AcquisitionFeed, **response_kwargs):
+        """Construct a response containing a single OPDS entry representing an active loan
+        or hold.
+
+        :param circulation: A CirculationAPI
+        :param item: A Loan or Hold -- perhaps one that was just created or looked up.
+        :param fulfillment: A FulfillmentInfo representing the format in which an active loan
+            should be fulfilled.
+        :param test_mode: Passed along to the constructor for this annotator class.
+        :param feed_class: A drop-in replacement for AcquisitionFeed, for use in tests.
+        :param response_kwargs: Extra keyword arguments to be passed into the OPDSEntryResponse
+            constructor.
+
+        :return: An OPDSEntryResponse
+        """
+        _db = Session.object_session(item)
+        license_pool = item.license_pool
+        work = license_pool.work or license_pool.presentation_edition.work
+        library = item.library
+
+        active_loans_by_work = {}
+        active_holds_by_work = {}
+        active_fulfillments_by_work = {}
+        if isinstance(item, Loan):
+            d = active_loans_by_work
+        elif isinstance(item, Hold):
+            d = active_holds_by_work
+        d[work] = item
+
+        if fulfillment:
+            active_fulfillments_by_work[work] = fulfillment
+
+        annotator = cls(
+            circulation, None, library,
+            active_loans_by_work=active_loans_by_work,
+            active_holds_by_work=active_holds_by_work,
+            active_fulfillments_by_work=active_fulfillments_by_work,
+            test_mode=test_mode
+        )
+        identifier = license_pool.identifier
         url = annotator.url_for(
             'loan_or_hold_detail',
             identifier_type=identifier.type,
             identifier=identifier.identifier,
-            library_short_name=loan.library.short_name,
+            library_short_name=library.short_name,
             _external=True
         )
-        if not work:
-            return AcquisitionFeed(
-                db, "Active loan for unknown work", url, [], annotator)
-        return AcquisitionFeed.single_entry(db, work, annotator)
-
-    @classmethod
-    def single_hold_feed(cls, circulation, hold, test_mode=False):
-        db = Session.object_session(hold)
-        work = hold.license_pool.work or hold.license_pool.presentation_edition.work
-        annotator = cls(circulation, None, hold.library,
-                        active_loans_by_work={},
-                        active_holds_by_work={work:hold},
-                        test_mode=test_mode)
-        return AcquisitionFeed.single_entry(db, work, annotator)
-
-    @classmethod
-    def single_fulfillment_feed(cls, circulation, loan, fulfillment, test_mode=False):
-        db = Session.object_session(loan)
-        work = loan.license_pool.work or loan.license_pool.presentation_edition.work
-        annotator = cls(circulation, None, loan.library,
-                        active_loans_by_work={},
-                        active_holds_by_work={},
-                        active_fulfillments_by_work={work:fulfillment},
-                        test_mode=test_mode)
-        identifier = loan.license_pool.identifier
-        url = annotator.url_for(
-            'loan_or_hold_detail',
-            identifier_type=identifier.type,
-            identifier=identifier.identifier,
-            library_short_name=loan.library.short_name,
-            _external=True
+        return annotator._single_entry_response(
+            _db, work, annotator, url, feed_class, **response_kwargs
         )
-        if not work:
-            return AcquisitionFeed(
-                db, "Active loan for unknown work", url, [], annotator)
-        return AcquisitionFeed.single_entry(db, work, annotator)
 
     def drm_device_registration_feed_tags(self, patron):
         """Return tags that provide information on DRM device deregistration
@@ -1466,51 +1520,49 @@ class LibraryLoanAndHoldAnnotator(LibraryAnnotator):
 class SharedCollectionLoanAndHoldAnnotator(SharedCollectionAnnotator):
 
     @classmethod
-    def single_loan_feed(cls, collection, loan, test_mode=False):
-        db = Session.object_session(loan)
-        work = loan.license_pool.work or loan.license_pool.presentation_edition.work
-        annotator = cls(collection, None,
-                        active_loans_by_work={work:loan},
-                        active_holds_by_work={},
-                        test_mode=test_mode)
-        identifier = loan.license_pool.identifier
-        url = annotator.url_for(
-            'shared_collection_loan_info',
-            collection_name=collection.name,
-            loan_id=loan.id,
-            _external=True
-        )
-        if not work:
-            return AcquisitionFeed(
-                db, "Active loan for unknown work", url, [], annotator)
-        return AcquisitionFeed.single_entry(db, work, annotator)
+    def single_item_feed(cls, collection, item, fulfillment=None, test_mode=False,
+                         feed_class=AcquisitionFeed, **response_kwargs):
+        """Create an OPDS entry representing a single loan or hold.
 
-    @classmethod
-    def single_hold_feed(cls, collection, hold, test_mode=False):
-        db = Session.object_session(hold)
-        work = hold.license_pool.work or hold.license_pool.presentation_edition.work
-        annotator = cls(collection, None,
-                        active_loans_by_work={},
-                        active_holds_by_work={work:hold},
-                        test_mode=test_mode)
-        return AcquisitionFeed.single_entry(db, work, annotator)
+        TODO: This and LibraryLoanAndHoldAnnotator.single_item_feed
+        can potentially be refactored. The main obstacle is different
+        routes and arguments for 'loan info' and 'hold info'.
 
-    @classmethod
-    def single_fulfillment_feed(cls, collection, loan, fulfillment, test_mode=False):
-        db = Session.object_session(loan)
-        work = loan.license_pool.work or loan.license_pool.presentation_edition.work
-        annotator = cls(collection, None, loan.library,
-                        active_loans_by_work={},
-                        active_holds_by_work={},
-                        active_fulfillments_by_work={work:fulfillment},
-                        test_mode=test_mode)
-        url = annotator.url_for(
-            'shared_collection_loan_info',
-            collection_name=collection.name,
-            loan_id=loan.id,
-            _external=True
+        :return: An OPDSEntryResponse
+
+        """
+        _db = Session.object_session(item)
+        license_pool = item.license_pool
+        work = license_pool.work or license_pool.presentation_edition.work
+        identifier = license_pool.identifier
+
+        active_loans_by_work = {}
+        active_holds_by_work = {}
+        active_fulfillments_by_work = {}
+        if fulfillment:
+            active_fulfillments_by_work[work] = fulfillment
+        if isinstance(item, Loan):
+            d = active_loans_by_work
+            route = 'shared_collection_loan_info'
+            route_kwargs = dict(loan_id=item.id)
+        elif isinstance(item, Hold):
+            d = active_holds_by_work
+            route = 'shared_collection_hold_info'
+            route_kwargs = dict(hold_id=item.id)
+        d[work] = item
+        annotator = cls(
+            collection, None,
+            active_loans_by_work=active_loans_by_work,
+            active_holds_by_work=active_holds_by_work,
+            active_fulfillments_by_work=active_fulfillments_by_work,
+            test_mode=test_mode
         )
-        if not work:
-            return AcquisitionFeed(
-                db, "Active loan for unknown work", url, [], annotator)
-        return AcquisitionFeed.single_entry(db, work, annotator)
+        url = annotator.url_for(
+            route,
+            collection_name=collection.name,
+            _external=True,
+            **route_kwargs
+        )
+        return annotator._single_entry_response(
+            _db, work, annotator, url, feed_class, **response_kwargs
+        )

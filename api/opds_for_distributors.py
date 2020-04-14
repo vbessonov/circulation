@@ -60,10 +60,23 @@ class OPDSForDistributorsAPI(BaseCirculationAPI, HasSelfTests):
         }
     ]
 
-    SUPPORTED_MEDIA_TYPES = [Representation.EPUB_MEDIA_TYPE]
+    # In OPDS For Distributors, all items are gated through the
+    # BEARER_TOKEN access control scheme.
+    #
+    # If the default client supports a given media type when
+    # combined with the BEARER_TOKEN scheme, then we should import
+    # titles with that media type...
+    SUPPORTED_MEDIA_TYPES = [
+        format for (format, drm) in
+        DeliveryMechanism.default_client_can_fulfill_lookup
+        if drm == (DeliveryMechanism.BEARER_TOKEN) and format is not None
+    ]
 
+    # ...and we should map requests for delivery of that media type to
+    # the (type, BEARER_TOKEN) DeliveryMechanism.
     delivery_mechanism_to_internal_format = {
-        (type, DeliveryMechanism.BEARER_TOKEN): type for type in SUPPORTED_MEDIA_TYPES
+        (type, DeliveryMechanism.BEARER_TOKEN): type
+        for type in SUPPORTED_MEDIA_TYPES
     }
 
     def __init__(self, _db, collection):
@@ -283,7 +296,9 @@ class OPDSForDistributorsImporter(OPDSImporter):
     @classmethod
     def _add_format_data(cls, circulation):
         for link in circulation.links:
-            if link.rel == Hyperlink.GENERIC_OPDS_ACQUISITION and link.media_type in OPDSForDistributorsAPI.SUPPORTED_MEDIA_TYPES:
+            if (link.rel == Hyperlink.GENERIC_OPDS_ACQUISITION
+                and link.media_type in
+                OPDSForDistributorsAPI.SUPPORTED_MEDIA_TYPES):
                 circulation.formats.append(
                     FormatData(
                         content_type=link.media_type,
@@ -347,6 +362,13 @@ class OPDSForDistributorsReaperMonitor(OPDSForDistributorsImportMonitor):
         """
         super(OPDSForDistributorsReaperMonitor, self).run_once(progress)
 
+        # self.seen_identifiers is full of URNs. We need the values
+        # that go in Identifier.identifier.
+        identifiers, failures = Identifier.parse_urns(
+            self._db, self.seen_identifiers
+        )
+        identifier_ids = [x.id for x in identifiers.values()]
+
         # At this point we've gone through the feed and collected all the identifiers.
         # If there's anything we didn't see, we know it's no longer available.
         qu = self._db.query(
@@ -356,11 +378,10 @@ class OPDSForDistributorsReaperMonitor(OPDSForDistributorsImportMonitor):
         ).filter(
             LicensePool.collection_id==self.collection.id
         ).filter(
-            ~Identifier.identifier.in_(self.seen_identifiers)
+            ~Identifier.id.in_(identifier_ids)
         ).filter(
             LicensePool.licenses_available > 0
         )
-
         pools_reaped = qu.count()
         self.log.info(
             "Reaping %s license pools for collection %s." % (pools_reaped, self.collection.name)

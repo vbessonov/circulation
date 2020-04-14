@@ -18,6 +18,7 @@ from app import app, babel
 from config import Configuration
 from core.app_server import (
     ErrorHandler,
+    compressible,
     returns_problem_detail,
 )
 from core.model import ConfigurationSetting
@@ -71,6 +72,21 @@ def requires_auth(f):
             return patron
         else:
             return f(*args, **kwargs)
+    return decorated
+
+def allows_auth(f):
+    """Decorator function for a controller method that supports both
+    authenticated and unauthenticated requests.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Try to authenticate a patron. This will set flask.request.patron
+        # if and only if there is an authenticated patron.
+        app.manager.index_controller.authenticated_patron_from_request()
+
+        # Call the decorated function regardless of whether
+        # authentication succeeds.
+        return f(*args, **kwargs)
     return decorated
 
 # The allows_patron_web decorator will add Cross-Origin Resource Sharing
@@ -130,6 +146,23 @@ def has_library(f):
             return f(*args, **kwargs)
     return decorated
 
+def allows_library(f):
+    """Decorator similar to @has_library but if there is no library short name,
+    then don't set the request library.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'library_short_name' in kwargs:
+            library_short_name = kwargs.pop("library_short_name")
+            library = app.manager.index_controller.library_for_request(library_short_name)
+            if isinstance(library, ProblemDetail):
+                return library.response
+        else:
+            library = None
+
+        return f(*args, **kwargs)
+    return decorated
+
 def library_route(path, *args, **kwargs):
     """Decorator to creates routes that have a library short name in either
     a subdomain or a url path prefix. If not used with @has_library, the view function
@@ -176,17 +209,20 @@ def library_dir_route(path, *args, **kwargs):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def index():
     return app.manager.index_controller()
 
 @library_route('/authentication_document')
 @has_library
 @returns_problem_detail
+@compressible
 def authentication_document():
     return app.manager.index_controller.authentication_document()
 
 @library_route('/public_key_document')
 @returns_problem_detail
+@compressible
 def public_key_document():
     return app.manager.index_controller.public_key_document()
 
@@ -195,6 +231,7 @@ def public_key_document():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def acquisition_groups(lane_identifier):
     return app.manager.opds_feeds.groups(lane_identifier)
 
@@ -203,6 +240,7 @@ def acquisition_groups(lane_identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def feed(lane_identifier):
     return app.manager.opds_feeds.feed(lane_identifier)
 
@@ -211,6 +249,7 @@ def feed(lane_identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def navigation_feed(lane_identifier):
     return app.manager.opds_feeds.navigation(lane_identifier)
 
@@ -218,6 +257,7 @@ def navigation_feed(lane_identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def crawlable_library_feed():
     return app.manager.opds_feeds.crawlable_library_feed()
 
@@ -225,12 +265,14 @@ def crawlable_library_feed():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def crawlable_list_feed(list_name):
     return app.manager.opds_feeds.crawlable_list_feed(list_name)
 
 @app.route('/collections/<collection_name>/crawlable')
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def crawlable_collection_feed(collection_name):
     return app.manager.opds_feeds.crawlable_collection_feed(collection_name)
 
@@ -281,6 +323,7 @@ def shared_collection_revoke_hold(collection_name, hold_id):
 @library_route('/marc')
 @has_library
 @returns_problem_detail
+@compressible
 def marc_page():
     return app.manager.marc_records.download_page()
 
@@ -289,6 +332,7 @@ def marc_page():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def lane_search(lane_identifier):
     return app.manager.opds_feeds.search(lane_identifier)
 
@@ -305,6 +349,7 @@ def patron_profile():
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def active_loans():
     return app.manager.loans.sync()
 
@@ -313,6 +358,7 @@ def active_loans():
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def annotations():
     return app.manager.annotations.container()
 
@@ -321,6 +367,7 @@ def annotations():
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def annotation_detail(annotation_id):
     return app.manager.annotations.detail(annotation_id)
 
@@ -329,6 +376,7 @@ def annotation_detail(annotation_id):
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def annotations_for_work(identifier_type, identifier):
     return app.manager.annotations.container_for_work(identifier_type, identifier)
 
@@ -371,6 +419,7 @@ def loan_or_hold_detail(identifier_type, identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def work():
     return app.manager.urn_lookup.work_lookup('work')
 
@@ -380,6 +429,7 @@ def work():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def contributor(contributor_name, languages, audiences):
     return app.manager.work_controller.contributor(contributor_name, languages, audiences)
 
@@ -389,6 +439,7 @@ def contributor(contributor_name, languages, audiences):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def series(series_name, languages, audiences):
     return app.manager.work_controller.series(series_name, languages, audiences)
 
@@ -396,6 +447,7 @@ def series(series_name, languages, audiences):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def permalink(identifier_type, identifier):
     return app.manager.work_controller.permalink(identifier_type, identifier)
 
@@ -403,6 +455,7 @@ def permalink(identifier_type, identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def recommendations(identifier_type, identifier):
     return app.manager.work_controller.recommendations(identifier_type, identifier)
 
@@ -410,6 +463,7 @@ def recommendations(identifier_type, identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def related_books(identifier_type, identifier):
     return app.manager.work_controller.related(identifier_type, identifier)
 
@@ -422,6 +476,7 @@ def report(identifier_type, identifier):
 
 @library_route('/analytics/<identifier_type>/<path:identifier>/<event_type>')
 @has_library
+@allows_auth
 @allows_patron_web
 @returns_problem_detail
 def track_analytics_event(identifier_type, identifier, event_type):

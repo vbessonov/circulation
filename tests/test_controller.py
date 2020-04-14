@@ -15,13 +15,13 @@ from decimal import Decimal
 import flask
 from flask import (
     url_for,
-    Response,
+    Response as FlaskResponse,
 )
 from flask_sqlalchemy_session import (
     current_session,
     flask_scoped_session,
 )
-from werkzeug import ImmutableMultiDict
+from werkzeug.datastructures import ImmutableMultiDict
 from werkzeug.exceptions import NotFound
 
 from . import DatabaseTest
@@ -49,11 +49,11 @@ from api.lanes import (
     SeriesLane,
 )
 from api.authenticator import (
-    BasicAuthenticationProvider,
     CirculationPatronProfileStorage,
     OAuthController,
     LibraryAuthenticator,
 )
+from api.simple_authentication import SimpleAuthenticationProvider
 from core.app_server import (
     cdn_url_for,
     load_lending_policy,
@@ -79,6 +79,7 @@ from core.entrypoint import (
     EverythingEntryPoint,
     AudiobooksEntryPoint,
 )
+from core.local_analytics_provider import LocalAnalyticsProvider
 from core.model import (
     Annotation,
     CachedMARCFile,
@@ -101,6 +102,7 @@ from core.model import (
     CachedFeed,
     Work,
     CirculationEvent,
+    LinkRelations,
     LicensePoolDeliveryMechanism,
     PresentationCalculationPolicy,
     RightsStatus,
@@ -124,6 +126,7 @@ from core.user_profile import (
     ProfileController,
     ProfileStorage,
 )
+from core.util.flask_util import Response
 from core.util.problem_detail import ProblemDetail
 from core.util.http import RemoteIntegrationException
 
@@ -148,6 +151,7 @@ import base64
 import feedparser
 from core.opds import (
     AcquisitionFeed,
+    NavigationFacets,
     NavigationFeed,
 )
 from core.util.opds_writer import (
@@ -301,9 +305,10 @@ class ControllerTest(VendorIDTest):
                 protocol="api.simple_authentication",
                 goal=ExternalIntegration.PATRON_AUTH_GOAL
             )
-            p = BasicAuthenticationProvider
+            p = SimpleAuthenticationProvider
             integration.setting(p.TEST_IDENTIFIER).value = "unittestuser"
             integration.setting(p.TEST_PASSWORD).value = "unittestpassword"
+            integration.setting(p.TEST_NEIGHBORHOOD).value = "Unit Test West"
             library.integrations.append(integration)
 
         for k, v in [
@@ -694,6 +699,11 @@ class TestBaseController(CirculationControllerTest):
         with self.request_context_with_library("/"):
             value = self.controller.authenticated_patron(self.valid_credentials)
             assert isinstance(value, Patron)
+
+            # The test neighborhood configured in the SimpleAuthenticationProvider
+            # has been associated with the authenticated Patron object for the
+            # duration of this request.
+            eq_("Unit Test West", value.neighborhood)
 
     def test_authentication_sends_proper_headers(self):
 
@@ -1147,7 +1157,6 @@ class TestIndexController(CirculationControllerTest):
         eq_('RSA', key['type'])
         assert 'BEGIN PUBLIC KEY' in key['value']
 
-
 class TestMultipleLibraries(CirculationControllerTest):
 
     def make_default_libraries(self, _db):
@@ -1181,6 +1190,7 @@ class TestLoanController(CirculationControllerTest):
     def setup(self):
         super(TestLoanController, self).setup()
         self.pool = self.english_1.license_pools[0]
+        [self.mech1] = self.pool.delivery_mechanisms
         self.mech2 = self.pool.set_delivery_mechanism(
             Representation.PDF_MEDIA_TYPE, DeliveryMechanism.NO_DRM,
             RightsStatus.CC_BY, None
@@ -1290,27 +1300,35 @@ class TestLoanController(CirculationControllerTest):
             [entry] = feed['entries']
             fulfillment_links = [x['href'] for x in entry['links']
                                 if x['rel'] == OPDSFeed.ACQUISITION_REL]
-            [mech1, mech2] = sorted(
-                self.pool.delivery_mechanisms,
-                key=lambda x: x.delivery_mechanism.default_client_can_fulfill
-            )
+
+            assert self.mech1.resource is not None
 
             # Make sure the two delivery mechanisms are incompatible.
-            mech1.delivery_mechanism.drm_scheme = "DRM type 1"
-            mech2.delivery_mechanism.drm_scheme = "DRM type 2"
-            fulfillable_mechanism = mech2
+            self.mech1.delivery_mechanism.drm_scheme = "DRM Scheme 1"
+            self.mech2.delivery_mechanism.drm_scheme = "DRM Scheme 2"
+            fulfillable_mechanism = self.mech1
+            self._db.commit()
 
             expects = [url_for('fulfill',
                                license_pool_id=self.pool.id,
                                mechanism_id=mech.delivery_mechanism.id,
                                library_short_name=self.library.short_name,
-                               _external=True) for mech in [mech1, mech2]]
+                               _external=True) for mech in [self.mech1, self.mech2]]
             eq_(set(expects), set(fulfillment_links))
 
-            # Now let's try to fulfill the loan.
+            # Make sure the first delivery mechanism has the data necessary
+            # to carry out an open source fulfillment.
+            assert self.mech1.resource is not None
+            assert self.mech1.resource.representation is not None
+            assert self.mech1.resource.representation.url is not None
+
+            # Now let's try to fulfill the loan using the first delivery mechanism.
             response = self.manager.loans.fulfill(
                 self.pool.id, fulfillable_mechanism.delivery_mechanism.id,
             )
+            if isinstance(response, ProblemDetail):
+                j, status, headers = response.response
+                raise Exception(repr(j))
             eq_(302, response.status_code)
             eq_(fulfillable_mechanism.resource.representation.public_url, response.headers.get("Location"))
 
@@ -1349,11 +1367,11 @@ class TestLoanController(CirculationControllerTest):
             # But we can't use some other mechanism -- we're stuck with
             # the first one we chose.
             response = self.manager.loans.fulfill(
-                self.pool.id, mech1.delivery_mechanism.id
+                self.pool.id, self.mech2.delivery_mechanism.id
             )
 
             eq_(409, response.status_code)
-            assert "You already fulfilled this loan as application/epub+zip (DRM type 2), you can't also do it as application/pdf (DRM type 1)" in response.detail
+            assert "You already fulfilled this loan as application/epub+zip (DRM Scheme 1), you can't also do it as application/pdf (DRM Scheme 2)" in response.detail
 
             # If the remote server fails, we get a problem detail.
             def doomed_get(url, headers, **kwargs):
@@ -1684,6 +1702,42 @@ class TestLoanController(CirculationControllerTest):
             )
             eq_(expect, fulfill_part_url(part))
 
+    def test_fulfill_returns_fulfillment_info_implementing_as_response(self):
+        # If CirculationAPI.fulfill returns a FulfillmentInfo that
+        # defines as_response, the result of as_response is returned
+        # directly and the normal process of converting a FulfillmentInfo
+        # to a Flask response is skipped.
+        class MockFulfillmentInfo(FulfillmentInfo):
+            @property
+            def as_response(self):
+                return "Here's your response"
+
+        class MockCirculationAPI(object):
+            def fulfill(slf, *args, **kwargs):
+                return MockFulfillmentInfo(
+                    self._default_collection, None, None, None, None,
+                    None, None, None
+                )
+
+        controller = self.manager.loans
+        mock = MockCirculationAPI()
+        controller.manager.circulation_apis[self._default_library.id] = mock
+
+        with self.request_context_with_library(
+            "/", headers=dict(Authorization=self.valid_auth)
+        ):
+            authenticated = controller.authenticated_patron_from_request()
+            loan, ignore = self.pool.loan_to(authenticated)
+
+            # Fulfill the loan.
+            result = controller.fulfill(
+                self.pool.id, self.mech2.delivery_mechanism.id
+            )
+
+            # The result of MockFulfillmentInfo.as_response was
+            # returned directly.
+            eq_("Here's your response", result)
+
     def test_fulfill_without_active_loan(self):
 
         controller = self.manager.loans
@@ -1705,7 +1759,7 @@ class TestLoanController(CirculationControllerTest):
             response = controller.fulfill(
                 self.pool.id, self.mech2.delivery_mechanism.id
             )
-            assert isinstance(response, Response)
+            assert isinstance(response, FlaskResponse)
             eq_(401, response.status_code)
 
         # ...or it might be because of an error communicating
@@ -2266,7 +2320,7 @@ class TestWorkController(CirculationControllerTest):
         links = feed['feed']['links']
         facet_links = [link for link in links
                        if link['rel'] == 'http://opds-spec.org/facet']
-        eq_(9, len(facet_links))
+        eq_(8, len(facet_links))
 
         # The feed was cached.
         cached = self._db.query(CachedFeed).one()
@@ -2297,7 +2351,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         # Test a basic request with custom faceting, pagination, and a
         # language and audience restriction. This will exercise nearly
@@ -2312,10 +2366,9 @@ class TestWorkController(CirculationControllerTest):
         ):
             response = m(contributor, languages, audiences, feed_class=Mock)
 
-        # We got a 200 response, where the data returned by the mock
-        # method is served as an OPDS feed.
+        # The Response served by Mock.page becomes the response to the
+        # incoming request.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         # Now check all the keyword arguments that were passed into
@@ -2324,7 +2377,6 @@ class TestWorkController(CirculationControllerTest):
 
         eq_(self._db, kwargs.pop('_db'))
         eq_(self.manager._external_search, kwargs.pop('search_engine'))
-        eq_(CachedFeed.CONTRIBUTOR_TYPE, kwargs.pop('cache_type'))
 
         # The feed is named after the contributor the request asked
         # about.
@@ -2342,7 +2394,7 @@ class TestWorkController(CirculationControllerTest):
         eq_(sort_key, pagination.last_item_on_previous_page)
         eq_(100, pagination.size)
 
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, ContributorLane)
         assert isinstance(lane.contributor, ContributorData)
 
@@ -2383,11 +2435,10 @@ class TestWorkController(CirculationControllerTest):
         with self.request_context_with_library("/"):
             response = self.manager.work_controller.permalink(self.identifier.type, self.identifier.identifier)
             annotator = LibraryAnnotator(None, None, self._default_library)
-            expect = etree.tostring(
-                AcquisitionFeed.single_entry(
-                    self._db, self.english_1, annotator
-                )
-            )
+            expect = AcquisitionFeed.single_entry(
+                self._db, self.english_1, annotator
+            ).data
+
         eq_(200, response.status_code)
         eq_(expect, response.data)
         eq_(OPDSFeed.ENTRY_TYPE, response.headers['Content-Type'])
@@ -2456,7 +2507,7 @@ class TestWorkController(CirculationControllerTest):
         # ExternalSearchIndex.
         eq_(200, response.status_code)
         feed = feedparser.parse(response.data)
-        eq_('Recommended Books', feed['feed']['title'])
+        eq_('Titles recommended by NoveList', feed['feed']['title'])
         [entry] = feed.entries
         eq_(self.english_1.title, entry['title'])
         author = self.edition.author_contributors[0]
@@ -2469,6 +2520,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 cls.called_with = kwargs
+                return Response("A bunch of titles")
 
         kwargs['feed_class'] = Mock
         with self.request_context_with_library(
@@ -2478,14 +2530,18 @@ class TestWorkController(CirculationControllerTest):
                 *args, **kwargs
             )
 
+        # The return value of Mock.page was used as the response
+        # to the incoming request.
+        eq_(200, response.status_code)
+        eq_("A bunch of titles", response.data)
+
         kwargs = Mock.called_with
         eq_(self._db, kwargs.pop('_db'))
-        eq_('Recommended Books', kwargs.pop('title'))
-        eq_(RecommendationLane.CACHED_FEED_TYPE, kwargs.pop('cache_type'))
+        eq_('Titles recommended by NoveList', kwargs.pop('title'))
 
         # The RecommendationLane is set up to ask for recommendations
         # for this book.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, RecommendationLane)
         library = self._default_library
         eq_(library.id, lane.library_id)
@@ -2636,7 +2692,7 @@ class TestWorkController(CirculationControllerTest):
 
         # Here's the sublane for recommendations from NoveList.
         [recommended_href, recommended_entry] = by_collection_link[
-            'Recommendations for Quite British by John Bull'
+            'Similar titles recommended by NoveList'
         ]
         eq_("Same author and series", recommended_entry['title'])
         work_url = "/works/%s/%s/" % (identifier.type, identifier.identifier)
@@ -2649,7 +2705,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def groups(cls, **kwargs):
                 cls.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         mock_api.setup(metadata)
         with self.request_context_with_library('/?entrypoint=Audio'):
@@ -2658,8 +2714,9 @@ class TestWorkController(CirculationControllerTest):
                 novelist_api=mock_api, feed_class=Mock
             )
 
+        # The return value of Mock.groups was used as the response
+        # to the incoming request.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         # Verify that groups() was called with the arguments we expect.
@@ -2667,7 +2724,6 @@ class TestWorkController(CirculationControllerTest):
         eq_(self._db, kwargs.pop('_db'))
         eq_(self.manager.external_search, kwargs.pop('search_engine'))
         eq_("Related Books", kwargs.pop('title'))
-        eq_(CachedFeed.RELATED_TYPE, kwargs.pop('cache_type'))
 
         # We're passing in a FeaturedFacets. Each lane will have a chance
         # to adapt it to a faceting object appropriate for that lane.
@@ -2677,7 +2733,7 @@ class TestWorkController(CirculationControllerTest):
 
         # We're generating a grouped feed using a RelatedBooksLane
         # that has three sublanes.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, RelatedBooksLane)
         contributor_lane, novelist_lane, series_lane = lane.children
 
@@ -2790,7 +2846,7 @@ class TestWorkController(CirculationControllerTest):
         links = feed['feed']['links']
         facet_links = [link for link in links
                        if link['rel'] == 'http://opds-spec.org/facet']
-        eq_(10, len(facet_links))
+        eq_(9, len(facet_links))
 
         # The facet link we care most about is the default sort order,
         # put into place by SeriesFacets.
@@ -2828,7 +2884,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         # Test a basic request with custom faceting, pagination, and a
         # language and audience restriction. This will exercise nearly
@@ -2842,22 +2898,20 @@ class TestWorkController(CirculationControllerTest):
                 feed_class=Mock
             )
 
-        # We got a 200 response, where the data returned by the mock
-        # method is served as an OPDS feed.
+        # The return value of Mock.page() is the response to the
+        # incoming request.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         kwargs = self.called_with
         eq_(self._db, kwargs.pop('_db'))
-        eq_(CachedFeed.SERIES_TYPE, kwargs.pop('cache_type'))
 
         # The feed is titled after the series.
         eq_(series_name, kwargs.pop('title'))
 
         # A SeriesLane was created to ask the search index for
         # matching works.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, SeriesLane)
         eq_(self._default_library.id, lane.library_id)
         eq_(series_name, lane.series)
@@ -2909,7 +2963,12 @@ class TestWorkController(CirculationControllerTest):
         eq_("series", facets.order)
 
 
-class TestFeedController(CirculationControllerTest):
+class TestOPDSFeedController(CirculationControllerTest):
+    """Test most of the methods of OPDSFeedController.
+
+    Methods relating to crawlable feeds are tested in
+    TestCrawlableFeed.
+    """
 
     BOOKS = list(CirculationControllerTest.BOOKS) + [
         ["english_2", "Totally American", "Uncle Sam", "eng", False],
@@ -2965,7 +3024,7 @@ class TestFeedController(CirculationControllerTest):
                            ]:
             ConfigurationSetting.for_library(rel, library).value = value
 
-        # Make a real OPDS feed and poke at it. 
+        # Make a real OPDS feed and poke at it.
         with self.request_context_with_library(
             "/?entrypoint=Book&size=10"
         ):
@@ -2979,6 +3038,12 @@ class TestFeedController(CirculationControllerTest):
             # So we'll need to do a more detailed test to make sure
             # the right arguments are being passed _into_ the search
             # index.
+
+            eq_(200, response.status_code)
+            assert (
+                'max-age=%d' % Lane.MAX_CACHE_AGE
+                in response.headers['Cache-Control']
+            )
             feed = feedparser.parse(response.data)
             eq_(set([x.title for x in self.works]),
                 set([x['title'] for x in feed['entries']]))
@@ -3031,7 +3096,7 @@ class TestFeedController(CirculationControllerTest):
             assert all(lane_str in x for x in facet_links)
             assert all('entrypoint=Book' in x for x in facet_links)
             assert any('order=title' in x for x in facet_links)
-            assert any('order=author' in x for x in facet_links)       
+            assert any('order=author' in x for x in facet_links)
 
         # Now let's take a closer look at what this controller method
         # passes into AcquisitionFeed.page(), by mocking page().
@@ -3039,7 +3104,7 @@ class TestFeedController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         sort_key = ["sort", "pagination", "key"]
         with self.request_context_with_library(
@@ -3058,10 +3123,7 @@ class TestFeedController(CirculationControllerTest):
                 library_short_name=self._default_library.short_name,
             )
 
-        # We got a 200 response, where the data returned by the mock
-        # method is served as an OPDS feed.
-        eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
+        assert isinstance(response, Response)
         eq_("An OPDS feed", response.data)
 
         # Now check all the keyword arguments that were passed into
@@ -3070,7 +3132,7 @@ class TestFeedController(CirculationControllerTest):
         eq_(kwargs.pop('url'), expect_url)
         eq_(self._db, kwargs.pop('_db'))
         eq_(self.english_adult_fiction.display_name, kwargs.pop('title'))
-        eq_(self.english_adult_fiction, kwargs.pop('lane'))
+        eq_(self.english_adult_fiction, kwargs.pop('worklist'))
 
         # Query string arguments were taken into account when
         # creating the Facets and Pagination objects.
@@ -3100,8 +3162,8 @@ class TestFeedController(CirculationControllerTest):
     def test_groups(self):
         # AcquisitionFeed.groups is tested in core/test_opds.py, and a
         # full end-to-end test would require setting up a real search
-        # index, so we're just going to test that groups() is called
-        # properly.
+        # index, so we're just going to test that groups() (or, in one
+        # case, page()) is called properly.
         library = self._default_library
         library.setting(library.MINIMUM_FEATURED_QUALITY).value = 0.15
         library.setting(library.FEATURED_LANE_SIZE).value = 2
@@ -3128,8 +3190,19 @@ class TestFeedController(CirculationControllerTest):
         class Mock(object):
             @classmethod
             def groups(cls, **kwargs):
-                self.called_with = kwargs
-                return "An OPDS feed"
+                # This method ends up being called most of the time
+                # the grouped feed controller is activated.
+                self.groups_called_with = kwargs
+                self.page_called_with = None
+                return Response("A grouped feed")
+
+            @classmethod
+            def page(cls, **kwargs):
+                # But for lanes that have no children, this method
+                # ends up being called instead.
+                self.groups_called_with = None
+                self.page_called_with = kwargs
+                return Response("A paginated feed")
 
         with self.request_context_with_library("/?entrypoint=Audio"):
             # In default_config, there are no LARGE_COLLECTION_LANGUAGES,
@@ -3144,11 +3217,10 @@ class TestFeedController(CirculationControllerTest):
             # Ask for that feed.
             response = self.manager.opds_feeds.groups(None, feed_class=Mock)
 
-            # The response is served as an OPDS feed.
+            # The Response returned by Mock.groups() has been converted
+            # into a Flask response.
             eq_(200, response.status_code)
-            eq_(OPDSFeed.ACQUISITION_FEED_TYPE,
-                response.headers['content-type'])
-            eq_("An OPDS feed", response.data)
+            eq_("A grouped feed", response.data)
 
             # While we're in request context, generate the URL we
             # expect to be used for this feed.
@@ -3157,9 +3229,9 @@ class TestFeedController(CirculationControllerTest):
                 library_short_name=library.short_name,
             )
 
-        kwargs = self.called_with
+        kwargs = self.groups_called_with
         eq_(self._db, kwargs.pop('_db'))
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         eq_(expect_lane, lane)
         eq_(lane.display_name, kwargs.pop('title'))
         eq_(expect_url, kwargs.pop('url'))
@@ -3179,11 +3251,48 @@ class TestFeedController(CirculationControllerTest):
 
         # Finally, let's try again with a specific lane rather than
         # None.
+
+        # This lane has no sublanes, so our call to groups()
+        # is going to become a call to page().
         with self.request_context_with_library("/?entrypoint=Audio"):
             response = self.manager.opds_feeds.groups(
                 self.english_adult_fiction.id, feed_class=Mock
             )
-        eq_(self.english_adult_fiction, self.called_with.pop('lane'))
+
+            # While we're in request context, generate the URL we
+            # expect to be used for this feed.
+            expect_url = self.manager.opds_feeds.cdn_url_for(
+                "feed", lane_identifier=self.english_adult_fiction.id,
+                library_short_name=library.short_name,
+            )
+
+        eq_(self.english_adult_fiction, self.page_called_with.pop('worklist'))
+
+        # The canonical URL for this feed is a page-type URL, not a
+        # groups-type URL.
+        eq_(expect_url, self.page_called_with.pop('url'))
+
+        # The faceting and pagination objects are typical for the
+        # first page of a paginated feed.
+        pagination = self.page_called_with.pop('pagination')
+        assert isinstance(pagination, SortKeyPagination)
+        facets = self.page_called_with.pop('facets')
+        assert isinstance(facets, Facets)
+
+        # groups() was never called.
+        eq_(None, self.groups_called_with)
+
+        # Give this lane a sublane, and the call to groups() goes
+        # through as normal.
+        sublane = self._lane(parent=self.english_adult_fiction)
+        with self.request_context_with_library("/?entrypoint=Audio"):
+            response = self.manager.opds_feeds.groups(
+                self.english_adult_fiction.id, feed_class=Mock
+            )
+        eq_(None, self.page_called_with)
+        eq_(self.english_adult_fiction, self.groups_called_with.pop('worklist'))
+        assert isinstance(self.groups_called_with.pop('facets'), FeaturedFacets)
+        assert 'pagination' not in self.groups_called_with
 
     def test_navigation(self):
         library = self._default_library
@@ -3208,13 +3317,11 @@ class TestFeedController(CirculationControllerTest):
             # sublanes for English, Spanish, Chinese, and French.
             eq_(len(lane.sublanes), len(entries))
 
-        # A FeaturedFacets object was created from a combination of
-        # library configuration and lane configuration, and passed in
-        # to NavigationFeed.navigation().
+        # A NavigationFacets object was created and passed in to
+        # NavigationFeed.navigation().
         args, kwargs = self.called_with
         facets = kwargs['facets']
-        assert isinstance(facets, FeaturedFacets)
-        eq_(library.minimum_featured_quality, facets.minimum_featured_quality)
+        assert isinstance(facets, NavigationFacets)
         NavigationFeed.navigation = old_navigation
 
     def _set_update_times(self):
@@ -3295,6 +3402,10 @@ class TestFeedController(CirculationControllerTest):
 
         kwargs = self.called_with
         eq_(self._db, kwargs.pop('_db'))
+
+        # Unlike other types of feeds, here the argument is called
+        # 'lane' instead of 'worklist', because a Lane is the _only_
+        # kind of WorkList that is currently searchable.
         lane = kwargs.pop('lane')
         eq_(expect_lane, lane)
         query = kwargs.pop("query")
@@ -3395,10 +3506,10 @@ class TestCrawlableFeed(CirculationControllerTest):
         """
         controller = self.manager.opds_feeds
         original = controller._crawlable_feed
-        def mock(title, url, lane, annotator=None,
+        def mock(title, url, worklist, annotator=None,
                  feed_class=AcquisitionFeed):
             self._crawlable_feed_called_with = dict(
-                title=title, url=url, lane=lane, annotator=annotator,
+                title=title, url=url, worklist=worklist, annotator=annotator,
                 feed_class=feed_class
             )
             return "An OPDS feed."
@@ -3433,7 +3544,7 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # A CrawlableCollectionBasedLane has been set up to show
         # everything in any of the requested library's collections.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, CrawlableCollectionBasedLane)
         eq_(library.id, lane.library_id)
         eq_([x.id for x in library.collections], lane.collection_ids)
@@ -3452,8 +3563,8 @@ class TestCrawlableFeed(CirculationControllerTest):
             response = controller.crawlable_collection_feed(
                 collection_name="No such collection"
             )
-            eq_(NO_SUCH_COLLECTION, response)            
-            
+            eq_(NO_SUCH_COLLECTION, response)
+
         # Unlike most of these controller methods, this one does not
         # require a library context.
         with self.app.test_request_context("/"):
@@ -3478,7 +3589,7 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # A CrawlableCollectionBasedLane has been set up to show
         # everything in the requested collection.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, CrawlableCollectionBasedLane)
         eq_(None, lane.library_id)
         eq_([collection.id], lane.collection_ids)
@@ -3501,7 +3612,7 @@ class TestCrawlableFeed(CirculationControllerTest):
         annotator = kwargs['annotator']
         assert isinstance(annotator, SharedCollectionAnnotator)
         eq_(collection, annotator.collection)
-        eq_(kwargs['lane'], annotator.lane)
+        eq_(kwargs['worklist'], annotator.lane)
 
     def test_crawlable_list_feed(self):
         # Test the creation of a crawlable feed for everything in
@@ -3545,11 +3656,11 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # A CrawlableCustomListBasedLane was created to fetch only
         # the works in the custom list.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, CrawlableCustomListBasedLane)
         eq_([customlist.id], lane.customlist_ids)
         eq_({}, kwargs)
-            
+
     def test__crawlable_feed(self):
         # Test the helper method called by all other feed methods.
         self.page_called_with = None
@@ -3557,7 +3668,7 @@ class TestCrawlableFeed(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.page_called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         work = self._work(with_open_access_download=True)
         class MockLane(DynamicLane):
@@ -3582,7 +3693,7 @@ class TestCrawlableFeed(CirculationControllerTest):
         in_kwargs = dict(
             title="Lane title",
             url="Lane URL",
-            lane=mock_lane,
+            worklist=mock_lane,
             feed_class=MockFeed
         )
 
@@ -3607,7 +3718,6 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # The result of page() was served as an OPDS feed.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         # Verify the arguments passed in to page().
@@ -3615,10 +3725,9 @@ class TestCrawlableFeed(CirculationControllerTest):
         eq_(self._db, out_kwargs.pop('_db'))
         eq_(self.manager.opds_feeds.search_engine,
             out_kwargs.pop('search_engine'))
-        eq_(in_kwargs['lane'], out_kwargs.pop('lane'))
+        eq_(in_kwargs['worklist'], out_kwargs.pop('worklist'))
         eq_(in_kwargs['title'], out_kwargs.pop('title'))
         eq_(in_kwargs['url'], out_kwargs.pop('url'))
-        eq_('crawlable', out_kwargs.pop('cache_type'))
 
         # Since no annotator was provided and the request did not
         # happen in a library context, a generic
@@ -3783,6 +3892,9 @@ class TestAnalyticsController(CirculationControllerTest):
             goal=ExternalIntegration.ANALYTICS_GOAL,
             protocol="core.local_analytics_provider",
         )
+        integration.setting(
+            LocalAnalyticsProvider.LOCATION_SOURCE
+        ).value = LocalAnalyticsProvider.LOCATION_SOURCE_NEIGHBORHOOD
         self.manager.analytics = Analytics(self._db)
 
         with self.request_context_with_library("/"):
@@ -3790,8 +3902,37 @@ class TestAnalyticsController(CirculationControllerTest):
             eq_(400, response.status_code)
             eq_(INVALID_ANALYTICS_EVENT_TYPE.uri, response.uri)
 
+        # If there is no active patron, or if the patron has no
+        # associated neighborhood, the CirculationEvent is created
+        # with no location.
+        patron = self._patron()
+        for request_patron in (None, patron):
+            with self.request_context_with_library("/"):
+                flask.request.patron = request_patron
+                response = self.manager.analytics_controller.track_event(
+                    self.identifier.type, self.identifier.identifier,
+                    "open_book"
+                )
+                eq_(200, response.status_code)
+
+                circulation_event = get_one(
+                    self._db, CirculationEvent,
+                    type="open_book",
+                    license_pool=self.lp
+                )
+                eq_(None, circulation_event.location)
+                self._db.delete(circulation_event)
+
+        # If the patron has an associated neighborhood, and the
+        # analytics controller is set up to use patron neighborhood as
+        # event location, then the CirculationEvent is created with
+        # that neighborhood as its location.
+        patron.neighborhood = "Mars Grid 4810579"
         with self.request_context_with_library("/"):
-            response = self.manager.analytics_controller.track_event(self.identifier.type, self.identifier.identifier, "open_book")
+            flask.request.patron = patron
+            response = self.manager.analytics_controller.track_event(
+                self.identifier.type, self.identifier.identifier, "open_book"
+            )
             eq_(200, response.status_code)
 
             circulation_event = get_one(
@@ -3799,8 +3940,8 @@ class TestAnalyticsController(CirculationControllerTest):
                 type="open_book",
                 license_pool=self.lp
             )
-            assert circulation_event != None
-
+            eq_(patron.neighborhood, circulation_event.location)
+            self._db.delete(circulation_event)
 
 class TestDeviceManagementProtocolController(ControllerTest):
 
@@ -4449,17 +4590,27 @@ class TestSharedCollectionController(ControllerTest):
             eq_(NO_ACTIVE_HOLD.uri, response.uri)
 
 
-class TestURLLookupController(ControllerTest):
+class TestURNLookupController(ControllerTest):
     """Test that a client can look up data on specific works."""
 
-    def test_get(self):
-        # Look up a work.
-        work = self._work(with_license_pool=True)
+    def test_work_lookup(self):
+        work = self._work(with_open_access_download=True)
         [pool] = work.license_pools
         urn = pool.identifier.urn
         with self.request_context_with_library("/?urn=%s" % urn):
             route_name = "work"
+
+            # Look up a work.
             response = self.manager.urn_lookup.work_lookup(route_name)
+
+            # We got an OPDS feed.
+            eq_(200, response.status_code)
+            eq_(
+                OPDSFeed.ACQUISITION_FEED_TYPE,
+                response.headers['Content-Type']
+            )
+
+            # Parse it.
             feed = feedparser.parse(response.data)
 
             # The route name we passed into work_lookup shows up in
@@ -4470,6 +4621,12 @@ class TestURLLookupController(ControllerTest):
             # The work we looked up has an OPDS entry.
             [entry] = feed['entries']
             eq_(work.title, entry['title'])
+
+            # The OPDS feed includes an open-access acquisition link
+            # -- something that only gets inserted by the
+            # CirculationManagerAnnotator.
+            [link] = entry.links
+            eq_(LinkRelations.OPEN_ACCESS_DOWNLOAD, link['rel'])
 
 
 class TestProfileController(ControllerTest):

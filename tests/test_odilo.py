@@ -40,6 +40,7 @@ from . import (
 from core.metadata_layer import TimestampData
 
 from core.model import (
+    Classification,
     Contributor,
     DataSource,
     DeliveryMechanism,
@@ -750,13 +751,14 @@ class TestOdiloRepresentationExtractor(OdiloAPITest):
         )
 
         subjects = sorted(metadata.subjects, key=lambda x: x.identifier)
-        eq_([(u'Children', 'tag', 100),
-             (u'Classics', 'tag', 100),
-             (u'FIC004000', 'BISAC', 100),
-             (u'Fantasy', 'tag', 100),
-             (u'K-12', 'Grade level', 10),
-             (u'LIT009000', 'BISAC', 100),
-             (u'YAF019020', 'BISAC', 100)],
+        weight = Classification.TRUSTED_DISTRIBUTOR_WEIGHT
+        eq_([(u'Children', 'tag', weight),
+             (u'Classics', 'tag', weight),
+             (u'FIC004000', 'BISAC', weight),
+             (u'Fantasy', 'tag', weight),
+             (u'K-12', 'Grade level', weight),
+             (u'LIT009000', 'BISAC', weight),
+             (u'YAF019020', 'BISAC', weight)],
             [(x.identifier, x.type, x.weight) for x in subjects]
             )
 
@@ -797,6 +799,20 @@ class TestOdiloRepresentationExtractor(OdiloAPITest):
         eq_(1, circulation.licenses_reserved)
 
         self.api.log.info('Testing book info with metadata finished ok !!')
+
+    def test_book_info_missing_metadata(self):
+        # Verify that we properly handle missing metadata from Odilo.
+        raw, book_json = self.sample_json("odilo_metadata.json")
+
+        # This was seen in real data.
+        book_json['series'] = ' '
+        book_json['seriesPosition'] = ' '
+
+        metadata, active = OdiloRepresentationExtractor.record_info_to_metadata(
+            book_json, {}
+        )
+        eq_(None, metadata.series)
+        eq_(None, metadata.series_position)
 
     def test_default_language_spanish(self):
         """Since Odilo primarily distributes Spanish-language titles, if a

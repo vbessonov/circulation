@@ -18,11 +18,11 @@ from core.model import (
     Identifier,
     Representation,
 )
+from core.testing import DummyHTTPClient
 from api.config import CannotLoadConfiguration
 from api.novelist import (
     MockNoveListAPI,
     NoveListAPI,
-    NoveListCoverageProvider,
 )
 from core.util.http import (
     HTTP
@@ -188,6 +188,72 @@ class TestNoveListAPI(DatabaseTest):
             metadata, series_info, book_info
         )
 
+    def test_lookup(self):
+        # Test the lookup() method.
+        h = DummyHTTPClient()
+        h.queue_response(200, "text/html", content="yay")
+
+        class Mock(NoveListAPI):
+            def build_query_url(self, params):
+                self.build_query_url_called_with = params
+                return "http://query-url/"
+
+            def scrubbed_url(self, params):
+                self.scrubbed_url_called_with = params
+                return "http://scrubbed-url/"
+
+            def review_response(self, response):
+                self.review_response_called_with = response
+
+            def lookup_info_to_metadata(self, representation):
+                self.lookup_info_to_metadata_called_with = representation
+                return "some metadata"
+
+        novelist = Mock.from_config(self._default_library)
+        identifier = self._identifier(identifier_type=Identifier.ISBN)
+
+        # Do the lookup.
+        result = novelist.lookup(identifier, do_get=h.do_get)
+
+        # A number of parameters were passed into build_query_url() to
+        # get the URL of the HTTP request. The same parameters were
+        # also passed into scrubbed_url(), to get the URL that should
+        # be used when storing the Representation in the database.
+        params1 = novelist.build_query_url_called_with
+        params2 = novelist.scrubbed_url_called_with
+        eq_(params1, params2)
+
+        eq_(
+            dict(profile=novelist.profile,
+                 ClientIdentifier=identifier.urn,
+                 ISBN=identifier.identifier,
+                 password=novelist.password,
+                 version=novelist.version,
+            ),
+            params1
+        )
+
+        # The HTTP request went out to the query URL -- not the scrubbed URL.
+        eq_(["http://query-url/"], h.requests)
+
+        # The HTTP response was passed into novelist.review_response()
+        eq_(
+            (200, {'content-type': 'text/html'}, 'yay'),
+            novelist.review_response_called_with
+        )
+
+        # Finally, the Representation was passed into
+        # lookup_info_to_metadata, which returned a hard-coded string
+        # as the final result.
+        eq_("some metadata", result)
+
+        # Looking at the Representation we can see that it was stored
+        # in the database under its scrubbed URL, not the URL used to
+        # make the request.
+        rep = novelist.lookup_info_to_metadata_called_with
+        eq_("http://scrubbed-url/", rep.url)
+        eq_("yay", rep.content)
+
     def test_lookup_info_to_metadata_ignores_empty_responses(self):
         """API requests that return no data result return a None tuple"""
 
@@ -232,27 +298,6 @@ class TestNoveListAPI(DatabaseTest):
         # The method to create a scrubbed url returns the same result
         # as the NoveListAPI.build_query_url
         eq_(scrubbed_result, self.novelist.scrubbed_url(params))
-
-    def test_cached_representation(self):
-        url = self._url
-
-        # If there's no Representation, nothing is returned.
-        result = self.novelist.cached_representation(url)
-        eq_(None, result)
-
-        # If a recent Representation exists, it is returned.
-        representation, is_new = self._representation(url=url)
-        representation.content = 'content'
-        representation.fetched_at = datetime.datetime.utcnow() - datetime.timedelta(days=3)
-        result = self.novelist.cached_representation(url)
-        eq_(representation, result)
-
-        # If an old Representation exists, it's deleted.
-        representation.fetched_at = datetime.datetime.utcnow() - datetime.timedelta(days=30)
-        result = self.novelist.cached_representation(url)
-        eq_(None, result)
-        self._db.commit()
-        assert representation not in self._db
 
     def test_scrub_subtitle(self):
         """Unnecessary title segments are removed from subtitles"""
@@ -464,7 +509,7 @@ class TestNoveListAPI(DatabaseTest):
             self.novelist.create_item_object(book1_narrator_from_query, currentIdentifier, existingItem)
         )
         eq_(currentIdentifier, book1_narrator_from_query[2])
-        eq_(existingItem, 
+        eq_(existingItem,
             {"isbn": "23456",
             "mediaType": "EBook",
             "title": "Title 1",
@@ -586,71 +631,3 @@ class TestNoveListAPI(DatabaseTest):
         eq_(args["headers"], headers)
 
         HTTP.put_with_timeout = oldPut
-
-
-class TestNoveListCoverageProvider(DatabaseTest):
-
-    def setup(self):
-        super(TestNoveListCoverageProvider, self).setup()
-        self.integration = self._external_integration(
-            ExternalIntegration.NOVELIST,
-            ExternalIntegration.METADATA_GOAL, username=u'library',
-            password=u'yep', libraries=[self._default_library]
-        )
-
-        self.novelist = NoveListCoverageProvider(self._db)
-        self.novelist.api = MockNoveListAPI.from_config(self._default_library)
-
-        self.metadata = Metadata(
-            data_source = self.novelist.data_source,
-            primary_identifier=self._identifier(
-                identifier_type=Identifier.NOVELIST_ID
-            ),
-            title=u"The Great American Novel"
-        )
-
-    def test_process_item(self):
-        identifier = self._identifier()
-        self.novelist.api.setup(None, self.metadata)
-
-        # When the response is None, the identifier is returned.
-        eq_(identifier, self.novelist.process_item(identifier))
-
-        # When the response is a Metadata object, the identifiers are set
-        # as equivalent and the metadata identifier's edition is updated.
-        eq_(identifier, self.novelist.process_item(identifier))
-        [edition] = self.metadata.primary_identifier.primarily_identifies
-        eq_(u"The Great American Novel", edition.title)
-        equivalents = [eq.output for eq in identifier.equivalencies]
-        eq_(True, self.metadata.primary_identifier in equivalents)
-
-    def test_process_item_creates_edition_for_series_info(self):
-        work = self._work(with_license_pool=True)
-        identifier = work.license_pools[0].identifier
-
-        # Without series information, a NoveList-source edition is not
-        # created for the original identifier.
-        self.metadata.series = self.metadata.series_position = None
-        self.novelist.api.setup(self.metadata)
-        eq_(identifier, self.novelist.process_item(identifier))
-        novelist_edition = get_one(
-            self._db, Edition, data_source=self.novelist.data_source,
-            primary_identifier=identifier
-        )
-        eq_(None, novelist_edition)
-
-        # When series information exists, an edition is created for the
-        # licensed identifier.
-        self.metadata.series = "A Series of Unfortunate Events"
-        self.metadata.series_position = 6
-        self.novelist.api.setup(self.metadata)
-        self.novelist.process_item(identifier)
-        novelist_edition = get_one(
-            self._db, Edition, data_source=self.novelist.data_source,
-            primary_identifier=identifier
-        )
-        assert novelist_edition
-        eq_(self.metadata.series, novelist_edition.series)
-        eq_(self.metadata.series_position, novelist_edition.series_position)
-        # Other basic metadata is also stored.
-        eq_(self.metadata.title, novelist_edition.title)

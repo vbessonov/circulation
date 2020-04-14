@@ -10,6 +10,7 @@ from core.util.http import RemoteIntegrationException
 from core.util import MoneyUtility
 from core.model import ExternalIntegration
 import json
+from api.sip.dialect import Dialect as Sip2Dialect
 
 class SIP2AuthenticationProvider(BasicAuthenticationProvider):
 
@@ -24,6 +25,8 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
     USE_SSL = "use_ssl"
     SSL_CERTIFICATE = "ssl_certificate"
     SSL_KEY = "ssl_key"
+    ILS = "ils"
+    PATRON_STATUS_BLOCK = "patron status block"
 
     SETTINGS = [
         { "key": ExternalIntegration.URL, "label": _("Server"), "required": True },
@@ -41,6 +44,16 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
           "default": "false",
           "required": True,
         },
+        { "key": ILS, "label": _("ILS"),
+          "description": _("Some ILS require specific SIP2 settings. If the ILS you are using is in the list please pick it otherwise select 'Generic ILS'."),
+          "type": "select",
+          "options": [
+              {"key": Sip2Dialect.GENERIC_ILS, "label": _("Generic ILS")},
+              {"key": Sip2Dialect.AG_VERSO, "label": _("Auto-Graphics VERSO")},
+          ],
+          "default": Sip2Dialect.GENERIC_ILS,
+          "required": True,
+        },
         { "key": SSL_CERTIFICATE, "label": _("SSL Certificate"),
           "description": _('The SSL certificate used to securely connect to an SSL-enabled SIP2 server. Not all SSL-enabled SIP2 servers require a custom certificate, but some do. This should be a string beginning with <code>-----BEGIN CERTIFICATE-----</code> and ending with <code>-----END CERTIFICATE-----</code>'),
           "type": "textarea",
@@ -52,6 +65,17 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
         },
         { "key": FIELD_SEPARATOR, "label": _("Field Separator"),
           "default": "|", "required": True,
+        },
+        { "key": PATRON_STATUS_BLOCK,
+          "label": _("SIP2 Patron Status Block"),
+          "description": _(
+            "Block patrons from borrowing based on the status of the SIP2 <em>patron status</em> field."),
+          "type": "select",
+          "options": [
+            {"key": "true", "label": _("Block based on patron status field")},
+            {"key": "false", "label": _("No blocks based on patron status field")},
+          ],
+          "default": "true",
         },
     ] + BasicAuthenticationProvider.SETTINGS
 
@@ -117,7 +141,13 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
         self.use_ssl = integration.setting(self.USE_SSL).json_value
         self.ssl_cert = integration.setting(self.SSL_CERTIFICATE).value
         self.ssl_key = integration.setting(self.SSL_KEY).value
+        self.dialect = Sip2Dialect.load_dialect(integration.setting(self.ILS).value)
         self.client = client
+        patron_status_block = integration.setting(self.PATRON_STATUS_BLOCK).json_value
+        if patron_status_block is None or patron_status_block:
+            self.fields_that_deny_borrowing = SIPClient.PATRON_STATUS_FIELDS_THAT_DENY_BORROWING_PRIVILEGES
+        else:
+            self.fields_that_deny_borrowing = []
 
     def patron_information(self, username, password):
         try:
@@ -128,7 +158,8 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
                     target_server=self.server, target_port=self.port,
                     login_user_id=self.login_user_id, login_password=self.login_password,
                     location_code=self.location_code, institution_id=self.institution_id, separator=self.field_separator,
-                    use_ssl=self.use_ssl, ssl_cert=self.ssl_cert, ssl_key=self.ssl_key
+                    use_ssl=self.use_ssl, ssl_cert=self.ssl_cert, ssl_key=self.ssl_key,
+                    dialect=self.dialect
                 )
             sip.connect()
             sip.login()
@@ -174,7 +205,8 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
                 target_server=self.server, target_port=self.port,
                 login_user_id=self.login_user_id, login_password=self.login_password,
                 location_code=self.location_code, institution_id=self.institution_id, separator=self.field_separator,
-                use_ssl=self.use_ssl, ssl_cert=self.ssl_cert, ssl_key=self.ssl_key
+                use_ssl=self.use_ssl, ssl_cert=self.ssl_cert, ssl_key=self.ssl_key,
+                dialect=self.dialect
             )
         
         connection = self.run_test(
@@ -215,10 +247,8 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
                     ("Raw test patron information"),
                     raw_patron_information
                 )
-        
 
-    @classmethod
-    def info_to_patrondata(cls, info, validate_password=True):
+    def info_to_patrondata(self, info, validate_password=True):
 
         """Convert the SIP-specific dictionary obtained from
         SIPClient.patron_information() to an abstract,
@@ -257,7 +287,7 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
         for expire_field in ['sipserver_patron_expiration', 'polaris_patron_expiration']:
             if expire_field in info:
                 value = info.get(expire_field)
-                value = cls.parse_date(value)
+                value = self.parse_date(value)
                 if value:
                     patrondata.authorization_expires = value
                     break
@@ -267,9 +297,9 @@ class SIP2AuthenticationProvider(BasicAuthenticationProvider):
         # books.
         status = info['patron_status_parsed']
         block_reason = PatronData.NO_VALUE
-        for field in SIPClient.PATRON_STATUS_FIELDS_THAT_DENY_BORROWING_PRIVILEGES:
+        for field in self.fields_that_deny_borrowing:
             if status.get(field) is True:
-                block_reason = cls.SPECIFIC_BLOCK_REASONS.get(
+                block_reason = self.SPECIFIC_BLOCK_REASONS.get(
                     field, PatronData.UNKNOWN_BLOCK
                 )
                 if block_reason not in (PatronData.NO_VALUE,
